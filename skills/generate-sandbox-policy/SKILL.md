@@ -423,6 +423,8 @@ Before presenting the policy to the user, verify correctness **and** flag breadt
 
 ### Breadth Warnings
 
+For gRPC clients, consult the published [HTTP/2 inspection conditions](https://docs.nvidia.com/openshell/latest/how-it-works/policies/network-rules#connection-and-request-checks). Use an exact enforced REST RPC-path allowlist only when those conditions hold. REST inspection does not authorize or inspect protobuf fields; the upstream service must enforce resource permissions.
+
 Evaluate the generated policy for overly broad access and **include warnings in the output to the user**. These do not block generation, but the user must see them.
 
 | Condition | Warning to show |

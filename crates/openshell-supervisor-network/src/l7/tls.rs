@@ -220,13 +220,16 @@ impl ProxyTlsState {
     }
 
     /// Get or generate a leaf cert for the hostname and return a TLS acceptor.
-    fn acceptor_for(&self, hostname: &str) -> Result<TlsAcceptor> {
+    fn acceptor_for(&self, hostname: &str, http2: bool) -> Result<TlsAcceptor> {
         let leaf = self.cert_cache.get_or_generate(hostname)?;
         let mut server_config = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(leaf.cert_chain.clone(), leaf.private_key.clone_key())
             .into_diagnostic()?;
         server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        if http2 {
+            server_config.alpn_protocols.insert(0, b"h2".to_vec());
+        }
         Ok(TlsAcceptor::from(Arc::new(server_config)))
     }
 
@@ -247,9 +250,26 @@ pub async fn tls_terminate_client<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let acceptor = tls_state.acceptor_for(hostname)?;
+    let acceptor = tls_state.acceptor_for(hostname, false)?;
     let tls_stream = acceptor.accept(client).await.into_diagnostic()?;
     Ok(tls_stream)
+}
+
+/// Negotiate HTTP/2 only when the caller has admitted an enforceable HTTP/2 route.
+pub(crate) async fn tls_terminate_http_client<S>(
+    client: S,
+    tls_state: &ProxyTlsState,
+    hostname: &str,
+    http2: bool,
+) -> Result<tokio_rustls::server::TlsStream<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    tls_state
+        .acceptor_for(hostname, http2)?
+        .accept(client)
+        .await
+        .into_diagnostic()
 }
 
 /// Connect TLS to an upstream server, verifying against the configured CA roots.

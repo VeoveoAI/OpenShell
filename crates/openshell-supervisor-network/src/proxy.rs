@@ -3061,48 +3061,62 @@ async fn handle_mediated_connection(
         // TLS detected — terminate unconditionally.
         if let Some(ref tls) = tls_state {
             ctx.request_default_port = Some(443);
+            let Some(relay_context) =
+                relay::prepare_http_relay(l7_route, &opa_engine, &decision, &ctx)
+            else {
+                return Ok(());
+            };
             // Complete the client handshake before observing the upstream
             // connection. A malformed client handshake provides no evidence
             // of an endpoint network failure.
-            let mut tls_client =
-                match crate::l7::tls::tls_terminate_client(client, tls, &host_lc).await {
-                    Ok(client) => client,
-                    Err(error) => {
-                        debug!(host = %host_lc, port, "client TLS handshake failed");
-                        return Err(error);
-                    }
-                };
-            let mut tls_upstream = match crate::l7::tls::tls_connect_upstream(
-                upstream,
+            let mut tls_client = match crate::l7::tls::tls_terminate_http_client(
+                client,
+                tls,
                 &host_lc,
-                tls.upstream_config(),
+                relay_context.allows_http2(),
             )
             .await
             {
-                Ok(upstream) => upstream,
+                Ok(client) => client,
                 Err(error) => {
-                    if let Some(observer) = connect_endpoint_observer.as_ref() {
-                        observer.observe(EndpointResult::TlsFailed);
-                    }
-                    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                        .activity(ActivityId::Fail)
-                        .severity(SeverityId::Low)
-                        .status(StatusId::Failure)
-                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                        .message("Upstream TLS establishment failed")
-                        .build();
-                    ocsf_emit!(event);
+                    debug!(host = %host_lc, port, "client TLS handshake failed");
                     return Err(error);
                 }
             };
-            let tls_result = async {
-                let Some(relay_context) =
-                    relay::prepare_http_relay(l7_route, &opa_engine, &decision, &ctx)
-                else {
-                    return Ok(());
+            let http2 = tls_client.get_ref().1.alpn_protocol() == Some(b"h2");
+            let mut upstream_config = (**tls.upstream_config()).clone();
+            if http2 {
+                upstream_config.alpn_protocols = vec![b"h2".to_vec()];
+            }
+            let upstream_config = Arc::new(upstream_config);
+            let mut tls_upstream =
+                match crate::l7::tls::tls_connect_upstream(upstream, &host_lc, &upstream_config)
+                    .await
+                {
+                    Ok(upstream) => upstream,
+                    Err(error) => {
+                        if let Some(observer) = connect_endpoint_observer.as_ref() {
+                            observer.observe(EndpointResult::TlsFailed);
+                        }
+                        let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::Low)
+                            .status(StatusId::Failure)
+                            .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                            .message("Upstream TLS establishment failed")
+                            .build();
+                        ocsf_emit!(event);
+                        return Err(error);
+                    }
                 };
-
-                relay::relay_http_stream(&mut tls_client, &mut tls_upstream, relay_context).await
+            let tls_result = async {
+                if http2 {
+                    relay::relay_http2_stream(&mut tls_client, &mut tls_upstream, relay_context)
+                        .await
+                } else {
+                    relay::relay_http_stream(&mut tls_client, &mut tls_upstream, relay_context)
+                        .await
+                }
             };
             if let Err(e) = Box::pin(tls_result).await {
                 if is_benign_relay_error(&e) {
