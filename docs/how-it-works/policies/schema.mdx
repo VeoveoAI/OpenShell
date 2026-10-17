@@ -349,8 +349,10 @@ matcher fields in one rule.
 - One denied call denies an entire batched request.
 - Server responses and server-to-client messages are not inspected.
 - Only an allow rule that names an extension method exactly can allow it.
-  Method globs and `mcp.allow_all_known_mcp_methods` do not. An extension
-  method is one that no supported MCP revision defines.
+  Method globs and `mcp.allow_all_known_mcp_methods` do not. Extensions include
+  methods unknown to every supported core revision and explicitly supported
+  extensions outside the selected core profile, such as the
+  [official Tasks extension](#official-tasks-extension).
 
 Under the 2025 revisions, a client sends `initialize` and `notifications/initialized` before calling tools. When `mcp.allow_all_known_mcp_methods` is omitted or `false`, allow both explicitly:
 
