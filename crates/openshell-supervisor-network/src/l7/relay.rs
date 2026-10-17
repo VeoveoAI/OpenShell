@@ -4037,6 +4037,38 @@ mod tests {
     }
 
     #[test]
+    fn native_service_authority_cannot_be_replaced_with_gateway_alias_or_another_port() {
+        let host = "team--application.openshell.localhost";
+        let ctx = L7EvalContext {
+            host: host.into(),
+            port: 17670,
+            request_default_port: Some(443),
+            ..Default::default()
+        };
+        for (authority, expected) in [
+            (format!("{host}:17670"), true),
+            (host.to_string(), false),
+            ("host.openshell.internal:17670".into(), false),
+            ("other.openshell.localhost:17670".into(), false),
+            (format!("{host}:443"), false),
+        ] {
+            let request = crate::l7::provider::L7Request {
+                action: "GET".into(),
+                target: "/mcp/local".into(),
+                query_params: TestHashMap::new(),
+                raw_header: format!("GET /mcp/local HTTP/1.1\r\nHost: {authority}\r\n\r\n")
+                    .into_bytes(),
+                body_length: crate::l7::provider::BodyLength::None,
+            };
+            assert_eq!(
+                request_authority_matches_endpoint(&request, &ctx),
+                expected,
+                "{authority}"
+            );
+        }
+    }
+
+    #[test]
     fn missing_request_default_port_does_not_infer_the_connect_port() {
         let request = crate::l7::provider::L7Request {
             action: "GET".to_string(),

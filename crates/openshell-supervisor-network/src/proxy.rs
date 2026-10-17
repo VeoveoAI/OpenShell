@@ -79,7 +79,7 @@ enum ProxyAcceptError {
 
 use self::destination::{
     DestinationDenial, DestinationDenialKind, DestinationRequest, DestinationValidationPlan,
-    build_pinned_validation_plan, build_validation_plan, validate_destination,
+    build_validation_plan, validate_destination,
 };
 use self::egress::{
     EgressDecision, EgressIntent, EndpointDecision, IdentityUnavailableReason, L7ConfigSnapshot,
@@ -787,9 +787,12 @@ async fn preauthorize_transparent_open(
             }
         },
     };
-    if let Err(denial) =
-        hydrate_destination_plan(&mut decision, backend_host_gateway, trusted_host_gateway)
-    {
+    if let Err(denial) = hydrate_destination_plan(
+        &mut decision,
+        policy_dns_store.and_then(|store| store.native_service_ingress()),
+        backend_host_gateway,
+        trusted_host_gateway,
+    ) {
         warn!(%destination, reason = %denial.reason, "Denied staged transparent destination");
         emit_staged_transparent_denial(
             destination,
@@ -967,8 +970,7 @@ fn pinned_transparent_plan(
         decision.policy_generation,
         std::time::Instant::now(),
     )?;
-    build_pinned_validation_plan(mapping.pinned_addresses())
-        .map_err(|_| MappingLookupError::InvalidMapping)
+    mapping.pinned_plan()
 }
 
 fn valid_policy_local_request(method: &str, target: &str, request_headers: &str) -> bool {
@@ -2565,6 +2567,9 @@ async fn handle_mediated_connection(
 
     if method != "CONNECT" {
         return Box::pin(handle_forward_proxy(
+            policy_dns_store
+                .as_ref()
+                .and_then(|store| store.native_service_ingress()),
             method,
             target,
             &buf[..],
@@ -2754,8 +2759,14 @@ async fn handle_mediated_connection(
     let sandbox_entrypoint_pid = entrypoint_pid.load(Ordering::Acquire);
 
     if prevalidated_connector.is_none() {
-        match hydrate_destination_plan(&mut decision, *backend_host_gateway, *trusted_host_gateway)
-        {
+        match hydrate_destination_plan(
+            &mut decision,
+            policy_dns_store
+                .as_ref()
+                .and_then(|store| store.native_service_ingress()),
+            *backend_host_gateway,
+            *trusted_host_gateway,
+        ) {
             Ok(()) => {}
             Err(denial) => {
                 if let Some(observer) = connect_endpoint_observer.as_ref() {
@@ -3084,7 +3095,8 @@ async fn handle_mediated_connection(
                 }
             };
             let http2 = tls_client.get_ref().1.alpn_protocol() == Some(b"h2");
-            let mut upstream_config = (**tls.upstream_config()).clone();
+            let mut upstream_config =
+                (**tls.upstream_config_for(&host_lc, port, connector.addrs())).clone();
             if http2 {
                 upstream_config.alpn_protocols = vec![b"h2".to_vec()];
             }
@@ -3891,20 +3903,30 @@ fn hydrate_tls_mode(decision: &mut EgressDecision) {
 
 fn hydrate_destination_plan(
     decision: &mut EgressDecision,
+    native_service_ingress: Option<crate::native_service::NativeServiceIngress>,
     backend_host_gateway: Option<IpAddr>,
     trusted_host_gateway: Option<IpAddr>,
 ) -> std::result::Result<(), DestinationDenial> {
     let host = decision.intent.destination.host.clone();
     let raw_allowed_ips = query_allowed_ips(decision);
     let exact_declared_host = decision.endpoint.exact_declared_host;
-    let plan = build_validation_plan(
-        &host,
-        &host.to_ascii_lowercase(),
-        backend_host_gateway,
-        trusted_host_gateway,
-        &raw_allowed_ips,
-        exact_declared_host,
-    )?;
+    let plan = if crate::native_service::is_reserved_service_host(&host) {
+        destination::build_native_service_plan(
+            &host,
+            decision.intent.destination.port,
+            native_service_ingress,
+            &raw_allowed_ips,
+        )?
+    } else {
+        build_validation_plan(
+            &host,
+            &host.to_ascii_lowercase(),
+            backend_host_gateway,
+            trusted_host_gateway,
+            &raw_allowed_ips,
+            exact_declared_host,
+        )?
+    };
     decision.endpoint.destination = Some(plan);
     Ok(())
 }
@@ -5274,6 +5296,7 @@ async fn inject_token_grant_for_forward_request(
 // dispatch; bundling them into a struct would just shift the noise into call sites.
 #[allow(clippy::too_many_arguments)]
 async fn handle_forward_proxy(
+    native_service_ingress: Option<crate::native_service::NativeServiceIngress>,
     method: &str,
     target_uri: &str,
     buf: &[u8],
@@ -6114,7 +6137,12 @@ async fn handle_forward_proxy(
     //    - Otherwise: reject internal IPs, allow public IPs through.
     //    When the policy host is already a literal IP address, treat it as
     //    implicitly allowed — the user explicitly declared the destination.
-    match hydrate_destination_plan(&mut decision, *backend_host_gateway, *trusted_host_gateway) {
+    match hydrate_destination_plan(
+        &mut decision,
+        native_service_ingress,
+        *backend_host_gateway,
+        *trusted_host_gateway,
+    ) {
         Ok(()) => {}
         Err(denial) => {
             deny_forward_destination(
@@ -7749,6 +7777,96 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
     }
 
     #[tokio::test]
+    async fn native_service_transparent_open_preserves_binary_and_port_admission() {
+        let host = "team--application.openshell.localhost";
+        let policy = POLICY_DNS_OPEN_POLICY
+            .replace("db.example", host)
+            .replace("5432", "17670");
+        for (valid_binary, port) in [(true, 17670), (false, 17670), (true, 443)] {
+            let engine = OpaEngine::from_strings(
+                include_str!("../data/sandbox-policy.rego"),
+                &policy_with_native_executable_paths(&policy),
+            )
+            .unwrap();
+            let ingress = crate::native_service::NativeServiceIngress::from_endpoint(
+                Some("https://localhost:17670"),
+                Some("127.0.0.1".parse().unwrap()),
+            )
+            .unwrap();
+            let store = Arc::new(
+                Arc::try_unwrap(policy_dns_test_store())
+                    .ok()
+                    .unwrap()
+                    .with_native_service_ingress(Some(ingress)),
+            );
+            let record = store
+                .publish(
+                    crate::policy_dns::PublishRequest {
+                        normalized_name: crate::policy_dns::NormalizedName::parse(host).unwrap(),
+                        family: crate::policy_dns::AddressFamily::Ipv4,
+                        allocation_identity: [9; 32],
+                        policy_generation: engine.current_generation(),
+                        ttl: std::time::Duration::from_secs(30),
+                        contracts: vec![crate::policy_dns::ResolvedPortContract {
+                            endpoint_id: PolicyEndpointId {
+                                policy_name: "database".into(),
+                                endpoint_index: 0,
+                            },
+                            port: 17670,
+                            destination_plan: destination::build_native_service_plan(
+                                host,
+                                17670,
+                                Some(ingress),
+                                &[],
+                            )
+                            .unwrap(),
+                            pinned_addresses: vec![ingress.socket().ip()],
+                        }],
+                    },
+                    engine.current_generation(),
+                    std::time::Instant::now(),
+                )
+                .unwrap();
+            let (mut open, completion) = staged_curl_open(
+                SocketAddr::new(record.synthetic_address, port),
+                engine.current_generation(),
+            );
+            if !valid_binary {
+                open.binary_identity.as_mut().unwrap().executable.path =
+                    executable_path("/usr/bin/psql");
+            }
+            let accepted = preauthorize_transparent_open(
+                open,
+                Some(&store),
+                &engine,
+                &BinaryIdentityCache::new(),
+                None,
+                None,
+                false,
+                None,
+            )
+            .await;
+            if valid_binary && port == 17670 {
+                let (_, _, _, transparent) = accepted.expect("authorized native service");
+                let (decision, connector) = transparent.unwrap().authorization.unwrap();
+                assert_eq!(completion.await.unwrap(), TcpOpenDecision::RelayReady);
+                assert_eq!(decision.intent.destination.host, host);
+                assert!(matches!(
+                    decision.endpoint.destination.unwrap().address_authorization,
+                    destination::AddressAuthorization::NativeServiceIngress(_)
+                ));
+                assert_eq!(connector.addrs(), &[ingress.socket()]);
+            } else {
+                assert!(accepted.is_none());
+                assert!(matches!(
+                    completion.await.unwrap(),
+                    TcpOpenDecision::Denied(_)
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn staged_transparent_open_proposes_a_denied_observation_hostname() {
         let engine = OpaEngine::from_strings(
             include_str!("../data/sandbox-policy.rego"),
@@ -8942,6 +9060,7 @@ network_policies:
             Box::pin(tokio::time::timeout(
                 std::time::Duration::from_secs(30),
                 Box::pin(handle_forward_proxy(
+                    None,
                     "POST",
                     &target,
                     request.as_bytes(),
@@ -9074,6 +9193,7 @@ network_policies:
         tokio::time::timeout(
             std::time::Duration::from_secs(30),
             Box::pin(handle_forward_proxy(
+                None,
                 "GET",
                 &target,
                 request.as_bytes(),
@@ -9193,6 +9313,7 @@ network_policies:
         tokio::time::timeout(
             std::time::Duration::from_secs(30),
             Box::pin(handle_forward_proxy(
+                None,
                 "GET",
                 &target,
                 request.as_bytes(),
@@ -9321,6 +9442,7 @@ network_policies:
         tokio::time::timeout(
             std::time::Duration::from_secs(30),
             Box::pin(handle_forward_proxy(
+                None,
                 "GET",
                 &target,
                 request.as_bytes(),
@@ -9464,6 +9586,7 @@ network_policies:
 
         let handler = tokio::spawn(async move {
             Box::pin(handle_forward_proxy(
+                None,
                 "GET",
                 &target,
                 request.as_bytes(),

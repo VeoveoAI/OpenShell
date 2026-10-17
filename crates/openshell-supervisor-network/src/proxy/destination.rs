@@ -14,6 +14,7 @@ use super::{
     resolve_and_check_allowed_ips, resolve_and_check_declared_endpoint,
     resolve_and_check_trusted_gateway, resolve_and_reject_internal,
 };
+use crate::native_service::{NativeServiceDestination, NativeServiceIngress};
 use ipnet::IpNet;
 use openshell_core::net::{connect_tcp_nodelay_best_effort, is_always_blocked_ip, is_internal_ip};
 use std::net::{IpAddr, SocketAddr};
@@ -33,6 +34,7 @@ pub(crate) enum AddressAuthorization {
     /// authority for this mapping, so the supervisor does not consult its own
     /// resolver before dialing it.
     BackendPinnedGateway(IpAddr),
+    NativeServiceIngress(NativeServiceDestination),
     /// Addresses already resolved and authorized by policy DNS. This mode must
     /// never resolve `DestinationRequest::host` again before constructing the
     /// unopened connector.
@@ -126,6 +128,37 @@ pub(crate) fn build_validation_plan(
     })
 }
 
+/// Classify only the reserved native namespace against startup-fixed coordinates.
+/// Explicit address restrictions remain effective and may deny the pinned socket.
+pub(crate) fn build_native_service_plan(
+    host: &str,
+    port: u16,
+    ingress: Option<NativeServiceIngress>,
+    raw_allowed_ips: &[String],
+) -> Result<DestinationValidationPlan, DestinationDenial> {
+    let pin = ingress
+        .and_then(|ingress| ingress.pin(host, port))
+        .ok_or_else(|| {
+            DestinationDenial::new(
+                DestinationDenialKind::TrustedGateway,
+                "native service hostname/port has no trusted ingress socket".to_string(),
+            )
+        })?;
+    if !raw_allowed_ips.is_empty() {
+        let restricted = DestinationValidationPlan {
+            address_authorization: AddressAuthorization::ExplicitAllowedIps(
+                parse_allowed_ips(raw_allowed_ips).map_err(|reason| {
+                    DestinationDenial::new(DestinationDenialKind::InvalidAllowedIps, reason)
+                })?,
+            ),
+        };
+        filter_resolved_addresses(&restricted, host, port, &[pin.socket().ip()])?;
+    }
+    Ok(DestinationValidationPlan {
+        address_authorization: AddressAuthorization::NativeServiceIngress(pin),
+    })
+}
+
 /// Build the destination mode used by policy DNS after it has validated and
 /// pinned a non-empty answer set for an endpoint.
 #[allow(dead_code, reason = "used by the policy DNS adapter")]
@@ -160,7 +193,8 @@ pub(crate) fn filter_resolved_addresses(
 ) -> Result<Vec<IpAddr>, DestinationDenial> {
     let (kind, control_plane_blocked) = match &plan.address_authorization {
         AddressAuthorization::TrustedGatewayAlias { .. }
-        | AddressAuthorization::BackendPinnedGateway(_) => {
+        | AddressAuthorization::BackendPinnedGateway(_)
+        | AddressAuthorization::NativeServiceIngress(_) => {
             (DestinationDenialKind::TrustedGateway, true)
         }
         AddressAuthorization::ExplicitAllowedIps(_)
@@ -181,6 +215,16 @@ pub(crate) fn filter_resolved_addresses(
     let mut first_rejection = None;
     for &ip in resolved_ips {
         let rejection = match &plan.address_authorization {
+            AddressAuthorization::NativeServiceIngress(pin) => {
+                if !pin.matches(host, port) || pin.socket().ip() != ip {
+                    Some(
+                        "native service destination does not match its logical socket pin"
+                            .to_string(),
+                    )
+                } else {
+                    None
+                }
+            }
             AddressAuthorization::DefaultPublicOnly if is_internal_ip(ip) => Some(format!(
                 "{host} resolves to internal address {ip}, connection rejected"
             )),
@@ -323,6 +367,10 @@ pub(crate) async fn validate_destination(
     } = request;
 
     let addrs = match &plan.address_authorization {
+        AddressAuthorization::NativeServiceIngress(pin) => {
+            filter_resolved_addresses(plan, host, port, &[pin.socket().ip()])?;
+            vec![pin.socket()]
+        }
         AddressAuthorization::TrustedGatewayAlias { expected_ip } => {
             resolve_and_check_trusted_gateway(host, port, *expected_ip, sandbox_entrypoint_pid)
                 .await
@@ -398,6 +446,41 @@ mod tests {
             sandbox_entrypoint_pid: 0,
             plan,
         }
+    }
+
+    #[tokio::test]
+    async fn native_service_destination_is_not_a_reusable_loopback_ip_exemption() {
+        let ingress = NativeServiceIngress::from_endpoint(
+            Some("https://localhost:17670"),
+            Some("127.0.0.1".parse().unwrap()),
+        )
+        .unwrap();
+        let host = "team--application.openshell.localhost";
+        let plan = build_native_service_plan(host, 17670, Some(ingress), &[]).unwrap();
+        for (requested_host, port, allowed) in [
+            (host, 17670, true),
+            (host, 443, false),
+            ("other.openshell.localhost", 17670, false),
+            ("host.openshell.internal", 17670, false),
+            ("127.0.0.1", 17670, false),
+        ] {
+            let result = validate_destination(DestinationRequest {
+                host: requested_host,
+                port,
+                sandbox_entrypoint_pid: 0,
+                plan: &plan,
+            })
+            .await;
+            assert_eq!(result.is_ok(), allowed, "{requested_host}:{port}");
+        }
+        assert!(
+            filter_resolved_addresses(&plan, host, 17670, &["127.0.0.2".parse().unwrap()]).is_err()
+        );
+        assert!(build_native_service_plan(host, 17670, None, &[]).is_err());
+        assert!(
+            build_native_service_plan(host, 17670, Some(ingress), &["192.0.2.0/24".into()])
+                .is_err()
+        );
     }
 
     /// Regression test: the shared upstream dial boundary sets `TCP_NODELAY`.

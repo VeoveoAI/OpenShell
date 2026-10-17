@@ -5,9 +5,10 @@
 
 use super::name::NormalizedName;
 use super::resolver::AddressFamily;
+use crate::native_service::NativeServiceIngress;
 use crate::proxy::destination::{
-    DestinationRequest, DestinationValidationPlan, UpstreamConnector, build_pinned_validation_plan,
-    validate_destination,
+    AddressAuthorization, DestinationRequest, DestinationValidationPlan, UpstreamConnector,
+    build_pinned_validation_plan, filter_resolved_addresses, validate_destination,
 };
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -103,6 +104,57 @@ impl MappingLookup {
             .map(|contract| &contract.endpoint_id)
     }
 
+    /// Preserve native logical socket pins instead of reducing them to IP-only plans.
+    pub(crate) fn pinned_plan(&self) -> Result<DestinationValidationPlan, MappingLookupError> {
+        self.pinned_plan_for(None)
+    }
+
+    fn pinned_plan_for(
+        &self,
+        endpoint: Option<&PolicyEndpointId>,
+    ) -> Result<DestinationValidationPlan, MappingLookupError> {
+        let contracts = self
+            .record
+            .contracts
+            .iter()
+            .filter(|contract| {
+                contract.port == self.port && endpoint.is_none_or(|id| id == &contract.endpoint_id)
+            })
+            .collect::<Vec<_>>();
+        if contracts.is_empty() {
+            return Err(MappingLookupError::EndpointMismatch);
+        }
+        let native = contracts.iter().find(|contract| {
+            matches!(
+                contract.destination_plan.address_authorization,
+                AddressAuthorization::NativeServiceIngress(_)
+            )
+        });
+        if let Some(native) = native {
+            let plan = &native.destination_plan;
+            for contract in &contracts {
+                if &contract.destination_plan != plan || contract.pinned_addresses.is_empty() {
+                    return Err(MappingLookupError::InvalidMapping);
+                }
+                filter_resolved_addresses(
+                    plan,
+                    self.record.normalized_name.as_str(),
+                    self.port,
+                    &contract.pinned_addresses,
+                )
+                .map_err(|_| MappingLookupError::InvalidMapping)?;
+            }
+            return Ok(plan.clone());
+        }
+        let mut seen = HashSet::new();
+        let addresses = contracts
+            .iter()
+            .flat_map(|contract| contract.pinned_addresses.iter().copied())
+            .filter(|address| seen.insert(*address))
+            .collect();
+        build_pinned_validation_plan(addresses).map_err(|_| MappingLookupError::InvalidMapping)
+    }
+
     /// Build the unopened connector for a process-authorized endpoint.
     ///
     /// Selecting by endpoint identity prevents a compatible endpoint record
@@ -112,20 +164,7 @@ impl MappingLookup {
         &self,
         endpoint_id: &PolicyEndpointId,
     ) -> Result<UpstreamConnector, MappingLookupError> {
-        let mut seen = HashSet::new();
-        let addresses = self
-            .record
-            .contracts
-            .iter()
-            .filter(|contract| contract.port == self.port && &contract.endpoint_id == endpoint_id)
-            .flat_map(|contract| contract.pinned_addresses.iter().copied())
-            .filter(|address| seen.insert(*address))
-            .collect::<Vec<_>>();
-        if addresses.is_empty() {
-            return Err(MappingLookupError::EndpointMismatch);
-        }
-        let plan = build_pinned_validation_plan(addresses)
-            .map_err(|_| MappingLookupError::InvalidMapping)?;
+        let plan = self.pinned_plan_for(Some(endpoint_id))?;
         validate_destination(DestinationRequest {
             host: self.record.normalized_name.as_str(),
             port: self.port,
@@ -275,6 +314,7 @@ struct StoreState {
 }
 
 pub(crate) struct ResolvedEndpointStore {
+    native_service_ingress: Option<NativeServiceIngress>,
     state: RwLock<StoreState>,
     config: StoreConfig,
     ipv4_pool_high_water_emitted: AtomicBool,
@@ -288,6 +328,7 @@ impl ResolvedEndpointStore {
         let next_ipv6 = u128::from(*config.pools.ipv6.start());
         let end_ipv6 = u128::from(*config.pools.ipv6.end());
         Self {
+            native_service_ingress: None,
             state: RwLock::new(StoreState {
                 records: BTreeMap::new(),
                 allocations: BTreeMap::new(),
@@ -302,6 +343,18 @@ impl ResolvedEndpointStore {
             ipv4_pool_high_water_emitted: AtomicBool::new(false),
             ipv6_pool_high_water_emitted: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn with_native_service_ingress(
+        mut self,
+        ingress: Option<NativeServiceIngress>,
+    ) -> Self {
+        self.native_service_ingress = ingress;
+        self
+    }
+
+    pub(crate) fn native_service_ingress(&self) -> Option<NativeServiceIngress> {
+        self.native_service_ingress
     }
 
     pub(crate) fn publish(
@@ -1019,6 +1072,48 @@ mod tests {
         let endpoint = lookup.endpoint_ids().next().unwrap().clone();
         let connector = lookup.connector_for(&endpoint).await.unwrap();
         assert_eq!(connector.addrs(), &["203.0.113.8:5432".parse().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn native_service_connector_preserves_logical_pin_after_mapping_lookup() {
+        let store = store(1);
+        let ingress = NativeServiceIngress::from_endpoint(
+            Some("https://localhost:17670"),
+            Some("127.0.0.1".parse().unwrap()),
+        )
+        .unwrap();
+        let host = "team--application.openshell.localhost";
+        let mut request = request(host, 1, Duration::from_secs(5));
+        request.contracts[0].port = 17670;
+        request.contracts[0].destination_plan =
+            crate::proxy::destination::build_native_service_plan(host, 17670, Some(ingress), &[])
+                .unwrap();
+        request.contracts[0].pinned_addresses = vec![ingress.socket().ip()];
+        let now = Instant::now();
+        let record = store.publish(request, 1, now).unwrap();
+        let mut lookup = store
+            .lookup(record.synthetic_address, 17670, 1, now)
+            .unwrap();
+        let endpoint = lookup.endpoint_ids().next().unwrap().clone();
+        assert!(matches!(
+            lookup.pinned_plan().unwrap().address_authorization,
+            AddressAuthorization::NativeServiceIngress(_)
+        ));
+        assert_eq!(
+            lookup.connector_for(&endpoint).await.unwrap().addrs(),
+            &[ingress.socket()]
+        );
+        lookup.record.normalized_name = NormalizedName::parse("other.openshell.localhost").unwrap();
+        assert!(matches!(
+            lookup.connector_for(&endpoint).await,
+            Err(MappingLookupError::InvalidMapping)
+        ));
+        lookup.record.normalized_name = NormalizedName::parse(host).unwrap();
+        lookup.record.contracts[0].pinned_addresses = vec!["127.0.0.2".parse().unwrap()];
+        assert!(matches!(
+            lookup.connector_for(&endpoint).await,
+            Err(MappingLookupError::InvalidMapping)
+        ));
     }
 
     #[tokio::test]

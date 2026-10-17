@@ -5120,6 +5120,7 @@ dependencies = [
  "tower-mcp-types",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
  "webpki-roots",
 ]

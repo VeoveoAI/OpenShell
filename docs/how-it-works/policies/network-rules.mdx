@@ -19,6 +19,59 @@ OpenShell checks every outbound connection from a sandbox against the
 `network_policies` section of its policy, and denies any connection that no rule
 allows.
 
+### Local Gateway Service Names
+
+On a Docker sandbox with a trusted local HTTPS gateway, policy DNS can resolve
+one-label names beneath the reserved `openshell.localhost` domain without external
+DNS. For example, a native service exposure may use
+`https://default--web--http.openshell.localhost:17670/`.
+Use the service's exact hostname and gateway port in its ordinary network rule:
+
+```yaml
+network_policies:
+  application:
+    endpoints:
+      - host: default--web--http.openshell.localhost
+        port: 17670
+        protocol: rest
+        rules:
+          - allow: { method: GET, path: "/**" }
+    binaries:
+      - path: /usr/bin/curl
+```
+
+Resolution does not grant access: the connection still needs an admitted executable,
+hostname and port, and inspected requests keep their method/path and authority
+checks. The gateway remains authoritative for the encoded workspace, sandbox,
+service and current exposure. Application authentication remains the exposed
+service's responsibility; a bearer-passthrough exposure does not grant OpenShell
+workspace membership.
+
+This path supports only a trusted supervisor HTTPS endpoint with a literal address
+or `localhost` that matches the isolation backend's pinned gateway IP. The URL's
+port must equal that endpoint's effective port. Different ingress/gRPC ports,
+custom domains, nested subdomains and missing trusted coordinates are unsupported
+and fail closed. The generated service URL must use HTTPS. Set
+`enable_loopback_service_http=false` in gateway configuration or
+`OPENSHELL_ENABLE_LOOPBACK_SERVICE_HTTP=false` in its environment when selecting
+HTTPS URLs. Omit `allowed_ips` overrides for this local path:
+existing always-blocked-address checks still reject authored loopback overrides.
+
+The driver-owned `OPENSHELL_TLS_CA` supplies additional upstream trust only for the
+validated native gateway socket: reserved service hostnames and the existing
+host-gateway aliases at that same port. Rustls still verifies the logical hostname
+and sends that hostname as SNI. Unrelated destinations and other ports keep their
+ordinary CA roots. A missing, unreadable or invalid gateway CA disables native
+service resolution/dialing with a configuration diagnostic, while ordinary
+interception remains available. The gateway CA is not copied into workload trust
+or accepted from workload environment/files.
+
+Routing coordinates and this scoped trust are captured at supervisor startup.
+Restart the sandbox after changing them. DNS mappings retain the existing bounded
+TTL and policy-generation fencing; endpoint deletion/replacement is resolved by
+the gateway rather than by caching a sandbox address. These mechanics require
+runtime qualification with the selected gateway certificate and driver.
+
 ### Rule Structure
 
 Each entry in `network_policies` is a rule. The entry's key is the rule's name,

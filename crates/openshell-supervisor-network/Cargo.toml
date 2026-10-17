@@ -55,6 +55,7 @@ tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 tower-mcp-types = { workspace = true }
 tracing = { workspace = true }
+url = { workspace = true }
 uuid = { workspace = true }
 webpki-roots = { workspace = true, optional = true }
 

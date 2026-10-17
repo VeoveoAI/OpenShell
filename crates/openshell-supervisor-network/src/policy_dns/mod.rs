@@ -32,8 +32,11 @@ pub(crate) use store::{
     SyntheticPools,
 };
 
+use crate::native_service::{NativeServiceIngress, is_reserved_service_host};
 use crate::opa::OpaEngine;
-use crate::proxy::destination::{build_validation_plan, filter_resolved_addresses};
+use crate::proxy::destination::{
+    build_native_service_plan, build_validation_plan, filter_resolved_addresses,
+};
 use crate::proxy::is_host_gateway_alias;
 use openshell_core::host_pattern::HostSelector;
 use openshell_ocsf::{
@@ -142,6 +145,7 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
             &snapshot.endpoints,
             &normalized_name,
             self.trusted_host_gateway,
+            self.store.native_service_ingress(),
         )?;
         if eligible.is_empty() {
             emit_dns_denial(
@@ -161,7 +165,18 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
         // The trusted resolver is invoked only after the immutable snapshot
         // proved policy eligibility. It never consults sandbox resolver state.
         let endpoint_context = eligible_endpoint_context(&eligible);
-        let trusted_answer = if is_host_gateway_alias(normalized_name.as_str()) {
+        let trusted_answer = if is_reserved_service_host(normalized_name.as_str()) {
+            let address = self
+                .store
+                .native_service_ingress()
+                .map(|ingress| ingress.socket().ip())
+                .filter(|address| family.accepts(*address))
+                .ok_or(PolicyDnsError::NoValidAddress)?;
+            TrustedAnswer {
+                addresses: vec![address],
+                ttl: MAX_MAPPING_TTL,
+            }
+        } else if is_host_gateway_alias(normalized_name.as_str()) {
             let address = self
                 .trusted_host_gateway
                 .filter(|address| family.accepts(*address))
@@ -343,6 +358,7 @@ fn observation_eligible(name: &NormalizedName) -> bool {
     name.as_str() != "localhost"
         && !openshell_core::net::is_known_metadata_hostname(name.as_str())
         && !is_host_gateway_alias(name.as_str())
+        && !is_reserved_service_host(name.as_str())
 }
 
 struct EligibleEndpoint {
@@ -356,6 +372,7 @@ fn eligible_endpoints(
     endpoints: &[crate::opa::MatchedEndpoint],
     name: &NormalizedName,
     trusted_host_gateway: Option<std::net::IpAddr>,
+    native_service_ingress: Option<NativeServiceIngress>,
 ) -> Result<Vec<EligibleEndpoint>, PolicyDnsError> {
     let mut eligible = Vec::new();
     for endpoint in endpoints {
@@ -368,21 +385,37 @@ fn eligible_endpoints(
         if !selector.matches(name.as_str()) {
             continue;
         }
-        let ports = value_ports(&endpoint.endpoint);
+        let mut ports = value_ports(&endpoint.endpoint);
         if ports.is_empty() {
             continue;
         }
         let raw_allowed_ips = value_string_array(&endpoint.endpoint, "allowed_ips");
         let exact_declared_host = !pattern.contains('*') && pattern == name.as_str();
-        let destination_plan = build_validation_plan(
-            name.as_str(),
-            name.as_str(),
-            trusted_host_gateway,
-            None,
-            &raw_allowed_ips,
-            exact_declared_host,
-        )
-        .map_err(|error| PolicyDnsError::Policy(error.reason))?;
+        let destination_plan = if is_reserved_service_host(name.as_str()) {
+            let Some(ingress) = native_service_ingress else {
+                continue;
+            };
+            ports.retain(|port| *port == ingress.socket().port());
+            let Some(port) = ports.first() else {
+                continue;
+            };
+            let Ok(plan) =
+                build_native_service_plan(name.as_str(), *port, Some(ingress), &raw_allowed_ips)
+            else {
+                continue;
+            };
+            plan
+        } else {
+            build_validation_plan(
+                name.as_str(),
+                name.as_str(),
+                trusted_host_gateway,
+                None,
+                &raw_allowed_ips,
+                exact_declared_host,
+            )
+            .map_err(|error| PolicyDnsError::Policy(error.reason))?
+        };
         eligible.push(EligibleEndpoint {
             endpoint_id: PolicyEndpointId {
                 policy_name: endpoint.policy_name.clone(),
@@ -752,6 +785,122 @@ filesystem_policy: { include_workdir: true, read_only: [], read_write: [] }
 landlock: { compatibility: best_effort }
 process: { run_as_user: sandbox, run_as_group: sandbox }
 ";
+
+    fn native_service(policy: &str, configured: bool) -> PolicyDnsService<FakeResolver> {
+        let mut service = service(policy, vec!["203.0.113.8".parse().unwrap()]);
+        let pools = SyntheticPools::new(
+            Ipv4Addr::new(198, 18, 0, 2)..=Ipv4Addr::new(198, 18, 0, 8),
+            "fd00:1::1".parse::<Ipv6Addr>().unwrap()..="fd00:1::8".parse::<Ipv6Addr>().unwrap(),
+        )
+        .unwrap();
+        let ingress = configured.then(|| {
+            NativeServiceIngress::from_endpoint(
+                Some("https://localhost:17670"),
+                Some("127.0.0.1".parse().unwrap()),
+            )
+            .unwrap()
+        });
+        service.store = Arc::new(
+            ResolvedEndpointStore::new(StoreConfig::new(pools, 16).unwrap())
+                .with_native_service_ingress(ingress),
+        );
+        service
+    }
+
+    #[tokio::test]
+    async fn native_service_dns_preserves_logical_name_port_and_generation_without_upstream_dns() {
+        let name = "team--application.openshell.localhost";
+        let policy = BASE_POLICY
+            .replace("db.example", name)
+            .replace("5432", "17670");
+        let service = native_service(&policy, true);
+        let now = Instant::now();
+        let answer = service
+            .answer_query(name, AddressFamily::Ipv4, now)
+            .await
+            .unwrap();
+        assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 0);
+        let mapping = service
+            .store
+            .lookup(
+                answer.address,
+                17670,
+                service.policy.current_generation(),
+                now,
+            )
+            .unwrap();
+        assert_eq!(mapping.record.normalized_name.as_str(), name);
+        assert!(matches!(
+            mapping.pinned_plan().unwrap().address_authorization,
+            crate::proxy::destination::AddressAuthorization::NativeServiceIngress(_)
+        ));
+        let endpoint = mapping.endpoint_ids().next().unwrap().clone();
+        assert_eq!(
+            mapping.connector_for(&endpoint).await.unwrap().addrs(),
+            &["127.0.0.1:17670".parse().unwrap()]
+        );
+        assert!(matches!(
+            service.store.lookup(
+                answer.address,
+                443,
+                service.policy.current_generation(),
+                now
+            ),
+            Err(MappingLookupError::PortMismatch)
+        ));
+        assert!(matches!(
+            service.store.lookup(
+                answer.address,
+                17670,
+                service.policy.current_generation() + 1,
+                now
+            ),
+            Err(MappingLookupError::StalePolicy)
+        ));
+        assert!(matches!(
+            service.store.lookup(
+                answer.address,
+                17670,
+                service.policy.current_generation(),
+                now + MAX_MAPPING_TTL + Duration::from_secs(1)
+            ),
+            Err(MappingLookupError::Expired)
+        ));
+    }
+
+    #[tokio::test]
+    async fn native_service_dns_fails_closed_for_missing_policy_coordinates_wrong_ports_and_nested_names()
+     {
+        let name = "team--application.openshell.localhost";
+        for (policy, configured, query) in [
+            (BASE_POLICY.to_string(), true, name),
+            (
+                BASE_POLICY
+                    .replace("db.example", name)
+                    .replace("5432", "17670"),
+                false,
+                name,
+            ),
+            (BASE_POLICY.replace("db.example", name), true, name),
+            (
+                BASE_POLICY
+                    .replace("db.example", "nested.team.openshell.localhost")
+                    .replace("5432", "17670"),
+                true,
+                "nested.team.openshell.localhost",
+            ),
+        ] {
+            let service = native_service(&policy, configured);
+            assert!(
+                service
+                    .answer_query(query, AddressFamily::Ipv4, Instant::now())
+                    .await
+                    .is_err(),
+                "{query}"
+            );
+            assert_eq!(service.resolver.calls.load(Ordering::SeqCst), 0);
+        }
+    }
 
     #[tokio::test]
     async fn stages_unknown_name_without_upstream_resolution() {

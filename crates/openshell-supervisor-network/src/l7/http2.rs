@@ -434,7 +434,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    const POLICY: &str = r#"
+    const POLICY: &str = r"
 network_policies:
   rpc:
     name: rpc
@@ -447,7 +447,7 @@ network_policies:
           - allow: {method: POST, path: /rpc/read}
     binaries:
       - {path: /usr/bin/client}
-"#;
+";
 
     #[tokio::test]
     async fn downstream_cancellation_resets_upstream_and_releases_relay_slots() {
@@ -589,16 +589,16 @@ network_policies:
                 let tx = seen_tx.clone();
                 tokio::spawn(async move {
                     let (parts, mut body) = request.into_parts();
-                    let mut content = Vec::new();
+                    let mut received_body = Vec::new();
                     while let Some(data) = body.data().await {
                         let data = data.unwrap();
                         body.flow_control().release_capacity(data.len()).unwrap();
-                        content.extend_from_slice(&data);
-                        if content.len() == 10 {
+                        received_body.extend_from_slice(&data);
+                        if received_body.len() == 10 {
                             break;
                         }
                     }
-                    tx.send((parts, content)).await.unwrap();
+                    tx.send((parts, received_body)).await.unwrap();
                     let mut reply = response
                         .send_response(
                             Response::builder()
@@ -643,12 +643,12 @@ network_policies:
             .unwrap();
         // The upstream must answer while the request stream is still open.
         body.send_data(Bytes::new(), true).unwrap();
-        let (parts, content) = seen_rx.recv().await.unwrap();
+        let (parts, received_body) = seen_rx.recv().await.unwrap();
         assert_eq!(
             parts.headers["authorization"],
             "Bearer supervisor-only-token"
         );
-        assert_eq!(content, payload);
+        assert_eq!(received_body, payload);
         let mut body = response.into_body();
         let mut reply = Vec::new();
         while let Some(data) = body.data().await {

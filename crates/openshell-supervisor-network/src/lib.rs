@@ -11,6 +11,7 @@
 //! aggregate them.
 
 mod google_cloud_metadata;
+mod native_service;
 #[cfg(target_os = "windows")]
 pub mod host;
 pub mod identity;
