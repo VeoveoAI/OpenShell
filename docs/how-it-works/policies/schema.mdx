@@ -423,6 +423,48 @@ For `2026-07-28` HTTP requests, cancel a request by closing its response stream.
 
 MCP introduced [tasks](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/tasks) as an experimental feature in `2025-11-25`, so the March and June 2025 revisions do not include the task methods or `notifications/tasks/status`. The default policy revision includes them, but using tasks also requires the peer's task capabilities and, for task-augmented tool calls, the tool's task-support declaration. The policy option does not negotiate these capabilities.
 
+#### Official Tasks Extension
+
+On builds with Tasks-extension inspection, MCP `2026-07-28` supports the official
+[`io.modelcontextprotocol/tasks` extension](https://github.com/modelcontextprotocol/ext-tasks/blob/main/specification/2026-07-28/tasks.md).
+Its client-to-server requests are `tasks/get`, `tasks/update`, and `tasks/cancel`.
+Each needs an exact method allow rule; `mcp.allow_all_known_mcp_methods` admits core
+methods only. For example, this endpoint permits the three Task-control methods:
+
+```yaml
+network_policies:
+  task_control:
+    endpoints:
+      - host: mcp.example.com
+        port: 443
+        path: /mcp
+        protocol: mcp
+        enforcement: enforce
+        mcp:
+          versions: ["2026-07-28"]
+          allow_all_known_mcp_methods: false
+        rules:
+          - allow: {method: tasks/get}
+          - allow: {method: tasks/update}
+          - allow: {method: tasks/cancel}
+    binaries:
+      - path: /usr/local/bin/task-client
+```
+
+Add discovery, tool calls, and subscriptions separately when the client needs them.
+Deny rules still take precedence. OpenShell validates the JSON-RPC request,
+`params.taskId`, the typed `inputResponses` map required by `tasks/update`, and the
+common per-request metadata. `Mcp-Method` must match the method and `Mcp-Name` must
+match `taskId`, using the same header encoding as other name-bearing requests.
+Capability declarations remain intact; the peers own extension negotiation and
+application authorization.
+
+The modern extension has no `tasks/result` or `tasks/list`; results arrive in
+`tasks/get` or server-to-client `notifications/tasks` updates through
+`subscriptions/listen`. A client cannot send `notifications/tasks` to impersonate
+the server. Legacy Tasks remain restricted to their existing `2025-11-25` profile;
+Task-control allow rules do not enable them in earlier revisions.
+
 #### MCP Version Selection
 
 `mcp.versions` lists the MCP revisions an endpoint accepts: `2025-03-26`,

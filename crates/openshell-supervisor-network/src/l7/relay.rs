@@ -11575,6 +11575,190 @@ network_policies:
         }
     }
 
+    fn mcp_tasks_extension_relay_context(
+        method: &str,
+        exact_allow: bool,
+        deny: bool,
+    ) -> (L7EndpointConfig, TunnelPolicyEngine, L7EvalContext) {
+        let allow = if exact_allow {
+            format!("          - allow: {{method: '{method}'}}\n")
+        } else {
+            String::new()
+        };
+        let deny = if deny {
+            format!("        deny_rules:\n          - method: '{method}'\n")
+        } else {
+            String::new()
+        };
+        mcp_relay_context_from_data(&format!(
+            r#"
+network_policies:
+  mcp_api:
+    name: mcp_api
+    endpoints:
+      - host: mcp.example.test
+        port: 8000
+        path: /mcp
+        protocol: mcp
+        enforcement: enforce
+        mcp:
+          versions: ["2026-07-28"]
+          allow_all_known_mcp_methods: true
+        rules:
+          - allow: {{}}
+{allow}{deny}    binaries:
+      - {{path: /usr/bin/python3}}
+"#
+        ))
+    }
+
+    #[tokio::test]
+    async fn mcp_tasks_extension_relays_require_exact_allow_and_preserve_deny_precedence() {
+        for route_selected in [false, true] {
+            for method in ["tasks/get", "tasks/update", "tasks/cancel"] {
+                let body = sessionless_mcp_body(
+                    method,
+                    serde_json::json!({
+                        "taskId": "task-opaque", "inputResponses": {}
+                    }),
+                );
+                let headers = format!(
+                    "MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: {method}\r\nMcp-Name: task-opaque\r\n"
+                );
+                for (exact_allow, deny, allowed) in [
+                    (false, false, false),
+                    (true, false, true),
+                    (true, true, false),
+                ] {
+                    let (response, forwarded) = run_mcp_relay_case(
+                        mcp_tasks_extension_relay_context(method, exact_allow, deny),
+                        route_selected,
+                        &headers,
+                        &body,
+                        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                    let status = if allowed {
+                        "204 No Content"
+                    } else {
+                        "403 Forbidden"
+                    };
+                    assert!(
+                        response.starts_with(&format!("HTTP/1.1 {status}")),
+                        "{method}: {response}"
+                    );
+                    if allowed {
+                        let forwarded = String::from_utf8(forwarded).unwrap();
+                        assert!(forwarded.contains(&headers), "Task routing headers changed");
+                        assert!(forwarded.ends_with(&body), "Task request body changed");
+                    } else {
+                        assert!(
+                            forwarded.is_empty(),
+                            "Task request bypassed extension policy"
+                        );
+                        if deny {
+                            assert!(response.contains("deny rule"), "{response}");
+                        } else {
+                            assert!(response.contains("exact allow rule"), "{response}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_tasks_extension_relays_reject_routing_mismatch_and_notification_spoof() {
+        for route_selected in [false, true] {
+            for (method, name_header) in [
+                ("tasks/get", ""),
+                ("tasks/get", "Mcp-Name: wrong-task\r\n"),
+                (
+                    "tasks/get",
+                    "Mcp-Name: task-opaque\r\nMcp-Name: task-opaque\r\n",
+                ),
+                ("tasks/cancel", "Mcp-Name: task-opaque\r\n"),
+            ] {
+                let headers = format!(
+                    "MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: {method}\r\n{name_header}"
+                );
+                let body =
+                    sessionless_mcp_body("tasks/get", serde_json::json!({"taskId": "task-opaque"}));
+                let (response, forwarded) = run_mcp_relay_case(
+                    mcp_tasks_extension_relay_context("tasks/get", true, false),
+                    route_selected,
+                    &headers,
+                    &body,
+                    "",
+                )
+                .await;
+                assert!(
+                    response.starts_with("HTTP/1.1 400 Bad Request"),
+                    "{response}"
+                );
+                assert!(
+                    response.contains("invalid_mcp_request_metadata"),
+                    "{response}"
+                );
+                assert!(forwarded.is_empty());
+            }
+            let body = serde_json::json!({"jsonrpc": "2.0", "method": "notifications/tasks",
+                "params": {"taskId": "private-task-marker", "status": "completed"}})
+            .to_string();
+            let (response, forwarded) = run_mcp_relay_case(
+                mcp_tasks_extension_relay_context("notifications/tasks", true, false),
+                route_selected,
+                "MCP-Protocol-Version: 2026-07-28\r\n",
+                &body,
+                "",
+            )
+            .await;
+            assert!(
+                response.starts_with("HTTP/1.1 400 Bad Request"),
+                "{response}"
+            );
+            assert!(response.contains("server-to-client only"), "{response}");
+            assert!(!response.contains("private-task-marker"));
+            assert!(forwarded.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn final_mcp_tasks_extension_check_reinspects_changed_task_routing() {
+        let (config, _, ctx) = mcp_tasks_extension_relay_context("tasks/get", true, false);
+        for (header_method, task_id, valid) in [
+            ("tasks/get", "task-opaque", true),
+            ("tasks/cancel", "task-opaque", false),
+            ("tasks/get", "changed-task", false),
+        ] {
+            let body = sessionless_mcp_body("tasks/get", serde_json::json!({"taskId": task_id}));
+            let request = crate::l7::provider::L7Request {
+                action: "POST".into(), target: "/mcp".into(), query_params: TestHashMap::new(),
+                raw_header: format!("POST /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: {header_method}\r\nMcp-Name: task-opaque\r\nContent-Length: {}\r\n\r\n{body}", body.len()).into_bytes(),
+                body_length: crate::l7::provider::BodyLength::ContentLength(body.len() as u64),
+            };
+            let mut response = Vec::new();
+            let allowed = enforce_final_mcp_protocol_version(
+                &config,
+                &request,
+                &mut response,
+                &ctx,
+                "/mcp",
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(allowed, valid);
+            if !valid {
+                assert!(
+                    String::from_utf8(response)
+                        .unwrap()
+                        .contains("invalid_mcp_request_metadata")
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn mcp_sessionless_relays_apply_metadata_and_method_policy() {
         for route_selected in [false, true] {

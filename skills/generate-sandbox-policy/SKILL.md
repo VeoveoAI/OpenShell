@@ -188,6 +188,14 @@ startup with `ConfigurationInvalid`. Repair the complete policy or provider
 selection using the published policy workflow; do not add
 `allow_uninspected_credentials` merely to bypass a startup error.
 
+For MCP, check the selected build's supported revisions and extension inspection
+before generating rules. On builds with official Tasks-extension inspection,
+`2026-07-28` Task control uses exact `tasks/get`, `tasks/update`, and `tasks/cancel`
+allow rules; `allow_all_known_mcp_methods` stays core-only. Do not generate modern
+`tasks/result` or `tasks/list` rules. See the published
+[Tasks policy contract](https://docs.nvidia.com/openshell/latest/how-it-works/policies/schema#official-tasks-extension)
+for metadata, routing headers, and peer-owned capability negotiation.
+
 ## Step 4: Choose Policy Shape
 
 Follow this decision tree based on the detail tier and user intent:
