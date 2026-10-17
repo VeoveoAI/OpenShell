@@ -187,7 +187,16 @@ async fn pump(
             grpc,
         )
     });
-    while let Some(data) = source.data().await {
+    loop {
+        let data = tokio::select! {
+            data = source.data() => data,
+            _ = std::future::poll_fn(|cx| destination.poll_reset(cx)) => {
+                return Err(miette!("HTTP/2 receiving peer cancelled the stream"));
+            }
+        };
+        let Some(data) = data else {
+            break;
+        };
         guard.ensure_current()?;
         let data = data.into_diagnostic()?;
         let length = data.len();
@@ -206,7 +215,13 @@ async fn pump(
         send_data(&mut destination, scanner.finish()?, &guard, request_context).await?;
     }
     guard.ensure_current()?;
-    if let Some(trailers) = source.trailers().await.into_diagnostic()? {
+    let trailers = tokio::select! {
+        trailers = source.trailers() => trailers.into_diagnostic()?,
+        _ = std::future::poll_fn(|cx| destination.poll_reset(cx)) => {
+            return Err(miette!("HTTP/2 receiving peer cancelled the stream"));
+        }
+    };
+    if let Some(trailers) = trailers {
         if request_context.is_some()
             && trailers.iter().any(|(name, value)| {
                 secrets::contains_reserved_credential_marker(name.as_str())
@@ -290,9 +305,18 @@ async fn exchange(
         downstream.send_response(response, true).into_diagnostic()?;
         return Ok(());
     }
-    let (prepared, scoped) =
-        prepare_inspected_request(request_headers, &context, &engine, &config, &info).await?;
-    let mut upstream = upstream.ready().await.into_diagnostic()?;
+    let (prepared, scoped) = tokio::select! {
+        prepared = prepare_inspected_request(request_headers, &context, &engine, &config, &info) => prepared?,
+        _ = std::future::poll_fn(|cx| downstream.poll_reset(cx)) => {
+            return Err(miette!("HTTP/2 client cancelled before request admission"));
+        }
+    };
+    let mut upstream = tokio::select! {
+        upstream = upstream.ready() => upstream.into_diagnostic()?,
+        _ = std::future::poll_fn(|cx| downstream.poll_reset(cx)) => {
+            return Err(miette!("HTTP/2 client cancelled before forwarding"));
+        }
+    };
     let (mut parts, body) = request.into_parts();
     parts.headers = resolved_headers(&prepared.raw_header, scoped.secret_resolver.as_deref())?;
     engine.generation_guard().ensure_current()?;
@@ -328,7 +352,14 @@ async fn exchange(
         Ok::<_, miette::Report>(())
     };
     let download = async {
-        let response = response.await.into_diagnostic()?;
+        let response = tokio::select! {
+            response = response => response.into_diagnostic()?,
+            _ = std::future::poll_fn(|cx| downstream.poll_reset(cx)) => {
+                // Cancelling this exchange drops both upstream stream handles.
+                // h2 then resets the upstream rather than retaining a stalled RPC.
+                return Err(miette!("HTTP/2 client cancelled while awaiting response"));
+            }
+        };
         let (parts, body) = response.into_parts();
         let end = body.is_end_stream();
         let send = downstream
@@ -417,6 +448,104 @@ network_policies:
     binaries:
       - {path: /usr/bin/client}
 "#;
+
+    #[tokio::test]
+    async fn downstream_cancellation_resets_upstream_and_releases_relay_slots() {
+        for response_started in [false, true] {
+            let engine =
+                OpaEngine::from_strings(include_str!("../../data/sandbox-policy.rego"), POLICY)
+                    .unwrap();
+            let input = NetworkInput {
+                host: "rpc.example.test".into(),
+                port: 443,
+                binary_path: PathBuf::from("/usr/bin/client"),
+                binary_sha256: "unused".into(),
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            };
+            let (config, generation) = engine
+                .query_endpoint_config_with_generation(&input)
+                .unwrap();
+            let config = super::super::parse_l7_config(&config.unwrap()).unwrap();
+            let tunnel = engine.clone_engine_for_tunnel(generation).unwrap();
+            let context = L7EvalContext {
+                host: input.host,
+                port: 443,
+                request_default_port: Some(443),
+                binary_path: "/usr/bin/client".into(),
+                policy_name: "rpc".into(),
+                ..Default::default()
+            };
+            let (app, relay_client) = tokio::io::duplex(8192);
+            let (relay_upstream, upstream) = tokio::io::duplex(8192);
+            let relay_task =
+                tokio::spawn(relay(relay_client, relay_upstream, config, tunnel, context));
+            let (seen_tx, mut seen_rx) = tokio::sync::mpsc::channel(4);
+            let (reset_tx, mut reset_rx) = tokio::sync::mpsc::channel(4);
+            let upstream_task = tokio::spawn(async move {
+                let mut server = h2::server::handshake(upstream).await.unwrap();
+                let mut pending = JoinSet::new();
+                while let Some(request) = server.accept().await {
+                    let (request, mut response) = request.unwrap();
+                    assert!(request.body().is_end_stream(), "upload must have completed");
+                    let (seen, reset) = (seen_tx.clone(), reset_tx.clone());
+                    pending.spawn(async move {
+                        let reason = if response_started {
+                            let mut body =
+                                response.send_response(Response::new(()), false).unwrap();
+                            seen.send(()).await.unwrap();
+                            std::future::poll_fn(|cx| body.poll_reset(cx))
+                                .await
+                                .unwrap()
+                        } else {
+                            seen.send(()).await.unwrap();
+                            std::future::poll_fn(|cx| response.poll_reset(cx))
+                                .await
+                                .unwrap()
+                        };
+                        reset.send(reason).await.unwrap();
+                    });
+                }
+            });
+            let (mut app, connection) = h2::client::handshake(app).await.unwrap();
+            let app_task = tokio::spawn(connection);
+            // More cancellations than the relay's slot limit prove that cancelled
+            // exchanges do not accumulate even when the connection stays open.
+            for _ in 0..=MAX_STREAMS {
+                app = app.ready().await.unwrap();
+                let (response, mut send) = app
+                    .send_request(
+                        Request::builder()
+                            .method("POST")
+                            .uri("https://rpc.example.test/rpc/read")
+                            .body(())
+                            .unwrap(),
+                        true,
+                    )
+                    .unwrap();
+                tokio::pin!(response);
+                tokio::time::timeout(Duration::from_secs(1), seen_rx.recv())
+                    .await
+                    .expect("relay slot was not released")
+                    .unwrap();
+                let held_response = if response_started {
+                    Some((&mut response).await.unwrap())
+                } else {
+                    None
+                };
+                send.send_reset(h2::Reason::CANCEL);
+                let reason = tokio::time::timeout(Duration::from_millis(500), reset_rx.recv())
+                    .await
+                    .expect("downstream cancellation did not reach the stalled upstream")
+                    .unwrap();
+                assert_eq!(reason, h2::Reason::CANCEL);
+                drop(held_response);
+            }
+            relay_task.abort();
+            upstream_task.abort();
+            app_task.abort();
+        }
+    }
 
     #[tokio::test]
     async fn streams_grpc_and_credentials_with_policy_and_authority_checks() {
