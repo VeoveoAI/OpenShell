@@ -1712,6 +1712,7 @@ fn preprocess_yaml_data(
             "invalid L7 policy configuration",
         )));
     }
+    validate_mcp_rest_route_selectors(&data)?;
     // Emit authored warnings only after the candidate passes validation.
     emit_l7_config_warnings(&warnings, "L7 policy validation warning");
 
@@ -1722,6 +1723,73 @@ fn preprocess_yaml_data(
     emit_l7_config_warnings(&expansion_warnings, "L7 access preset expansion warning");
 
     serde_json::to_string(&data).map_err(|_| miette::miette!("failed to serialize OPA policy data"))
+}
+
+/// Check raw local-policy routes with the same selector overlap analysis as
+/// typed policy. Project only REST/MCP selectors after field validation and port
+/// normalization; raw OPA data can also carry fields outside the authored schema.
+fn validate_mcp_rest_route_selectors(data: &serde_json::Value) -> Result<()> {
+    use openshell_core::proto::{NetworkEndpoint, NetworkPolicyRule};
+
+    let Some(policies) = data
+        .get("network_policies")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Ok(());
+    };
+    let mut selectors = ProtoSandboxPolicy::default();
+    for (name, policy) in policies {
+        let endpoints = policy
+            .get("endpoints")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|endpoint| {
+                let protocol = endpoint.get("protocol")?.as_str()?;
+                if !matches!(protocol, "mcp" | "rest") {
+                    return None;
+                }
+                Some(NetworkEndpoint {
+                    host: endpoint
+                        .get("host")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .into(),
+                    path: endpoint
+                        .get("path")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .into(),
+                    protocol: protocol.into(),
+                    ports: endpoint
+                        .get("ports")
+                        .and_then(serde_json::Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|port| port.as_u64().and_then(|port| u32::try_from(port).ok()))
+                        .collect(),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        selectors.network_policies.insert(
+            name.clone(),
+            NetworkPolicyRule {
+                name: name.clone(),
+                endpoints,
+                ..Default::default()
+            },
+        );
+    }
+    let ambiguities = openshell_policy::find_endpoint_ambiguities(&selectors);
+    if !ambiguities.is_empty() {
+        return Err(miette::miette!(render_repeated_validation_diagnostic(
+            "network endpoint ambiguity validation failed",
+            ambiguities.len(),
+            "overlapping REST/MCP endpoint selectors",
+        )));
+    }
+    Ok(())
 }
 
 /// Canonicalize recognized protocol spellings before L7 validation or Rego use.
@@ -8570,6 +8638,92 @@ network_policies:
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
         assert_eq!(val, regorus::Value::from(true));
+    }
+
+    fn rest_mcp_route_data(rest_path: &str) -> String {
+        format!(
+            r#"
+version: 1
+network_policies:
+  routes:
+    name: routes
+    endpoints:
+      - host: api.example.com
+        port: 8080
+        path: "{rest_path}"
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: {{ method: GET, path: "/**" }}
+      - host: api.example.com
+        port: 8080
+        path: "/mcp"
+        protocol: mcp
+        enforcement: enforce
+        rules:
+          - allow: {{ method: initialize }}
+    binaries:
+      - {{ path: /usr/bin/curl }}
+"#
+        )
+    }
+
+    #[test]
+    fn rest_mcp_routes_have_the_same_overlap_boundary_in_typed_and_local_loads() {
+        for (path, admitted) in [
+            ("/oauth/**", true),
+            ("/mcp-other/**", true),
+            ("/mcp", false),
+            ("/mcp/**", false),
+            ("/m?p", false),
+            ("/**", false),
+        ] {
+            let data = rest_mcp_route_data(path);
+            let local = OpaEngine::from_strings(TEST_POLICY, &data);
+            let proto =
+                openshell_policy::parse_sandbox_policy(&data).expect("valid authored shape");
+            let typed = OpaEngine::from_proto(&proto);
+            assert_eq!(local.is_ok(), admitted, "local {path}");
+            assert_eq!(typed.is_ok(), admitted, "typed {path}");
+            if !admitted {
+                for result in [local, typed] {
+                    let Err(error) = result else {
+                        panic!("overlap must reject activation")
+                    };
+                    assert!(error.to_string().contains("ambiguity validation failed"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn overlapping_rest_mcp_reload_keeps_the_active_generation_and_route() {
+        let engine =
+            OpaEngine::from_strings(TEST_POLICY, &rest_mcp_route_data("/oauth/**")).unwrap();
+        let generation = engine.current_generation();
+        assert!(
+            engine
+                .reload(TEST_POLICY, &rest_mcp_route_data("/**"))
+                .is_err()
+        );
+        assert_eq!(engine.current_generation(), generation);
+        let input = NetworkInput {
+            host: "api.example.com".into(),
+            port: 8080,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let (configs, _) = engine
+            .query_endpoint_configs_with_generation(&input)
+            .unwrap();
+        let mut paths = configs
+            .iter()
+            .map(|config| crate::l7::parse_l7_config(config).unwrap().path)
+            .collect::<Vec<_>>();
+        paths.sort();
+        assert_eq!(paths, ["/mcp", "/oauth/**"]);
     }
 
     #[test]

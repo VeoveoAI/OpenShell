@@ -11,12 +11,12 @@
 //! aggregate them.
 
 mod google_cloud_metadata;
-mod native_service;
 #[cfg(target_os = "windows")]
 pub mod host;
 pub mod identity;
 pub mod identity_source;
 pub mod l7;
+mod native_service;
 pub mod opa;
 pub(crate) mod policy_dns;
 pub mod policy_local;

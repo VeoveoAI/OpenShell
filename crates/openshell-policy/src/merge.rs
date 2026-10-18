@@ -586,7 +586,7 @@ impl std::fmt::Display for PolicyMergeError {
                 contracts,
             } => write!(
                 f,
-                "{host}:{port} would carry more than one L7 inspection contract ({}); the sandbox resolves one contract per host and port, so these cannot coexist even in different rules or under different paths",
+                "{host}:{port} would carry incompatible L7 inspection contracts ({}); MCP contracts must agree, and REST/MCP endpoint paths must not overlap even across rules",
                 contracts.join(", ")
             ),
             Self::InvalidL7Target {
@@ -1046,6 +1046,7 @@ struct EffectiveInspection {
     protocol: String,
     /// Present only when the endpoint is inspected as MCP.
     mcp: Option<EffectiveMcpContract>,
+    path: String,
 }
 
 /// Host and port pairs whose inspected endpoints cannot coexist, mapped to the
@@ -1070,6 +1071,7 @@ fn conflicting_inspection_contracts(
             let inspection = EffectiveInspection {
                 protocol: endpoint.protocol.to_ascii_lowercase(),
                 mcp: effective_mcp_contract(endpoint),
+                path: endpoint.path.clone(),
             };
             for port in canonical_ports(endpoint) {
                 contracts
@@ -1106,9 +1108,10 @@ fn conflicting_inspection_contracts(
 /// MCP is different. Its allow rules address JSON-RPC methods and tool names, so
 /// a plain REST rule on an overlapping path can satisfy authorization for a tool
 /// call the MCP endpoint never allowed, and the relay forwards it. MCP therefore
-/// cannot share a host and port with a differently inspected endpoint. Two MCP
-/// endpoints must also agree on one contract, including the exact revision
-/// allowlist, because MCP options are not path-selected.
+/// can share a host and port with REST only when their endpoint path selectors
+/// provably do not overlap. HTTP method rules cannot disambiguate parser choice.
+/// Other mixed MCP inspections remain unsupported. Two MCP endpoints must still
+/// agree on one contract, including the exact revision allowlist.
 fn inspections_conflict(found: &[(EffectiveInspection, String)]) -> bool {
     let mut mcp_contracts = found
         .iter()
@@ -1116,10 +1119,17 @@ fn inspections_conflict(found: &[(EffectiveInspection, String)]) -> bool {
     let Some(first) = mcp_contracts.next() else {
         return false;
     };
-    if found.iter().any(|(inspection, _)| inspection.mcp.is_none()) {
+    if mcp_contracts.any(|contract| contract != first) {
         return true;
     }
-    mcp_contracts.any(|contract| contract != first)
+    found.iter().any(|(mcp, _)| {
+        mcp.mcp.is_some()
+            && found.iter().any(|(other, _)| {
+                other.mcp.is_none()
+                    && (other.protocol != "rest"
+                        || crate::ambiguity::path_patterns_overlap(&mcp.path, &other.path))
+            })
+    })
 }
 
 /// Rejects an operation that introduces an L7 inspection-contract conflict.
@@ -6915,11 +6925,84 @@ mod tests {
         .expect("path selectors disambiguate these protocols at request time");
     }
 
+    #[test]
+    fn disjoint_rest_mcp_paths_are_admitted_but_overlaps_and_other_protocols_are_not() {
+        for (protocol, path, admitted) in [
+            ("rest", "/oauth/**", true),
+            ("rest", "/mcp-other/**", true),
+            ("rest", "/m?p", false),
+            ("rest", "/mcp/**", false),
+            ("rest", "/**", false),
+            ("json-rpc", "/oauth/**", false),
+        ] {
+            for separate_rule in [false, true] {
+                let policy = policy_with_rule(
+                    "existing",
+                    rule_with_authorizations(
+                        "existing",
+                        vec![NetworkEndpoint {
+                            path: "/mcp".into(),
+                            ..mcp_endpoint(
+                                "svc.example.com",
+                                &[443],
+                                None,
+                                None,
+                                0,
+                                vec![mcp_tool_rule("safe")],
+                            )
+                        }],
+                        &["/usr/bin/agent"],
+                    ),
+                );
+                let name = if separate_rule {
+                    "incoming"
+                } else {
+                    "existing"
+                };
+                let incoming = rule_with_authorizations(
+                    name,
+                    vec![NetworkEndpoint {
+                        path: path.into(),
+                        protocol: protocol.into(),
+                        enforcement: NetworkEnforcementMode::Enforce as i32,
+                        rules: vec![if protocol == "rest" {
+                            rest_rule("GET", "/**")
+                        } else {
+                            mcp_tool_rule("safe")
+                        }],
+                        ..endpoint("svc.example.com", 443)
+                    }],
+                    &["/usr/bin/agent"],
+                );
+                let result = merge_policy(
+                    policy,
+                    &[PolicyMergeOp::AddRule {
+                        rule_name: name.into(),
+                        rule: incoming,
+                    }],
+                );
+                if admitted {
+                    let merged =
+                        result.expect("provably disjoint REST/MCP routes should be admitted");
+                    assert!(crate::find_endpoint_ambiguities(&merged.policy).is_empty());
+                } else {
+                    assert!(
+                        matches!(
+                            result,
+                            Err(PolicyMergeError::ConflictingInspectionContracts { .. })
+                        ),
+                        "{protocol} {path}, separate={separate_rule}: {result:?}"
+                    );
+                }
+            }
+        }
+    }
+
     /// Authorization is evaluated across every matching endpoint, but the parser
     /// is chosen by most-specific path. A broad REST rule can therefore satisfy
     /// authorization for a JSON-RPC tool call that the MCP endpoint selected to
-    /// parse it never allowed, and the relay forwards it. MCP cannot share a
-    /// host and port with a differently inspected endpoint.
+    /// parse it never allowed, and the relay forwards it. Overlapping MCP/REST
+    /// paths must therefore be rejected even when one selector is more specific.
     #[test]
     fn mcp_alongside_a_broader_rest_endpoint_is_rejected() {
         let existing = rule_with_authorizations(

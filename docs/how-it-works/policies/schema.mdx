@@ -639,6 +639,16 @@ port, uses different rules. An empty path, `**`, or `/**` matches every path,
 `/v1/**` matches `/v1` and every path under it, and in other patterns `*` also
 matches `/`.
 
+On builds with disjoint REST/MCP route admission, you can inspect REST and MCP
+on the same host and port when their endpoint `path` selectors do not overlap.
+For example, use REST at `/oauth/**` and MCP at `/mcp/local`. Set the endpoint
+selectors themselves; narrow HTTP allow-rule paths alone do not separate the
+parsers. Overlapping selectors are rejected even when their HTTP method rules
+or path specificity differ, because REST authorization must not admit an MCP
+call that its MCP rules deny. All MCP endpoints on that host and port must still
+agree on their inspection options. This does not enable arbitrary mixed protocols
+or change credential bindings, TLS verification or MCP method restrictions.
+
 ## Full Example
 
 ```yaml showLineNumbers={false}

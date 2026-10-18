@@ -9712,6 +9712,7 @@ network_policies:
     ) -> (Vec<L7EndpointConfig>, TunnelPolicyEngine, L7EvalContext) {
         let data = format!(
             r#"
+version: 1
 network_policies:
   shared_api:
     name: shared_api
@@ -9737,6 +9738,27 @@ network_policies:
       - {{ path: /usr/bin/python3 }}
 "#
         );
+        if protocol == "mcp" {
+            // Exercise real incremental admission before using these routes in
+            // relay regressions, rather than loading a hand-built bypass.
+            let mut policy = openshell_policy::parse_sandbox_policy(&data).unwrap();
+            let rule = policy.network_policies.get_mut("shared_api").unwrap();
+            let rest = rule.endpoints.pop().unwrap();
+            let incoming = openshell_core::proto::NetworkPolicyRule {
+                endpoints: vec![rest],
+                ..rule.clone()
+            };
+            let merged = openshell_policy::merge_policy(
+                policy,
+                &[openshell_policy::PolicyMergeOp::AddRule {
+                    rule_name: "shared_api".into(),
+                    rule: incoming,
+                }],
+            )
+            .expect("disjoint REST/MCP paths must pass incremental admission");
+            let admitted = openshell_policy::serialize_sandbox_policy(&merged.policy).unwrap();
+            return two_endpoint_route_configs(&admitted, "mcp.example.test", "shared_api");
+        }
         two_endpoint_route_configs(&data, "mcp.example.test", "shared_api")
     }
 
@@ -9990,6 +10012,52 @@ network_policies:
             assert!(
                 receiver.try_recv().is_err(),
                 "route_selected={route_selected}: one result per exchange"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn admitted_rest_mcp_routes_canonicalize_before_parser_and_authorization_selection() {
+        for path in ["/api/../mcp", "/%6dcp", "//mcp"] {
+            let (configs, engine, ctx) = jsonrpc_and_rest_route_configs("mcp", "enforce");
+            let (mut app, mut client) = tokio::io::duplex(8192);
+            let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+            let relay = tokio::spawn(async move {
+                relay_with_route_selection(&configs, engine, &mut client, &mut relay_upstream, &ctx)
+                    .await
+            });
+            let request = format!(
+                "POST {path} HTTP/1.1\r\nHost: mcp.example.test:8000\r\nContent-Type: application/json\r\nMCP-Protocol-Version: 2025-11-25\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                UNALLOWED_TOOL_CALL.len()
+            );
+            app.write_all(request.as_bytes()).await.unwrap();
+            app.write_all(UNALLOWED_TOOL_CALL).await.unwrap();
+            let mut response = Vec::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                app.read_to_end(&mut response),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let mut forwarded = Vec::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                upstream.read_to_end(&mut forwarded),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let response = String::from_utf8_lossy(&response);
+            assert!(response.starts_with("HTTP/1.1 403"), "{path}: {response}");
+            assert!(
+                forwarded.is_empty(),
+                "{path}: a denied MCP tool call reached upstream"
             );
         }
     }
