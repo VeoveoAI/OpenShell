@@ -517,6 +517,10 @@ fn prepare_server_config_with_drivers(
     }
 
     config = config.with_database_url(db_url);
+    config.tcp_forwarding = file
+        .as_ref()
+        .and_then(|file| file.openshell.gateway.tcp_forwarding)
+        .unwrap_or_default();
     if let Some(driver) = &args.compute_driver {
         config = config.with_compute_driver(driver);
     }

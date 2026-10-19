@@ -68,8 +68,8 @@ pub use config::{
     AppArmorProfile, Config, GatewayAuthConfig, GatewayInterceptorBindingOverride,
     GatewayInterceptorBindingPolicy, GatewayInterceptorConfig, GatewayInterceptorFailurePolicy,
     GatewayInterceptorPhaseConfig, GatewayJwtConfig, GatewayProviderProfileSourceConfig,
-    ImagePullPolicy, MtlsAuthConfig, OidcConfig, PolicyValidationFailureMode, TlsConfig,
-    UpstreamProxyConfig,
+    ImagePullPolicy, MtlsAuthConfig, OidcConfig, PolicyValidationFailureMode, TcpForwardingConfig,
+    TlsConfig, UpstreamProxyConfig,
 };
 pub use dynamic_string_allowlist::DynamicStringAllowlist;
 pub use error::{ComputeDriverError, Error, Result};

@@ -2659,6 +2659,7 @@ struct ForwardConnectionGuard {
     state: Arc<ServerState>,
     token: Option<String>,
     sandbox_id: String,
+    tcp: bool,
 }
 
 impl Drop for ForwardConnectionGuard {
@@ -2666,7 +2667,21 @@ impl Drop for ForwardConnectionGuard {
         if let Some(token) = self.token.as_deref() {
             decrement_ssh_connection_count(&self.state.ssh_connections_by_token, token);
         }
-        decrement_ssh_connection_count(&self.state.ssh_connections_by_sandbox, &self.sandbox_id);
+        if self.tcp {
+            let mut counts = self.state.tcp_forward_connections.lock().unwrap();
+            counts.total -= 1;
+            if let Some(count) = counts.by_sandbox.get_mut(&self.sandbox_id) {
+                *count -= 1;
+                if *count == 0 {
+                    counts.by_sandbox.remove(&self.sandbox_id);
+                }
+            }
+        } else {
+            decrement_ssh_connection_count(
+                &self.state.ssh_connections_by_sandbox,
+                &self.sandbox_id,
+            );
+        }
     }
 }
 
@@ -2674,8 +2689,8 @@ impl Drop for ForwardConnectionGuard {
 ///
 /// `target.tcp` streams are authorized by the caller's gateway principal, which
 /// `handle_forward_tcp` has already checked against the sandbox's workspace, so
-/// they carry no session token and touch no store: the only per-connection
-/// state is the in-memory per-sandbox connection count. `target.ssh` streams
+/// they carry no session token and touch no store. Their active per-sandbox
+/// and per-replica counts are independent of SSH session capacity. `target.ssh` streams
 /// keep requiring the `CreateSshSession` token because the process that opens
 /// them is an ssh `ProxyCommand` that holds nothing else. A token supplied with
 /// a TCP target (older clients) is still validated and counted per token.
@@ -2686,32 +2701,57 @@ async fn acquire_forward_connection_guard(
 ) -> Result<ForwardConnectionGuard, Status> {
     let sandbox_id = sandbox.object_id().to_string();
     let token = init.authorization_token.trim();
-    if token.is_empty() {
-        if !matches!(init.target, Some(tcp_forward_init::Target::Tcp(_))) {
-            return Err(Status::unauthenticated(
-                "authorization_token is required for SSH targets",
-            ));
-        }
-        acquire_sandbox_connection_slot(&state.ssh_connections_by_sandbox, &sandbox_id)?;
-        return Ok(ForwardConnectionGuard {
-            state: state.clone(),
-            token: None,
-            sandbox_id,
-        });
+    let tcp = matches!(init.target, Some(tcp_forward_init::Target::Tcp(_)));
+    if token.is_empty() && !tcp {
+        return Err(Status::unauthenticated(
+            "authorization_token is required for SSH targets",
+        ));
     }
-
-    validate_ssh_forward_token(state, token, &sandbox_id).await?;
-    acquire_ssh_connection_slots(
-        &state.ssh_connections_by_token,
-        &state.ssh_connections_by_sandbox,
-        token,
-        &sandbox_id,
-    )?;
-
+    if !token.is_empty() {
+        validate_ssh_forward_token(state, token, &sandbox_id).await?;
+    }
+    if tcp {
+        if !token.is_empty() {
+            acquire_ssh_token_connection_slot(&state.ssh_connections_by_token, token)?;
+        }
+        let limits = state.config.tcp_forwarding;
+        let result = {
+            let mut counts = state.tcp_forward_connections.lock().unwrap();
+            if counts.total >= limits.active_per_replica.get() {
+                Err(Status::resource_exhausted(
+                    "gateway TCP forwarding connection limit reached",
+                ))
+            } else if counts.by_sandbox.get(&sandbox_id).copied().unwrap_or(0)
+                >= limits.active_per_sandbox.get()
+            {
+                Err(Status::resource_exhausted(
+                    "sandbox TCP forwarding connection limit reached",
+                ))
+            } else {
+                counts.total += 1;
+                *counts.by_sandbox.entry(sandbox_id.clone()).or_default() += 1;
+                Ok(())
+            }
+        };
+        if let Err(error) = result {
+            if !token.is_empty() {
+                decrement_ssh_connection_count(&state.ssh_connections_by_token, token);
+            }
+            return Err(error);
+        }
+    } else {
+        acquire_ssh_connection_slots(
+            &state.ssh_connections_by_token,
+            &state.ssh_connections_by_sandbox,
+            token,
+            &sandbox_id,
+        )?;
+    }
     Ok(ForwardConnectionGuard {
         state: state.clone(),
-        token: Some(token.to_string()),
+        token: (!token.is_empty()).then(|| token.to_string()),
         sandbox_id,
+        tcp,
     })
 }
 
@@ -2743,14 +2783,9 @@ async fn validate_ssh_forward_token(
     Ok(())
 }
 
-const MAX_CONNECTIONS_PER_TOKEN: u32 = 3;
-const MAX_CONNECTIONS_PER_SANDBOX: u32 = 20;
-
-fn acquire_ssh_connection_slots(
+fn acquire_ssh_token_connection_slot(
     token_counts: &std::sync::Mutex<HashMap<String, u32>>,
-    sandbox_counts: &std::sync::Mutex<HashMap<String, u32>>,
     token: &str,
-    sandbox_id: &str,
 ) -> Result<(), Status> {
     {
         let mut counts = token_counts.lock().unwrap();
@@ -2762,6 +2797,20 @@ fn acquire_ssh_connection_slots(
         }
         *count += 1;
     }
+
+    Ok(())
+}
+
+const MAX_CONNECTIONS_PER_TOKEN: u32 = 3;
+const MAX_CONNECTIONS_PER_SANDBOX: u32 = 20;
+
+fn acquire_ssh_connection_slots(
+    token_counts: &std::sync::Mutex<HashMap<String, u32>>,
+    sandbox_counts: &std::sync::Mutex<HashMap<String, u32>>,
+    token: &str,
+    sandbox_id: &str,
+) -> Result<(), Status> {
+    acquire_ssh_token_connection_slot(token_counts, token)?;
 
     if let Err(status) = acquire_sandbox_connection_slot(sandbox_counts, sandbox_id) {
         decrement_ssh_connection_count(token_counts, token);
@@ -4389,11 +4438,12 @@ mod tests {
         })
     }
 
-    fn sandbox_connection_count(state: &ServerState, sandbox_id: &str) -> u32 {
+    fn sandbox_connection_count(state: &ServerState, sandbox_id: &str) -> usize {
         state
-            .ssh_connections_by_sandbox
+            .tcp_forward_connections
             .lock()
             .unwrap()
+            .by_sandbox
             .get(sandbox_id)
             .copied()
             .unwrap_or(0)
@@ -4668,13 +4718,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tcp_forwards_without_token_share_the_per_sandbox_connection_cap() {
-        let state = test_server_state().await;
+    async fn tcp_forwards_use_configured_capacity_independently_from_ssh() {
+        let mut state = test_server_state().await;
+        let config = &mut Arc::get_mut(&mut state).unwrap().config;
+        config.tcp_forwarding.active_per_sandbox = std::num::NonZeroUsize::new(24).unwrap();
+        config.tcp_forwarding.active_per_replica = std::num::NonZeroUsize::new(25).unwrap();
         let sandbox = test_sandbox("fwd", Vec::new());
         let init = forward_init(loopback_tcp_target(), "");
 
         let mut guards = Vec::new();
-        for _ in 0..MAX_CONNECTIONS_PER_SANDBOX {
+        for _ in 0..24 {
             guards.push(
                 acquire_forward_connection_guard(&state, &init, &sandbox)
                     .await
@@ -4686,12 +4739,37 @@ mod tests {
             .err()
             .expect("cap reached");
         assert_eq!(err.code(), tonic::Code::ResourceExhausted);
-        assert_eq!(err.message(), "sandbox SSH connection limit reached");
         assert_eq!(
-            sandbox_connection_count(&state, sandbox.object_id()),
-            MAX_CONNECTIONS_PER_SANDBOX
+            err.message(),
+            "sandbox TCP forwarding connection limit reached"
         );
+        assert_eq!(sandbox_connection_count(&state, sandbox.object_id()), 24);
 
+        assert!(state.ssh_connections_by_sandbox.lock().unwrap().is_empty());
+        let other = test_sandbox("fwd-other", Vec::new());
+        let other_guard = acquire_forward_connection_guard(&state, &init, &other)
+            .await
+            .unwrap();
+        let third = test_sandbox("fwd-third", Vec::new());
+        assert_eq!(
+            acquire_forward_connection_guard(&state, &init, &third)
+                .await
+                .err()
+                .unwrap()
+                .code(),
+            tonic::Code::ResourceExhausted
+        );
+        for _ in 0..MAX_CONNECTIONS_PER_SANDBOX {
+            acquire_sandbox_connection_slot(&state.ssh_connections_by_sandbox, sandbox.object_id())
+                .unwrap();
+        }
+        assert_eq!(
+            acquire_sandbox_connection_slot(&state.ssh_connections_by_sandbox, sandbox.object_id())
+                .unwrap_err()
+                .code(),
+            tonic::Code::ResourceExhausted
+        );
+        drop(other_guard);
         guards.pop();
         let guard = acquire_forward_connection_guard(&state, &init, &sandbox)
             .await
@@ -4699,6 +4777,18 @@ mod tests {
         drop(guard);
         drop(guards);
         assert_eq!(sandbox_connection_count(&state, sandbox.object_id()), 0);
+        assert_eq!(state.tcp_forward_connections.lock().unwrap().total, 0);
+        assert_eq!(
+            state
+                .ssh_connections_by_sandbox
+                .lock()
+                .unwrap()
+                .get(sandbox.object_id()),
+            Some(&MAX_CONNECTIONS_PER_SANDBOX)
+        );
+        for _ in 0..MAX_CONNECTIONS_PER_SANDBOX {
+            decrement_ssh_connection_count(&state.ssh_connections_by_sandbox, sandbox.object_id());
+        }
     }
 
     #[test]

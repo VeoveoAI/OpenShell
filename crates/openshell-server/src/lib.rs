@@ -255,6 +255,12 @@ pub(crate) struct ServerStartupConfig {
     pub legacy_compute_driver_env_seen: bool,
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct TcpForwardConnections {
+    total: usize,
+    by_sandbox: HashMap<String, usize>,
+}
+
 /// Server state shared across handlers.
 #[derive(Debug)]
 pub struct ServerState {
@@ -287,6 +293,9 @@ pub struct ServerState {
 
     /// Active SSH tunnel connection counts per sandbox id.
     pub ssh_connections_by_sandbox: Mutex<HashMap<String, u32>>,
+
+    /// TCP forwarding counts, independent from SSH session and sandbox counts.
+    pub(crate) tcp_forward_connections: Mutex<TcpForwardConnections>,
 
     /// Serializes settings mutations (global and sandbox) to prevent
     /// read-modify-write races. Held for the duration of any setting
@@ -447,6 +456,7 @@ impl ServerState {
             telemetry: telemetry::TelemetryState::new(),
             ssh_connections_by_token: Mutex::new(HashMap::new()),
             ssh_connections_by_sandbox: Mutex::new(HashMap::new()),
+            tcp_forward_connections: Mutex::new(TcpForwardConnections::default()),
             settings_mutex: tokio::sync::Mutex::new(()),
             supervisor_sessions,
             gateway_shutting_down: AtomicBool::new(false),
@@ -643,7 +653,9 @@ pub(crate) async fn run_server(
 
     let sandbox_index = SandboxIndex::new();
     let sandbox_watch_bus = SandboxWatchBus::new();
-    let supervisor_sessions = Arc::new(supervisor_session::SupervisorSessionRegistry::new());
+    let supervisor_sessions = Arc::new(
+        supervisor_session::SupervisorSessionRegistry::with_tcp_forwarding(config.tcp_forwarding),
+    );
     let driver_startup = compute::driver_config::DriverStartupContext {
         file: config_file.as_ref(),
         guest_tls: guest_tls.as_ref(),
@@ -870,9 +882,10 @@ pub(crate) async fn run_server(
 
     // Bind the Prometheus metrics endpoint on a dedicated port when configured.
     if let Some(metrics_bind_address) = config.metrics_bind_address {
-        let prometheus_handle =
-            gateway_metrics::install_global_recorder(supervisor_session::RELAY_CAPACITY)
-                .map_err(|e| Error::config(format!("failed to install metrics recorder: {e}")))?;
+        let prometheus_handle = gateway_metrics::install_global_recorder(
+            supervisor_session::relay_capacity(config.tcp_forwarding),
+        )
+        .map_err(|e| Error::config(format!("failed to install metrics recorder: {e}")))?;
         let metrics_listener = TcpListener::bind(metrics_bind_address).await.map_err(|e| {
             Error::transport(format!(
                 "failed to bind metrics port {metrics_bind_address}: {e}",

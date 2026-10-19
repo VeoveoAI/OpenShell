@@ -90,6 +90,16 @@ Use gateway metadata, deployment values, or the user's setup notes to identify t
 | VM | VM driver logs, rootfs availability, host virtualization support. |
 | Extension | External driver process, Unix socket ownership/mode, configured driver name, capability handshake, gateway logs. |
 
+For `ForwardTcp` resource exhaustion during parallel browser or service requests,
+inspect `[openshell.gateway.tcp_forwarding]` in the selected trusted gateway TOML.
+The positive active and pending budgets are separate for each sandbox and the
+replica. Defaults are 128/1024 active and 128/512 pending. Changes require only a
+gateway restart; sandbox and supervisor images are unchanged. Inspect the native
+gRPC status and the caller's own connection budget before changing limits. SSH
+keeps its independent session-token and sandbox limits; do not increase those to
+repair TCP forwarding. See the published gateway configuration reference and use
+the installed gateway's preflight command to validate the selected file.
+
 ### Step 3: Check Gateway Startup Dependencies
 
 Before debugging the compute platform, inspect gateway logs for failures in dependencies initialized before the listener becomes ready.

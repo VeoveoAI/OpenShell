@@ -329,6 +329,31 @@ External compute drivers declare this requirement by adding `openshell.compute.l
 
 `[openshell.gateway.auth] allow_unauthenticated_users = true` is an unsafe local-development and trusted-proxy escape hatch. It accepts user-facing CLI/API calls without OIDC or mTLS credentials while sandbox supervisors still authenticate with gateway-minted sandbox JWTs. Leave it false for shared and production gateways.
 
+## TCP forwarding capacity
+
+Native `ForwardTcp` connections to TCP targets have independent, finite gateway
+budgets. Configure them in the trusted gateway file; changes require a gateway
+restart, without rebuilding sandbox or supervisor images:
+
+```toml
+[openshell.gateway.tcp_forwarding]
+active_per_sandbox = 128
+active_per_replica = 1024
+pending_per_sandbox = 128
+pending_per_replica = 512
+```
+
+These values are also the defaults. All four values must be nonzero. Active
+budgets count connected streams and opens awaiting their target; pending budgets
+count only relay opens not yet claimed by a supervisor. Each global budget may
+independently dominate its per-sandbox budget. A full budget returns gRPC
+`ResourceExhausted`; closing or cancelling a stream releases its slot. Native
+workspace authorization and loopback-target validation remain mandatory.
+
+SSH retains its existing three connections per session token, twenty per sandbox,
+and separate pending-open limits. A TCP request supplying an SSH session token
+still validates that token and observes its per-token limit.
+
 ## OCSF JSONL Output
 
 `[openshell.gateway.ocsf_log]` enables a gateway-local file containing native OCSF events emitted by the gateway, including events without a sandbox association. Omit the table to disable it. Restart the gateway after changing this configuration.
