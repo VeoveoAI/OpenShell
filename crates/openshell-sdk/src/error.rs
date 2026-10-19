@@ -44,6 +44,9 @@ pub enum SdkError {
     Connect {
         /// Error message.
         message: String,
+        /// Original channel error, including its TCP, TLS or HTTP/2 cause chain.
+        #[source]
+        source: Option<Box<tonic::transport::Error>>,
     },
 
     /// Auth-related failure: OIDC discovery / refresh, token format invalid
@@ -139,6 +142,15 @@ impl SdkError {
     pub fn connect(message: impl Into<String>) -> Self {
         Self::Connect {
             message: message.into(),
+            source: None,
+        }
+    }
+
+    /// Preserve a channel connection failure and its original transport causes.
+    pub fn from_transport(error: tonic::transport::Error) -> Self {
+        Self::Connect {
+            message: "gateway transport failed".to_string(),
+            source: Some(Box::new(error)),
         }
     }
 
