@@ -425,6 +425,158 @@ fn inspected_volume(driver: &str, options: HashMap<String, String>) -> bollard::
     }
 }
 
+#[test]
+fn persistent_workspace_ownership_refuses_foreign_or_nonlocal_backing() {
+    let config = runtime_config();
+    let mut owned = inspected_volume("local", HashMap::new());
+    owned.name = docker_workspace_volume_name_by_id("workspace-owner", &config);
+    owned.labels = docker_workspace_volume_labels("workspace-owner", &config);
+    assert!(validate_docker_workspace_volume(&owned, "workspace-owner", &config).is_ok());
+    for label in owned.labels.keys() {
+        let mut changed = owned.clone();
+        changed.labels.insert(label.clone(), "foreign".into());
+        assert_eq!(
+            validate_docker_workspace_volume(&changed, "workspace-owner", &config)
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+    }
+    for (driver, options) in [
+        ("nfs", HashMap::new()),
+        ("local", HashMap::from([("device".into(), "/host".into())])),
+    ] {
+        let changed = bollard::models::Volume {
+            driver: driver.into(),
+            options,
+            ..owned.clone()
+        };
+        assert_eq!(
+            validate_docker_workspace_volume(&changed, "workspace-owner", &config)
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+    }
+    assert!(validate_docker_workspace_volume(&owned, "different-sandbox", &config).is_err());
+    let other_namespace = DockerDriverRuntimeConfig {
+        sandbox_namespace: "other-namespace".into(),
+        ..config
+    };
+    assert!(validate_docker_workspace_volume(&owned, "workspace-owner", &other_namespace).is_err());
+}
+
+#[tokio::test]
+async fn persistent_workspace_verification_precedes_resource_admission_bypass() {
+    let mut config = runtime_config();
+    config.allow_driver_config = true;
+    config.resource_admission.enabled = false;
+    let driver = test_driver_with_config(config);
+    let container = serde_json::from_value(serde_json::json!({
+        "Config": {"Labels": {
+            (LABEL_PERSISTENT_WORKSPACE_ROOT): "/workspace",
+            (LABEL_SANDBOX_ID): "workspace-owner"
+        }}, "Mounts": []
+    }))
+    .unwrap();
+    assert_eq!(
+        driver
+            .admit_container_resources(&container)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+}
+
+#[test]
+fn persistent_workspace_is_an_internal_mount_after_caller_mount_validation() {
+    let config = runtime_config();
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .labels
+        .insert(
+            LABEL_PERSISTENT_WORKSPACE_ROOT.into(),
+            "/caller-forged".into(),
+        );
+    let metadata = DockerImageMetadata {
+        id: "sha256:immutable".into(),
+        user: "1234:1235".into(),
+        working_dir: "/workspace/project".into(),
+        volumes: vec![],
+    };
+    let mut selection = DockerSandboxDriverConfig {
+        persistent_workspace: true,
+        ..Default::default()
+    };
+    let body = build_container_create_body_for_image(
+        &sandbox,
+        &config,
+        &selection,
+        None,
+        &metadata,
+        &test_workload_identity(),
+    )
+    .unwrap();
+    assert_eq!(
+        body.labels
+            .unwrap()
+            .get(LABEL_PERSISTENT_WORKSPACE_ROOT)
+            .map(String::as_str),
+        Some("/workspace/project")
+    );
+    let mounts = body.host_config.unwrap().mounts.unwrap();
+    let mount = mounts
+        .iter()
+        .find(|mount| mount.target.as_deref() == Some("/workspace/project"))
+        .unwrap();
+    assert_eq!(
+        mount.source.as_deref(),
+        Some(docker_workspace_volume_name_by_id(&sandbox.id, &config).as_str())
+    );
+    assert_eq!(mount.read_only, Some(false));
+    assert_eq!(mount.volume_options.as_ref().unwrap().no_copy, Some(false));
+    selection.mounts = serde_json::from_value::<DockerSandboxDriverConfig>(
+        serde_json::json!({"mounts": [{"type": "tmpfs", "target": "/workspace"}]}),
+    )
+    .unwrap()
+    .mounts;
+    assert_eq!(
+        build_container_create_body_for_image(
+            &sandbox,
+            &config,
+            &selection,
+            None,
+            &metadata,
+            &test_workload_identity()
+        )
+        .unwrap_err()
+        .code(),
+        tonic::Code::FailedPrecondition
+    );
+    let ordinary = build_container_create_body_for_image(
+        &sandbox,
+        &config,
+        &DockerSandboxDriverConfig::default(),
+        None,
+        &metadata,
+        &test_workload_identity(),
+    )
+    .unwrap();
+    assert!(
+        !ordinary
+            .labels
+            .unwrap()
+            .contains_key(LABEL_PERSISTENT_WORKSPACE_ROOT)
+    );
+}
+
 fn test_driver_with_config(config: DockerDriverRuntimeConfig) -> DockerComputeDriver {
     let wsl_all_gpu_fallback_enabled = config.gpu.wsl_all_gpu_fallback_enabled;
     DockerComputeDriver {
@@ -552,6 +704,113 @@ async fn live_docker_resource_admission_checks_native_volume_labels() {
             .unwrap();
         assert_eq!(results, vec![approved; 2]);
     }
+}
+
+#[tokio::test]
+#[ignore = "requires local Docker and OPENSHELL_DOCKER_WORKSPACE_TEST_IMAGE built from tests/fixtures/persistent-workspace.Dockerfile; never pulls"]
+async fn live_docker_persistent_workspace_survives_recreation_and_gc_until_explicit_delete() {
+    let image = std::env::var("OPENSHELL_DOCKER_WORKSPACE_TEST_IMAGE")
+        .expect("supply the immutable ID of the already-cached non-root workspace fixture image");
+    assert!(image.starts_with("sha256:"));
+    let temporary = TempDir::new().unwrap();
+    let suffix = temporary.path().file_name().unwrap().to_str().unwrap();
+    let mut config = runtime_config();
+    config.sandbox_namespace = format!("workspace-fixture-{suffix}");
+    config.image_pull_policy = ImagePullPolicy::Never;
+    let mut driver = test_driver_with_config(config);
+    driver.docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+    let mut sandbox = test_sandbox();
+    sandbox.id = format!("workspace-fixture-{suffix}");
+    sandbox.name = sandbox.id.clone();
+    let volume = docker_workspace_volume_name_by_id(&sandbox.id, &driver.config);
+    assert!(
+        matches!(driver.docker.inspect_volume(&volume).await, Err(error) if is_not_found_error(&error))
+    );
+    let mut containers = Vec::new();
+    let result: Result<(), Status> = async {
+        let metadata = driver.ensure_image_available(&sandbox.id, &image).await?;
+        if metadata.user != "1000:1000" || metadata.working_dir != "/workspace/project" {
+            return Err(Status::failed_precondition("use the non-root seeded workspace fixture image"));
+        }
+        let identity = ResolvedWorkloadIdentity::new(1000, 1000, vec![], "image".to_string(), metadata.id.clone())
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        let selection = DockerSandboxDriverConfig { persistent_workspace: true, ..Default::default() };
+        for (step, command) in [
+            ("first", concat!(
+                r#"test "$(id -u)" = 1000 && "#,
+                r#"test "$(stat -c %u /workspace/project)" = 1000 && "#,
+                r#"test "$(cat /workspace/project/image-seed)" = image-seed && "#,
+                "printf user-data > /workspace/project/retained",
+            )),
+            ("recreated", concat!(
+                r#"test "$(id -u)" = 1000 && "#,
+                r#"test "$(stat -c %u /workspace/project)" = 1000 && "#,
+                r#"test "$(cat /workspace/project/image-seed)" = image-seed && "#,
+                r#"test "$(cat /workspace/project/retained)" = user-data"#,
+            )),
+        ] {
+            ensure_docker_workspace_volume(&driver.docker, &sandbox.id, &driver.config).await?;
+            let mut body = build_container_create_body_for_image(&sandbox, &driver.config, &selection, None, &metadata, &identity)?;
+            let host = body.host_config.as_mut().unwrap();
+            host.binds = None;
+            host.mounts.as_mut().unwrap().retain(|mount| mount.target.as_deref() == Some("/workspace/project"));
+            // The fixture omits runtime mounts and runs a shell; workspace construction and admission stay native.
+            body.entrypoint = Some(vec!["/bin/sh".into(), "-c".into()]);
+            body.cmd = Some(vec![command.into()]);
+            let container = driver.docker.create_container(Some(CreateContainerOptionsBuilder::default()
+                .name(&format!("openshell-workspace-{suffix}-{step}")).build()), body).await
+                .map_err(|error| internal_status("create workspace fixture container", error))?;
+            containers.push(container.id.clone());
+            driver.docker.start_container(&container.id, None::<bollard::query_parameters::StartContainerOptions>).await
+                .map_err(|error| internal_status("start workspace fixture container", error))?;
+            let inspected = driver.docker.inspect_container(&container.id, None).await
+                .map_err(|error| internal_status("inspect workspace fixture container", error))?;
+            driver.admit_container_resources(&inspected).await?;
+            let finished = tokio::time::timeout(Duration::from_secs(20), async {
+                driver.docker.wait_container(&container.id, None::<bollard::query_parameters::WaitContainerOptions>).next().await
+            }).await.map_err(|_| Status::deadline_exceeded("workspace fixture command did not finish"))?
+                .ok_or_else(|| Status::internal("workspace fixture wait ended without status"))?
+                .map_err(|error| internal_status("wait for workspace fixture command", error))?;
+            if finished.status_code != 0 {
+                return Err(Status::internal("workspace fixture copy-up, ownership or retained data check failed"));
+            }
+            if step == "first" {
+                driver.docker.remove_container(&container.id, Some(RemoveContainerOptionsBuilder::default().force(true).build())).await
+                    .map_err(|error| internal_status("remove first workspace fixture container", error))?;
+                driver.reconcile_runtime_resources_at_startup().await?;
+                let retained = driver.docker.inspect_volume(&volume).await
+                    .map_err(|error| internal_status("inspect workspace after container-absence GC", error))?;
+                validate_docker_workspace_volume(&retained, &sandbox.id, &driver.config)?;
+            }
+        }
+        if !driver.delete_sandbox_inner(&sandbox.id, &sandbox.name).await? {
+            return Err(Status::internal("explicit sandbox Delete did not remove retained workspace"));
+        }
+        if !matches!(driver.docker.inspect_volume(&volume).await, Err(error) if is_not_found_error(&error)) {
+            return Err(Status::internal("explicit sandbox Delete retained its workspace volume"));
+        }
+        ensure_docker_workspace_volume(&driver.docker, &sandbox.id, &driver.config).await?;
+        if !driver.delete_sandbox_inner(&sandbox.id, "").await?
+            || !matches!(driver.docker.inspect_volume(&volume).await, Err(error) if is_not_found_error(&error))
+        {
+            return Err(Status::internal("explicit sandbox Delete must also remove an owned workspace without a container"));
+        }
+        Ok(())
+    }.await;
+    // IDs came from this test's successful creates; volume cleanup verifies native ownership.
+    for container in containers {
+        let _ = driver
+            .docker
+            .remove_container(
+                &container,
+                Some(RemoveContainerOptionsBuilder::default().force(true).build()),
+            )
+            .await;
+    }
+    remove_docker_workspace_volume_by_id(&driver.docker, &sandbox.id, &driver.config)
+        .await
+        .unwrap();
+    result.unwrap();
 }
 
 type TestDriverClient =

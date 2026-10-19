@@ -478,6 +478,7 @@ pub(super) fn validate_annotations(
     for key in annotations.keys() {
         validate_label_key(key)?;
     }
+    crate::compute::retention::SandboxRetention::parse(annotations)?;
     Ok(())
 }
 

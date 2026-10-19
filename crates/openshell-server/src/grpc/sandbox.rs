@@ -1758,7 +1758,7 @@ async fn handle_start_sandbox_inner(
         .start_sandbox_authenticated(
             &workspace,
             &name,
-            state.sandbox_session_jwt_authority.as_deref(),
+            state.sandbox_session_jwt_authority.clone(),
         )
         .await?;
     let remote_authority =

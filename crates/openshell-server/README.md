@@ -9,6 +9,34 @@ The server owns control-plane RPCs, authentication, provider credential delivery
 and sandbox lifecycle orchestration. The `openshell-gateway` crate composes the
 server with selected compute drivers.
 
+## Persistent sandbox intent
+
+Native create requests may set `openshell.nvidia.com/retention=persistent` in
+`annotations`. This retains the durable sandbox ID, specification, settings and
+SSH identity when the compute watch or reconciliation sweep observes a missing
+runtime. Stopped/Completed intent stays stopped/terminal; other runtime loss is
+reported as `Error` with `Ready=False/ComputeResourceMissing`. Start recreates
+missing compute using the retained specification and a fresh runtime generation.
+Restarting an existing container preserves its generation and rotates native
+credentials. Only an authoritative missing-runtime response allocates a fresh
+generation and claims recovery Create atomically. The gateway does not
+automatically relaunch a user-stopped sandbox.
+
+A failed create retains `Error/ProvisioningFailed` and uses owned Stop compensation
+instead of deletion. Explicit Start also retries asynchronous driver infrastructure
+errors (such as image/container preparation failures) without changing their
+reported diagnostic. A retry quiesces leftovers before starting/recreating compute.
+Unresolved driver operations remain fail-closed under existing provisioning
+ownership; no lease expiry or missing runtime establishes that an external request
+has settled. Explicit `Deleting` remains authoritative and releases owned backing
+resources. A missing row by itself does not authorize persistent-data deletion.
+
+Retention does not provide durable storage. For Docker, also enable the native
+`persistent_workspace` option; see the Docker driver README. Runtime labels prove
+backing-resource ownership, not desired lifecycle. Ordinary and ephemeral sandbox
+semantics remain unchanged. Workload-template annotations are not inherited by a
+create request.
+
 ## Operator credential export
 
 `GetProviderCredentials` exports selected profile-declared runtime environment

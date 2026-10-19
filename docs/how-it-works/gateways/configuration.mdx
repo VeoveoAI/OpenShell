@@ -1004,6 +1004,33 @@ provider_spiffe_workload_api_socket = "/run/spire/agent.sock"
 Use `sandbox_label` for Docker configurations. The legacy
 `sandbox_namespace` key is rejected.
 
+For persistent Docker sandboxes, set both fields on the native create request:
+
+- `annotations["openshell.nvidia.com/retention"] = "persistent"` retains the
+  sandbox's durable identity, specification and settings after compute loss or
+  failed creation. Start recreates missing compute with the same sandbox ID and a
+  new runtime generation. Explicit Delete removes the sandbox.
+- `spec.template.driver_config.docker.persistent_workspace = true` stores the
+  resolved OCI working directory in a managed local volume. It defaults to
+  `false`. The gateway must enable `allow_driver_config` to accept this option.
+
+The annotation belongs to the create request; annotations on a workload template
+are not inherited. Without the annotation, ordinary gateway cleanup still applies.
+Without the Docker option, files remain in the transient container writable layer.
+The existing `ephemeral` retention value still deletes a completed sandbox;
+unknown or combined retention values are refused.
+
+The driver chooses the volume name from the sandbox ID and namespace and fixes
+the mount target to the image's workdir. A new volume receives the image's initial
+workspace files and ownership. Caller mounts still cannot cover that directory.
+This managed volume does not require caller-volume approval labels; the driver
+verifies its own ownership and local backing on reuse.
+
+Stop, recreation, provisioning failure and gateway startup cleanup retain the
+volume. Explicit sandbox deletion removes it after ownership verification. A
+crash during deletion may leave an orphaned workspace volume; absence of a
+container never authorizes startup cleanup to discard retained data.
+
 Docker accepts `http://` and `https://` proxy URLs in explicit
 `scheme://host:port` form. `no_proxy` bypasses only the corporate proxy;
 OpenShell policy still applies. Proxy URLs cannot embed credentials. Supply a
