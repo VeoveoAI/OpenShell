@@ -2544,9 +2544,33 @@ pub(super) async fn handle_exec_sandbox(
 }
 
 /// Wait for the supervisor's reverse CONNECT to deliver a relay stream.
-///
-/// Returns `Some(stream)` on success. On any failure the error is sent on `tx`
-/// and `None` is returned; the caller should then `return` immediately.
+/// A relay claim follows the supervisor's successful target connection. Keep
+/// the open deadline independent of streaming and retain caller cancellation.
+async fn wait_for_relay_claim(
+    relay_rx: oneshot::Receiver<Result<tokio::io::DuplexStream, Status>>,
+    sandbox_id: &str,
+    channel_id: &str,
+    context: &str,
+) -> Result<tokio::io::DuplexStream, Status> {
+    match tokio::time::timeout(std::time::Duration::from_secs(10), relay_rx).await {
+        Ok(Ok(Ok(stream))) => Ok(stream),
+        Ok(Ok(Err(status))) => {
+            warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, error = %status.message(), "{context}: relay target open failed");
+            Err(status)
+        }
+        Ok(Err(_)) => {
+            warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "{context}: relay channel dropped");
+            Err(Status::unavailable("relay channel dropped"))
+        }
+        Err(_) => {
+            warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "{context}: relay open timed out");
+            Err(Status::deadline_exceeded("relay open timed out"))
+        }
+    }
+}
+
+/// Streaming exec callers publish a claim failure on their existing output
+/// stream. `ForwardTcp` instead waits before returning its successful response.
 async fn await_relay_stream<T: Send + 'static>(
     relay_rx: oneshot::Receiver<Result<tokio::io::DuplexStream, Status>>,
     tx: &mpsc::Sender<Result<T, Status>>,
@@ -2554,25 +2578,10 @@ async fn await_relay_stream<T: Send + 'static>(
     channel_id: &str,
     context: &str,
 ) -> Option<tokio::io::DuplexStream> {
-    match tokio::time::timeout(std::time::Duration::from_secs(10), relay_rx).await {
-        Ok(Ok(Ok(stream))) => Some(stream),
-        Ok(Ok(Err(status))) => {
-            warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, error = %status.message(), "{context}: relay target open failed");
+    match wait_for_relay_claim(relay_rx, sandbox_id, channel_id, context).await {
+        Ok(stream) => Some(stream),
+        Err(status) => {
             let _ = tx.send(Err(status)).await;
-            None
-        }
-        Ok(Err(_)) => {
-            warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "{context}: relay channel dropped");
-            let _ = tx
-                .send(Err(Status::unavailable("relay channel dropped")))
-                .await;
-            None
-        }
-        Err(_) => {
-            warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "{context}: relay open timed out");
-            let _ = tx
-                .send(Err(Status::deadline_exceeded("relay open timed out")))
-                .await;
             None
         }
     }
@@ -2629,15 +2638,14 @@ pub(super) async fn handle_forward_tcp(
     .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
 
     let sandbox_id = sandbox.object_id().to_string();
+    // ForwardTcp success means the supervisor connected the requested target,
+    // not merely that the gateway admitted the request. No application bytes
+    // or protocol-specific health request are needed to establish readiness.
+    let relay_stream =
+        wait_for_relay_claim(relay_rx, &sandbox_id, &channel_id, "ForwardTcp").await?;
     let (tx, rx) = mpsc::channel::<Result<TcpForwardFrame, Status>>(256);
     tokio::spawn(async move {
         let _connection_guard = connection_guard;
-        let Some(relay_stream) =
-            await_relay_stream(relay_rx, &tx, &sandbox_id, &channel_id, "ForwardTcp").await
-        else {
-            return;
-        };
-
         bridge_forward_tcp_stream(inbound, relay_stream, tx, &sandbox_id, &channel_id).await;
     });
 
@@ -2837,7 +2845,7 @@ fn validate_tcp_target_parts(host: &str, _port: u32) -> Result<String, Status> {
 }
 
 async fn bridge_forward_tcp_stream(
-    mut inbound: tonic::Streaming<TcpForwardFrame>,
+    mut inbound: impl tokio_stream::Stream<Item = Result<TcpForwardFrame, Status>> + Unpin,
     relay_stream: tokio::io::DuplexStream,
     tx: mpsc::Sender<Result<TcpForwardFrame, Status>>,
     sandbox_id: &str,
@@ -2845,16 +2853,16 @@ async fn bridge_forward_tcp_stream(
 ) {
     let (mut relay_read, mut relay_write) = tokio::io::split(relay_stream);
 
-    let sandbox_id_in = sandbox_id.to_string();
-    let channel_id_in = channel_id.to_string();
-    tokio::spawn(async move {
+    // Own both directions in this future. Request EOF only half-closes the
+    // target's input; its pending response must still reach the caller.
+    let upload = async {
         loop {
-            match inbound.message().await {
-                Ok(Some(frame)) => {
+            match tokio_stream::StreamExt::next(&mut inbound).await {
+                Some(Ok(frame)) => {
                     let Some(openshell_core::proto::tcp_forward_frame::Payload::Data(data)) =
                         frame.payload
                     else {
-                        warn!(sandbox_id = %sandbox_id_in, channel_id = %channel_id_in, "ForwardTcp: received non-data frame after init");
+                        warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "ForwardTcp: received non-data frame after init");
                         break;
                     };
                     if data.is_empty() {
@@ -2863,45 +2871,56 @@ async fn bridge_forward_tcp_stream(
                     if let Err(err) =
                         tokio::io::AsyncWriteExt::write_all(&mut relay_write, &data).await
                     {
-                        warn!(sandbox_id = %sandbox_id_in, channel_id = %channel_id_in, error = %err, "ForwardTcp: write to relay failed");
+                        warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, error = %err, "ForwardTcp: write to relay failed");
                         break;
                     }
                 }
-                Ok(None) => break,
-                Err(err) => {
-                    debug!(sandbox_id = %sandbox_id_in, channel_id = %channel_id_in, error = %err, "ForwardTcp: inbound stream ended");
+                None => break,
+                Some(Err(err)) => {
+                    debug!(sandbox_id = %sandbox_id, channel_id = %channel_id, error = %err, "ForwardTcp: inbound stream ended");
                     break;
                 }
             }
         }
         let _ = tokio::io::AsyncWriteExt::shutdown(&mut relay_write).await;
-    });
-
-    let mut buf = vec![0u8; TCP_FORWARD_CHUNK_SIZE];
-    loop {
-        match tokio::io::AsyncReadExt::read(&mut relay_read, &mut buf).await {
-            Ok(0) => break,
-            Ok(n) => {
-                let frame = TcpForwardFrame {
-                    payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Data(
-                        buf[..n].to_vec(),
-                    )),
-                };
-                if tx.send(Ok(frame)).await.is_err() {
+    };
+    let download = async {
+        let mut buf = vec![0u8; TCP_FORWARD_CHUNK_SIZE];
+        loop {
+            match tokio::io::AsyncReadExt::read(&mut relay_read, &mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    let frame = TcpForwardFrame {
+                        payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Data(
+                            buf[..n].to_vec(),
+                        )),
+                    };
+                    if tx.send(Ok(frame)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, error = %err, "ForwardTcp: read from relay failed");
+                    let _ = tx
+                        .send(Err(Status::unavailable(format!(
+                            "relay read failed: {err}"
+                        ))))
+                        .await;
                     break;
                 }
             }
-            Err(err) => {
-                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, error = %err, "ForwardTcp: read from relay failed");
-                let _ = tx
-                    .send(Err(Status::unavailable(format!(
-                        "relay read failed: {err}"
-                    ))))
-                    .await;
-                break;
-            }
+        }
+    };
+    tokio::pin!(upload, download);
+    tokio::select! {
+        () = tx.closed() => {},
+        () = &mut download => {},
+        () = &mut upload => {
+            tokio::select! { () = tx.closed() => {}, () = &mut download => {} }
         }
     }
+    // Dropping the scoped futures closes both native relay halves, including
+    // an upload still waiting for input. The caller releases its guard next.
 }
 
 // ---------------------------------------------------------------------------
@@ -4405,6 +4424,206 @@ mod tests {
             0,
             "dropping the guard releases the sandbox slot"
         );
+    }
+
+    #[tokio::test]
+    async fn tcp_forward_waits_for_target_claim_before_success() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("fwd-delayed", Vec::new());
+        let guard = acquire_forward_connection_guard(
+            &state,
+            &forward_init(loopback_tcp_target(), ""),
+            &sandbox,
+        )
+        .await
+        .unwrap();
+        let (claim, receiver) = oneshot::channel();
+        let mut opening = Box::pin(async move {
+            let stream =
+                wait_for_relay_claim(receiver, "fwd-delayed", "channel", "ForwardTcp").await?;
+            Ok::<_, Status>((guard, stream))
+        });
+        assert!(
+            futures::poll!(&mut opening).is_pending(),
+            "successful open must wait for the target claim"
+        );
+        assert_eq!(sandbox_connection_count(&state, sandbox.object_id()), 1);
+        let (connected, mut target) = tokio::io::duplex(64);
+        claim.send(Ok(connected)).unwrap();
+        let (guard, mut stream) = opening.await.unwrap();
+        target.write_all(b"connected").await.unwrap();
+        let mut bytes = [0; 9];
+        stream.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"connected");
+        drop(stream);
+        drop(guard);
+        assert_eq!(sandbox_connection_count(&state, sandbox.object_id()), 0);
+    }
+
+    #[tokio::test]
+    async fn tcp_forward_failed_or_cancelled_claim_releases_connection_slot() {
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("fwd-failed", Vec::new());
+        for failure in [
+            Some(Status::unavailable("synthetic target not listening")),
+            None,
+        ] {
+            let guard = acquire_forward_connection_guard(
+                &state,
+                &forward_init(loopback_tcp_target(), ""),
+                &sandbox,
+            )
+            .await
+            .unwrap();
+            let (claim, receiver) = oneshot::channel();
+            let mut opening = Box::pin(async move {
+                let _guard = guard;
+                wait_for_relay_claim(receiver, "fwd-failed", "channel", "ForwardTcp").await
+            });
+            assert!(futures::poll!(&mut opening).is_pending());
+            if let Some(failure) = failure {
+                claim.send(Err(failure)).unwrap();
+            } else {
+                drop(claim);
+            }
+            assert_eq!(opening.await.unwrap_err().code(), tonic::Code::Unavailable);
+            assert_eq!(sandbox_connection_count(&state, sandbox.object_id()), 0);
+        }
+        let guard = acquire_forward_connection_guard(
+            &state,
+            &forward_init(loopback_tcp_target(), ""),
+            &sandbox,
+        )
+        .await
+        .unwrap();
+        let (claim, receiver) = oneshot::channel();
+        let mut opening = Box::pin(async move {
+            let _guard = guard;
+            wait_for_relay_claim(receiver, "fwd-cancelled", "channel", "ForwardTcp").await
+        });
+        assert!(futures::poll!(&mut opening).is_pending());
+        drop(opening);
+        assert!(
+            claim.is_closed(),
+            "cancelled caller must stop waiting for a target claim"
+        );
+        assert_eq!(sandbox_connection_count(&state, sandbox.object_id()), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tcp_forward_target_claim_keeps_existing_open_deadline() {
+        let (_claim, receiver) = oneshot::channel();
+        let mut opening = Box::pin(wait_for_relay_claim(
+            receiver,
+            "fwd-timeout",
+            "channel",
+            "ForwardTcp",
+        ));
+        assert!(futures::poll!(&mut opening).is_pending());
+        tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        assert_eq!(
+            opening.await.unwrap_err().code(),
+            tonic::Code::DeadlineExceeded
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_forward_dropped_idle_response_releases_both_directions_and_slot() {
+        use tokio::io::AsyncReadExt;
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("fwd-idle-close", Vec::new());
+        let guard = acquire_forward_connection_guard(
+            &state,
+            &forward_init(loopback_tcp_target(), ""),
+            &sandbox,
+        )
+        .await
+        .unwrap();
+        let (_request, inbound) = mpsc::channel::<Result<TcpForwardFrame, Status>>(1);
+        let (outbound, response) = mpsc::channel(1);
+        let (relay, mut target) = tokio::io::duplex(64);
+        let bridge = tokio::spawn(async move {
+            let _guard = guard;
+            bridge_forward_tcp_stream(
+                ReceiverStream::new(inbound),
+                relay,
+                outbound,
+                "fwd-idle-close",
+                "channel",
+            )
+            .await;
+        });
+        // Target and request are both still open and idle. Closing only the
+        // response must cancel the owned bridge without waiting for target EOF.
+        drop(response);
+        tokio::time::timeout(std::time::Duration::from_secs(1), bridge)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sandbox_connection_count(&state, sandbox.object_id()), 0);
+        assert_eq!(target.read(&mut [0; 1]).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn tcp_forward_request_eof_keeps_pending_target_response() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let state = test_server_state().await;
+        let sandbox = test_sandbox("fwd-half-close", Vec::new());
+        let guard = acquire_forward_connection_guard(
+            &state,
+            &forward_init(loopback_tcp_target(), ""),
+            &sandbox,
+        )
+        .await
+        .unwrap();
+        let (request, inbound) = mpsc::channel::<Result<TcpForwardFrame, Status>>(1);
+        let (outbound, mut response) = mpsc::channel(1);
+        let (relay, mut target) = tokio::io::duplex(64);
+        let bridge = tokio::spawn(async move {
+            let _guard = guard;
+            bridge_forward_tcp_stream(
+                ReceiverStream::new(inbound),
+                relay,
+                outbound,
+                "fwd-half-close",
+                "channel",
+            )
+            .await;
+        });
+        drop(request);
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), target.read(&mut [0; 1]))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sandbox_connection_count(&state, sandbox.object_id()),
+            1,
+            "request EOF must not discard the response"
+        );
+        assert!(futures::poll!(Box::pin(response.recv())).is_pending());
+        target.write_all(b"final response").await.unwrap();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), response.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            frame.payload,
+            Some(openshell_core::proto::tcp_forward_frame::Payload::Data(
+                b"final response".to_vec()
+            ))
+        );
+        drop(target);
+        tokio::time::timeout(std::time::Duration::from_secs(1), bridge)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sandbox_connection_count(&state, sandbox.object_id()), 0);
+        assert!(response.recv().await.is_none());
     }
 
     #[tokio::test]

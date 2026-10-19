@@ -58,6 +58,17 @@ guarantee.
 | `UNIMPLEMENTED` | Check gateway and SDK version compatibility. |
 | `INTERNAL`, `UNKNOWN`, `DATA_LOSS` | Preserve the status and correlation metadata for diagnosis. Do not blindly retry mutations. |
 
+## TCP forwarding readiness
+
+A successful `ForwardTcp` RPC response means the supervisor connected the selected
+target and claimed its native relay. Target-open failures are initial RPC errors;
+the existing relay-claim deadline is ten seconds. `SandboxPhase::Ready` does not
+prove an application has started listening. A caller may retry a transient
+forward-open failure with backoff under its own startup deadline, while treating
+authorization and invalid-target errors as terminal. Close an unused successful
+stream to release its connection slot. TCP connectivity does not establish
+application protocol health.
+
 ## SDK access
 
 Each SDK exposes decoded fields and an escape hatch for complete transport data.

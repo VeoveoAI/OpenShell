@@ -37,6 +37,18 @@ backing-resource ownership, not desired lifecycle. Ordinary and ephemeral sandbo
 semantics remain unchanged. Workload-template annotations are not inherited by a
 create request.
 
+## Native forwarding readiness
+
+`ForwardTcp` returns a successful RPC response only after the supervisor has
+connected the requested loopback/SSH target and claimed the existing native relay.
+The relay claim keeps its ten-second open deadline. Authorization, target-open
+failure, timeout and cancellation release the per-connection guard; a successful
+stream retains it until forwarding ends. Dropping the response cancels both scoped
+transfer directions even when the target remains idle. Request EOF half-closes
+the target's input while retaining its pending response. No application data or health endpoint
+is needed to establish TCP connectivity. This does not establish application
+protocol health, and `SandboxPhase::Ready` alone still describes sandbox readiness.
+
 ## Operator credential export
 
 `GetProviderCredentials` exports selected profile-declared runtime environment
