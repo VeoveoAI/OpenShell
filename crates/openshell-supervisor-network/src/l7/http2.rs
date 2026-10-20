@@ -400,20 +400,52 @@ where
     let serve = async {
         let mut tasks = JoinSet::new();
         loop {
+            let at_capacity = tasks.len() >= MAX_STREAMS as usize;
+            if at_capacity {
+                tracing::debug!(
+                    category = "exchange_backpressure",
+                    active_tasks = tasks.len(),
+                    limit = MAX_STREAMS,
+                    "HTTP/2 relay awaiting exchange capacity"
+                );
+            }
             tokio::select! {
-                request = downstream.accept() => {
-                    let Some(request) = request else { break; };
-                    let (request, mut response) = request.into_diagnostic()?;
-                    if tasks.len() >= MAX_STREAMS as usize {
-                        response.send_reset(h2::Reason::REFUSED_STREAM);
-                        continue;
+                request = async {
+                    if at_capacity {
+                        // Retired wire streams can still have exchange tasks awaiting
+                        // cancellation or joining. Let H2 queue compliant replacements
+                        // until a task slot opens, while continuing to drive active I/O.
+                        std::future::poll_fn(|cx| downstream.poll_closed(cx))
+                            .await
+                            .map(|()| None)
+                    } else {
+                        downstream.accept().await.transpose()
                     }
+                } => {
+                    let Some((request, response)) = request.into_diagnostic()? else { break; };
                     tasks.spawn(exchange(request, response, sender.clone(), config.clone(), engine.clone(), context.clone()));
                 }
                 Some(result) = tasks.join_next(), if !tasks.is_empty() => {
-                    // An invalid stream is reset by dropping its handles. Never log
-                    // request headers or credential-resolution error contents.
-                    if result.is_err() { return Err(miette!("HTTP/2 relay task failed")); }
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            // Only typed transport categories are safe to expose.
+                            // The report may contain credential-resolution details.
+                            let h2_reason = error.chain()
+                                .find_map(|cause| cause.downcast_ref::<h2::Error>())
+                                .and_then(h2::Error::reason);
+                            let io_kind = error.chain()
+                                .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+                                .map(std::io::Error::kind);
+                            tracing::debug!(
+                                category = "exchange_failure",
+                                ?h2_reason,
+                                ?io_kind,
+                                "HTTP/2 relay exchange ended unsuccessfully"
+                            );
+                        }
+                        Err(_) => return Err(miette!("HTTP/2 relay task failed")),
+                    }
                 }
             }
         }
@@ -448,6 +480,119 @@ network_policies:
     binaries:
       - {path: /usr/bin/client}
 ";
+
+    #[tokio::test]
+    async fn concurrent_stream_rollover_accepts_peer_compliant_replacements() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let engine =
+                OpaEngine::from_strings(include_str!("../../data/sandbox-policy.rego"), POLICY)
+                    .unwrap();
+            let input = NetworkInput {
+                host: "rpc.example.test".into(),
+                port: 443,
+                binary_path: PathBuf::from("/usr/bin/client"),
+                binary_sha256: "unused".into(),
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            };
+            let (config, generation) = engine
+                .query_endpoint_config_with_generation(&input)
+                .unwrap();
+            let config = super::super::parse_l7_config(&config.unwrap()).unwrap();
+            let tunnel = engine.clone_engine_for_tunnel(generation).unwrap();
+            let context = L7EvalContext {
+                host: input.host,
+                port: 443,
+                request_default_port: Some(443),
+                binary_path: "/usr/bin/client".into(),
+                policy_name: "rpc".into(),
+                ..Default::default()
+            };
+            let (app, relay_client) = tokio::io::duplex(64 * 1024);
+            let (relay_upstream, upstream) = tokio::io::duplex(64 * 1024);
+            // Own the real relay future so the peer can retire streams and queue
+            // replacements before the relay reaps their exchange tasks. There is
+            // no scheduler sleep or test-only production admission hook.
+            let relay = relay(relay_client, relay_upstream, config, tunnel, context);
+            tokio::pin!(relay);
+            let upstream_task = tokio::spawn(async move {
+                let mut server = h2::server::handshake(upstream).await.unwrap();
+                let mut replies = Vec::new();
+                while let Some(request) = server.accept().await {
+                    let (request, mut response) = request.unwrap();
+                    assert!(request.body().is_end_stream());
+                    replies.push(response.send_response(Response::new(()), false).unwrap());
+                    assert!(
+                        replies.len() <= (MAX_STREAMS + MAX_STREAMS / 2) as usize,
+                        "upstream must not receive replayed requests"
+                    );
+                }
+            });
+            let (mut app, connection) = h2::client::handshake(app).await.unwrap();
+            tokio::pin!(connection);
+            let mut sends = Vec::new();
+            let mut responses = Vec::new();
+            for _ in 0..MAX_STREAMS {
+                app = app.ready().await.unwrap();
+                let (response, send) = app
+                    .send_request(
+                        Request::builder()
+                            .method("POST")
+                            .uri("https://rpc.example.test/rpc/read")
+                            .body(())
+                            .unwrap(),
+                        true,
+                    )
+                    .unwrap();
+                sends.push(send);
+                responses.push(response);
+            }
+            let initial = tokio::select! {
+                result = &mut relay => panic!("relay ended before initial streams: {result:?}"),
+                result = &mut connection => panic!("client ended before initial streams: {result:?}"),
+                result = futures::future::try_join_all(responses) => result.unwrap(),
+            };
+            assert_eq!(initial.len(), MAX_STREAMS as usize);
+            assert_eq!(connection.max_concurrent_send_streams(), MAX_STREAMS as usize);
+
+            // RST_STREAM closes these streams in the peer's H2 accounting before
+            // it opens replacements. Keep the other streams concurrently active.
+            let rollover = MAX_STREAMS / 2;
+            for send in sends.iter_mut().take(rollover as usize) {
+                send.send_reset(h2::Reason::CANCEL);
+            }
+            // Drive only the peer connection to flush the retirements. The relay
+            // future remains unpolled, so its old tasks have not been reaped.
+            assert!(futures::poll!(connection.as_mut()).is_pending());
+            let mut replacements = Vec::new();
+            for _ in 0..rollover {
+                app = app.ready().await.unwrap();
+                let (response, send) = app
+                    .send_request(
+                        Request::builder()
+                            .method("POST")
+                            .uri("https://rpc.example.test/rpc/read")
+                            .body(())
+                            .unwrap(),
+                        true,
+                    )
+                    .unwrap();
+                sends.push(send);
+                replacements.push(response);
+            }
+            assert!(futures::poll!(connection.as_mut()).is_pending());
+            let replaced = tokio::select! {
+                result = &mut relay => panic!("relay ended during rollover: {result:?}"),
+                result = &mut connection => panic!("client ended during rollover: {result:?}"),
+                result = futures::future::try_join_all(replacements) => result
+                    .expect("peer-compliant replacements must not be reset"),
+            };
+            assert_eq!(replaced.len(), rollover as usize);
+            upstream_task.abort();
+        })
+        .await
+        .expect("concurrent stream rollover deadline");
+    }
 
     #[tokio::test]
     async fn downstream_cancellation_resets_upstream_and_releases_relay_slots() {
