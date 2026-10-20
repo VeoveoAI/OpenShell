@@ -2646,6 +2646,7 @@ impl KubernetesComputeDriver {
             agent_gid,
             &names.sandbox_secret,
         )?;
+        let gpu_requested = workload_pod_gpu_requested(&workload_pod)?;
         let workload_pod_uid =
             workload_pod.metadata.uid.clone().ok_or_else(|| {
                 KubernetesDriverError::Message("workload Pod has no UID".to_string())
@@ -2748,6 +2749,7 @@ impl KubernetesComputeDriver {
                 trust_anchor_pem: tls.trust_anchor_pem.clone(),
             },
             host_gateway_ip,
+            gpu_requested,
             workload_identity,
             child_env,
         }
@@ -2932,6 +2934,7 @@ impl KubernetesComputeDriver {
             agent_gid,
             &names.sandbox_secret,
         )?;
+        let gpu_requested = workload_pod_gpu_requested(&workload_pod)?;
         let workload_pod_uid =
             workload_pod.metadata.uid.clone().ok_or_else(|| {
                 KubernetesDriverError::Message("workload Pod has no UID".to_string())
@@ -3012,6 +3015,7 @@ impl KubernetesComputeDriver {
                 trust_anchor_pem: tls.trust_anchor_pem.clone(),
             },
             host_gateway_ip: self.config.host_gateway_ip.parse().ok(),
+            gpu_requested,
             workload_identity,
             child_env,
         }
@@ -4984,6 +4988,45 @@ fn should_try_next_sandbox_api_version(err: &KubeError) -> bool {
     // group/version is unavailable and the next supported Sandbox API version
     // should be tried.
     matches!(err, KubeError::Api(api) if api.code == 404)
+}
+
+/// Read only the agent allocation from the fresh, ownership-validated API Pod.
+/// Both initial provisioning and reconstruction use this observed resource;
+/// caller metadata, environment and `RuntimeClass` selection are not GPU claims.
+fn workload_pod_gpu_requested(pod: &Pod) -> Result<bool, KubernetesDriverError> {
+    let agent = pod
+        .spec
+        .as_ref()
+        .and_then(|spec| {
+            spec.containers
+                .iter()
+                .find(|container| container.name == "agent")
+        })
+        .ok_or_else(|| {
+            KubernetesDriverError::Precondition(
+                "admitted workload Pod has no agent container for GPU allocation".to_string(),
+            )
+        })?;
+    let Some(quantity) = agent
+        .resources
+        .as_ref()
+        .and_then(|resources| resources.limits.as_ref())
+        .and_then(|limits| limits.get(GPU_RESOURCE_NAME))
+    else {
+        return Ok(false);
+    };
+    // The native GPU renderer emits unsigned decimal counts. Do not treat an
+    // unsupported or malformed Quantity spelling as proof of GPU allocation.
+    let invalid = || {
+        KubernetesDriverError::Precondition(
+            "admitted agent nvidia.com/gpu limit must be an unsigned decimal integer".to_string(),
+        )
+    };
+    if quantity.0.is_empty() || !quantity.0.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    let count = quantity.0.parse::<u64>().map_err(|_| invalid())?;
+    Ok(count > 0)
 }
 
 fn validate_gpu_request(
@@ -9504,16 +9547,20 @@ mod tests {
 
     #[test]
     fn driver_config_rejects_unknown_fields() {
-        let template = SandboxTemplate {
-            driver_config: Some(json_struct(serde_json::json!({
-                "cdi_devices": ["nvidia.com/gpu=0"]
-            }))),
-            ..SandboxTemplate::default()
-        };
+        for config in [
+            serde_json::json!({"cdi_devices": ["nvidia.com/gpu=0"]}),
+            serde_json::json!({"gpu_requested": true}),
+            serde_json::json!({"resource_claims": {"openshell.gpu": "true"}}),
+        ] {
+            let template = SandboxTemplate {
+                driver_config: Some(json_struct(config)),
+                ..SandboxTemplate::default()
+            };
 
-        let err = KubernetesSandboxDriverConfig::from_template(&template).unwrap_err();
+            let err = KubernetesSandboxDriverConfig::from_template(&template).unwrap_err();
 
-        assert!(err.contains("unknown field"));
+            assert!(err.contains("unknown field"));
+        }
     }
 
     #[test]
@@ -10300,6 +10347,106 @@ mod tests {
         let err = validate_gpu_request(gpu_requirements).unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("gpu count must be greater than 0"));
+    }
+
+    #[test]
+    fn gpu_boundary_claim_uses_rendered_agent_allocation() {
+        for has_template in [false, true] {
+            for gpu in [
+                None,
+                Some(GpuResourceRequirements { count: None }),
+                Some(GpuResourceRequirements { count: Some(1) }),
+                Some(GpuResourceRequirements { count: Some(2) }),
+            ] {
+                let expected = gpu.is_some();
+                let spec = SandboxSpec {
+                    template: has_template.then(SandboxTemplate::default),
+                    resource_requirements: Some(ResourceRequirements { gpu }),
+                    ..SandboxSpec::default()
+                };
+                let rendered = sandbox_to_k8s_spec(Some(&spec), &SandboxPodParams::default())
+                    .expect("valid native GPU request");
+                let pod: Pod = serde_json::from_value(serde_json::json!({
+                    "spec": rendered["spec"]["podTemplate"]["spec"]
+                }))
+                .unwrap();
+                assert_eq!(workload_pod_gpu_requested(&pod).unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn gpu_boundary_claim_ignores_metadata_env_runtime_class_and_other_containers() {
+        let pod: Pod = serde_json::from_value(serde_json::json!({
+            "metadata": {
+                "labels": {"openshell.gpu": "true"},
+                "annotations": {"gpu_requested": "true", "openshell.gpu": "true"}
+            },
+            "spec": {
+                "runtimeClassName": "nvidia",
+                "containers": [
+                    {"name": "agent", "resources": {"requests": {"nvidia.com/gpu": "1"}},
+                     "env": [{"name": "OPENSHELL_GPU", "value": "true"},
+                             {"name": "NVIDIA_VISIBLE_DEVICES", "value": "all"}]},
+                    {"name": "other", "resources": {"limits": {"nvidia.com/gpu": "1"}}}
+                ],
+                "initContainers": [
+                    {"name": "init", "resources": {"limits": {"nvidia.com/gpu": "1"}}}
+                ]
+            }
+        }))
+        .unwrap();
+        assert!(!workload_pod_gpu_requested(&pod).unwrap());
+    }
+
+    #[test]
+    fn gpu_boundary_claim_rejects_unsupported_or_malformed_agent_limits() {
+        for quantity in [
+            "",
+            "-1",
+            "+1",
+            "0.5",
+            "1e0",
+            "1m",
+            "1Ki",
+            "true",
+            " 1",
+            "1 ",
+            "18446744073709551616",
+        ] {
+            let pod: Pod = serde_json::from_value(serde_json::json!({
+                "spec": {"containers": [{"name": "agent", "resources": {
+                    "limits": {"nvidia.com/gpu": quantity}
+                }}]}
+            }))
+            .unwrap();
+            assert!(matches!(
+                workload_pod_gpu_requested(&pod),
+                Err(KubernetesDriverError::Precondition(message))
+                    if message == "admitted agent nvidia.com/gpu limit must be an unsigned decimal integer"
+            ));
+        }
+        let zero: Pod = serde_json::from_value(serde_json::json!({
+            "spec": {"containers": [{"name": "agent", "resources": {
+                "limits": {"nvidia.com/gpu": "0"}
+            }}]}
+        }))
+        .unwrap();
+        assert!(!workload_pod_gpu_requested(&zero).unwrap());
+    }
+
+    #[test]
+    fn gpu_boundary_claim_requires_the_agent_container() {
+        for pod in [
+            Pod::default(),
+            serde_json::from_value(serde_json::json!({"spec": {"containers": []}})).unwrap(),
+        ] {
+            assert!(matches!(
+                workload_pod_gpu_requested(&pod),
+                Err(KubernetesDriverError::Precondition(message))
+                    if message == "admitted workload Pod has no agent container for GPU allocation"
+            ));
+        }
     }
 
     fn template_with_pod_annotations(keys: &[&str]) -> SandboxTemplate {

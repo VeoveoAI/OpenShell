@@ -23,6 +23,7 @@ use kube::core::ObjectMeta;
 use openshell_isolation_interface::contract::{
     BackendError, ProvisioningEvidence, ResolvedWorkloadIdentity,
 };
+use openshell_sandbox_backend::GPU_RESOURCE_CLAIM;
 use openshell_sandbox_backend::boundary_protocol::{
     BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
     SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
@@ -201,6 +202,8 @@ pub struct KubernetesSandboxRuntimeBoundarySpec {
     pub sandbox_tls: SandboxTlsServerConfig,
     pub supervisor_tls: SandboxTlsClientConfig,
     pub host_gateway_ip: Option<IpAddr>,
+    /// Derived from the ownership-validated workload Pod's agent GPU limit.
+    pub gpu_requested: bool,
     pub workload_identity: ResolvedWorkloadIdentity,
     pub child_env: HashMap<String, String>,
 }
@@ -215,7 +218,7 @@ impl KubernetesSandboxRuntimeBoundarySpec {
     /// Produce both sides of the common protocol from one observed Kubernetes
     /// resource set so a stale or recreated object cannot be attached.
     pub fn provision(self) -> Result<KubernetesSandboxRuntimeBoundaryProvisioning, BackendError> {
-        let resource_claims = BTreeMap::from([
+        let mut resource_claims = BTreeMap::from([
             ("kubernetes.namespace_uid".to_string(), self.namespace_uid),
             (
                 "kubernetes.sandbox_resource_uid".to_string(),
@@ -238,6 +241,9 @@ impl KubernetesSandboxRuntimeBoundarySpec {
                 self.egress_policy_resource_version,
             ),
         ]);
+        if self.gpu_requested {
+            resource_claims.insert(GPU_RESOURCE_CLAIM.to_string(), "true".to_string());
+        }
         let provisioning_evidence = KubernetesOuterFenceEvidence {
             network_policy_uid: &resource_claims["kubernetes.egress_policy_uid"],
             network_policy_resource_version: &resource_claims
@@ -365,6 +371,7 @@ mod tests {
                 trust_anchor_pem: "test-ca".to_string(),
             },
             host_gateway_ip: Some("10.42.0.1".parse().expect("valid gateway IP")),
+            gpu_requested: false,
             workload_identity: ResolvedWorkloadIdentity::new(
                 1000,
                 1000,
@@ -404,6 +411,27 @@ mod tests {
                 .validate("generation-1")
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn provisioning_binds_gpu_claim_only_for_an_admitted_gpu_workload() {
+        for gpu_requested in [false, true] {
+            let mut spec = spec();
+            spec.gpu_requested = gpu_requested;
+            let provisioned = spec.provision().unwrap();
+            assert_eq!(
+                provisioned.boundary_config.resource_claims,
+                provisioned.runtime_descriptor.resource_claims
+            );
+            assert_eq!(
+                provisioned
+                    .boundary_config
+                    .resource_claims
+                    .get(GPU_RESOURCE_CLAIM)
+                    .map(String::as_str),
+                gpu_requested.then_some("true")
+            );
+        }
     }
 
     #[test]

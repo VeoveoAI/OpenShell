@@ -85,6 +85,15 @@ Use `--cpu`, `--memory`, and `--gpu` on `openshell sandbox create` to request re
 | Kubernetes | Container requests and limits | `nvidia.com/gpu` resource limit |
 | MicroVM | Ignored; use `vcpus` and `mem_mib` | One GPU through `gpu_device_ids` |
 
+On Kubernetes, request a GPU with `--gpu`; selecting an NVIDIA RuntimeClass alone
+does not request device access. OpenShell carries the admitted agent-container GPU
+allocation into the workload boundary so the sandbox can access its GPU devices.
+After a gateway upgrade that fixes GPU provisioning, use native `sandbox stop`
+followed by `sandbox start` for an existing GPU sandbox. This creates a fresh
+runtime generation; a gateway upgrade alone does not rewrite existing bootstrap
+material. Keep the workload image's CUDA libraries and NVIDIA device-plugin
+configuration consistent with the host driver.
+
 ## Pass Driver Config
 
 `--driver-config-json` passes driver-specific settings that have no dedicated flag. The value is a JSON object keyed by driver name, and the gateway forwards only the block for the active driver:
