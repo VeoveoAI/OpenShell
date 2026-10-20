@@ -401,6 +401,17 @@ the deadline passes without a transition to `Ready`. Docker, Podman,
 Kubernetes, and VM native restart policies remain disabled; the gateway owns
 the replacement.
 
+For Kubernetes, `SandboxRuntimeTerminated` reports a terminal admitted supervisor
+with its Pod identities and enforcement fences intact.
+`InfrastructureRestartScheduled` means `always` or `on-failure` selected a fresh
+fenced runtime generation, not a canonical command exit. Before publication,
+`DependenciesNotReady` can describe the same verified generation awaiting
+reconciliation; a stale `Suspended` status after resume must not become an
+operator Stop. Compare the Sandbox's desired operating mode with its conditions.
+An explicit Stop or missing/changed identity or enforcement fence follows a
+separate fail-closed path and does not authorize this recovery. Check the
+structured dependency diagnostics before classifying an unavailable supervisor.
+
 ### Step 5: Check Podman-Backed Gateways
 
 ```bash

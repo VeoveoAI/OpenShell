@@ -151,6 +151,9 @@ fence generation still present, the driver publishes `SandboxRuntimeTerminated`
 instead of suspending the Sandbox. The gateway applies its existing
 `Always`/`OnFailure` policy and fenced STOP → fresh paired credentials → START
 sequence. This infrastructure loss has no inferred canonical process exit code.
+Before loss publication, the same verified terminal generation projects as
+`DependenciesNotReady`; stale v1beta1 `Suspended` status cannot overwrite its
+still-running desired intent.
 
 Missing/deleting Pods, changed identities and missing or altered enforcement
 fences retain their fail-closed paths. Explicit Stop/Delete, `Never`, and a
