@@ -59,6 +59,12 @@ impl std::fmt::Debug for ProxyListenerConfig {
     }
 }
 
+fn read_native_gateway_ca(path: Option<&std::path::Path>) -> Result<String> {
+    let path = path.ok_or_else(|| miette::miette!("native gateway CA is not configured"))?;
+    std::fs::read_to_string(path)
+        .map_err(|_| miette::miette!("native gateway CA could not be read"))
+}
+
 #[cfg(target_os = "linux")]
 pub struct TransparentRuntimeSetup {
     pub listeners: Vec<tokio::net::TcpListener>,
@@ -366,6 +372,11 @@ pub async fn run_networking(
     // the proxy, so it's owned here.
     let identity_cache = opa_engine.map(|_| Arc::new(BinaryIdentityCache::new()));
 
+    let mut native_service_ingress = crate::native_service::NativeServiceIngress::from_endpoint(
+        openshell_endpoint,
+        host_gateway_ip,
+    );
+
     // Load a provisioned CA when the boundary lifetime outlives this control
     // process; otherwise generate an ephemeral CA.
     // The CA cert is written to disk so sandbox processes can trust it.
@@ -437,7 +448,34 @@ pub async fn run_networking(
 
                         let upstream_config = build_upstream_client_config(&system_ca_bundle)?;
                         let cert_cache = CertCache::new(ca);
-                        let state = Arc::new(ProxyTlsState::new(cert_cache, upstream_config));
+                        let mut state = ProxyTlsState::new(cert_cache, upstream_config);
+                        if let Some(ingress) = native_service_ingress {
+                            // This reserved input is provisioned into the trusted supervisor,
+                            // not read from the workload environment or its filesystem.
+                            let configured = (|| -> Result<()> {
+                                let path = std::env::var_os(openshell_core::sandbox_env::TLS_CA);
+                                let pem = read_native_gateway_ca(
+                                    path.as_deref().map(std::path::Path::new),
+                                )?;
+                                state.configure_native_service_ingress(
+                                    ingress,
+                                    &system_ca_bundle,
+                                    &pem,
+                                )
+                            })();
+                            if configured.is_err() {
+                                // An unavailable optional native route must not take down
+                                // ordinary interception or silently use generic roots.
+                                native_service_ingress = None;
+                                ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+                                    .severity(SeverityId::High)
+                                    .status(StatusId::Failure)
+                                    .state(StateId::Disabled, "unavailable")
+                                    .message("Native gateway ingress disabled: trusted CA unavailable or invalid")
+                                    .build());
+                            }
+                        }
+                        let state = Arc::new(state);
                         ocsf_emit!(
                             ConfigStateChangeBuilder::new(ocsf_ctx())
                                 .severity(SeverityId::Informational)
@@ -493,6 +531,9 @@ pub async fn run_networking(
         (None, None)
     };
 
+    if tls_state.is_none() {
+        native_service_ingress = None;
+    }
     let mediated_policy_dns = if let Some(source) = network_mediation_source.clone() {
         let engine = opa_engine
             .cloned()
@@ -501,6 +542,7 @@ pub async fn run_networking(
             engine,
             source,
             host_gateway_ip,
+            native_service_ingress,
             crate::policy_dns::PolicyDnsRuntimeConfig::for_epoch(0)?,
             engine_ready_rx.clone(),
         )?)
@@ -700,5 +742,26 @@ mod transparent_runtime_tests {
     /// Generate a real, valid self-signed CA certificate PEM for tests.
     fn generate_test_ca_pem() -> String {
         SandboxCa::generate().unwrap().cert_pem().to_string()
+    }
+}
+
+#[cfg(test)]
+mod native_service_tests {
+    use super::read_native_gateway_ca;
+
+    #[test]
+    fn native_service_ca_input_fails_closed_without_exposing_paths_or_os_errors() {
+        assert_eq!(
+            read_native_gateway_ca(None).unwrap_err().to_string(),
+            "native gateway CA is not configured"
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("private-ca.pem");
+        assert_eq!(
+            read_native_gateway_ca(Some(&missing))
+                .unwrap_err()
+                .to_string(),
+            "native gateway CA could not be read"
+        );
     }
 }

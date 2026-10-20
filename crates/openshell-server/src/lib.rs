@@ -257,6 +257,12 @@ pub(crate) struct ServerStartupConfig {
     pub legacy_compute_driver_env_seen: bool,
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct TcpForwardConnections {
+    total: usize,
+    by_sandbox: HashMap<String, usize>,
+}
+
 /// Server state shared across handlers.
 #[derive(Debug)]
 pub struct ServerState {
@@ -289,6 +295,9 @@ pub struct ServerState {
 
     /// Active SSH tunnel connection counts per sandbox id.
     pub ssh_connections_by_sandbox: Mutex<HashMap<String, u32>>,
+
+    /// TCP forwarding counts, independent from SSH session and sandbox counts.
+    pub(crate) tcp_forward_connections: Mutex<TcpForwardConnections>,
 
     /// Registry of active supervisor sessions and pending relay channels.
     ///
@@ -447,6 +456,7 @@ impl ServerState {
             telemetry: telemetry::TelemetryState::new(),
             ssh_connections_by_token: Mutex::new(HashMap::new()),
             ssh_connections_by_sandbox: Mutex::new(HashMap::new()),
+            tcp_forward_connections: Mutex::new(TcpForwardConnections::default()),
             supervisor_sessions,
             gateway_shutting_down: AtomicBool::new(false),
             config_delivery,
@@ -650,7 +660,9 @@ pub(crate) async fn run_server(
 
     let sandbox_index = SandboxIndex::new();
     let sandbox_watch_bus = SandboxWatchBus::new();
-    let supervisor_sessions = Arc::new(supervisor_session::SupervisorSessionRegistry::new());
+    let supervisor_sessions = Arc::new(
+        supervisor_session::SupervisorSessionRegistry::with_tcp_forwarding(config.tcp_forwarding),
+    );
     let driver_startup = compute::driver_config::DriverStartupContext {
         file: config_file.as_ref(),
         guest_tls: guest_tls.as_ref(),
@@ -846,7 +858,7 @@ pub(crate) async fn run_server(
         .metrics_bind_address
         .map(|metrics_bind_address| {
             gateway_metrics::install_global_recorder(
-                supervisor_session::RELAY_CAPACITY,
+                supervisor_session::relay_capacity(config.tcp_forwarding),
                 store.mutation_lock_connections(),
             )
             .map(|prometheus_handle| (metrics_bind_address, prometheus_handle))

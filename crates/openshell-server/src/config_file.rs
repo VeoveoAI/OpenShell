@@ -180,6 +180,10 @@ pub struct GatewayFileSection {
     pub oidc: Option<OidcConfig>,
     #[serde(default)]
     pub auth: Option<GatewayAuthConfig>,
+
+    /// Independent native TCP forwarding budgets.
+    #[serde(default)]
+    pub tcp_forwarding: Option<openshell_core::TcpForwardingConfig>,
     #[serde(default)]
     pub interceptors: Vec<GatewayInterceptorConfig>,
     #[serde(default)]
@@ -1110,6 +1114,12 @@ grpc_rate_limit_requests = 120
 grpc_rate_limit_window_seconds = 60
 policy_validation_failure_mode = "retain_last_valid"
 
+[openshell.gateway.tcp_forwarding]
+active_per_sandbox = 128
+active_per_replica = 1024
+pending_per_sandbox = 128
+pending_per_replica = 512
+
 [openshell.gateway.tls]
 cert_path = "/etc/openshell/certs/gateway.pem"
 key_path = "/etc/openshell/certs/gateway-key.pem"
@@ -1142,6 +1152,33 @@ namespace = "agents"
             gw.policy_validation_failure_mode,
             Some(openshell_core::PolicyValidationFailureMode::RetainLastValid)
         );
+        let tcp = gw.tcp_forwarding.unwrap();
+        assert_eq!(tcp.active_per_sandbox.get(), 128);
+        assert_eq!(tcp.active_per_replica.get(), 1024);
+        assert_eq!(tcp.pending_per_sandbox.get(), 128);
+        assert_eq!(tcp.pending_per_replica.get(), 512);
+        for field in [
+            "active_per_sandbox",
+            "active_per_replica",
+            "pending_per_sandbox",
+            "pending_per_replica",
+        ] {
+            let invalid = toml.replace(
+                &format!(
+                    "{field} = {}",
+                    match field {
+                        "active_per_sandbox" | "pending_per_sandbox" => 128,
+                        "active_per_replica" => 1024,
+                        _ => 512,
+                    }
+                ),
+                &format!("{field} = 0"),
+            );
+            assert!(
+                load(write_tmp(&invalid).path()).is_err(),
+                "zero {field} must fail parsing"
+            );
+        }
         assert!(gw.tls.is_some());
         let oidc = gw.oidc.as_ref().expect("OIDC config parses");
         assert!(!oidc.dangerously_allow_insecure_http);

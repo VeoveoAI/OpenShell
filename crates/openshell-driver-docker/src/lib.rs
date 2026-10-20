@@ -124,6 +124,8 @@ const LABEL_ISOLATION_ROLE_SANDBOX: &str = "sandbox";
 const LABEL_ISOLATION_ROLE_SUPERVISOR: &str = "supervisor";
 const LABEL_ISOLATION_ROLE_STAGING: &str = "staging";
 const LABEL_ISOLATION_ROLE_IDENTITY: &str = "identity";
+const LABEL_ISOLATION_ROLE_WORKSPACE: &str = "workspace";
+const LABEL_PERSISTENT_WORKSPACE_ROOT: &str = "openshell.ai/private-workspace-root";
 const RUNTIME_DESCRIPTOR_FILE: &str = "runtime-descriptor.json";
 const MAIN_PROCESS_SPEC_FILE: &str = "main-process.json";
 const WORKSPACE_ROOT_FILE: &str = "workspace-root";
@@ -764,6 +766,7 @@ struct DockerSandboxDriverConfig {
     )]
     cdi_devices: Option<Vec<String>>,
     mounts: Vec<DockerDriverMountConfig>,
+    persistent_workspace: bool,
 }
 
 struct ValidatedDockerSandbox<'a> {
@@ -1263,6 +1266,7 @@ impl DockerComputeDriver {
         &self,
         container: &bollard::models::ContainerInspectResponse,
     ) -> Result<(), Status> {
+        let workspace_volume = self.admit_persistent_workspace(container).await?;
         if self.config.allow_driver_config && !self.config.resource_admission.enabled {
             return Ok(());
         }
@@ -1302,6 +1306,9 @@ impl DockerComputeDriver {
                         .name
                         .as_deref()
                         .ok_or_else(|| Status::failed_precondition("volume lacks identity"))?;
+                    if workspace_volume.as_deref() == Some(name) {
+                        continue;
+                    }
                     let volume = self.docker.inspect_volume(name).await.map_err(|error| {
                         if is_not_found_error(&error) {
                             Status::failed_precondition("attached volume no longer exists")
@@ -1365,6 +1372,55 @@ impl DockerComputeDriver {
             ));
         }
         Ok(())
+    }
+
+    async fn admit_persistent_workspace(
+        &self,
+        container: &bollard::models::ContainerInspectResponse,
+    ) -> Result<Option<String>, Status> {
+        let Some(labels) = container
+            .config
+            .as_ref()
+            .and_then(|config| config.labels.as_ref())
+        else {
+            return Ok(None);
+        };
+        let Some(root) = labels.get(LABEL_PERSISTENT_WORKSPACE_ROOT) else {
+            return Ok(None);
+        };
+        let sandbox_id = labels.get(LABEL_SANDBOX_ID).ok_or_else(|| {
+            Status::failed_precondition("persistent workspace lacks sandbox identity")
+        })?;
+        let name = docker_workspace_volume_name_by_id(sandbox_id, &self.config);
+        let mut mounts = container
+            .mounts
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|mount| mount.name.as_deref() == Some(name.as_str()));
+        let Some(mount) = mounts.next() else {
+            return Err(Status::failed_precondition(
+                "persistent workspace mount missing",
+            ));
+        };
+        if mounts.next().is_some()
+            || mount.typ != Some(bollard::models::MountPointTypeEnum::VOLUME)
+            || mount.destination.as_deref() != Some(root.as_str())
+            || mount.rw != Some(true)
+        {
+            return Err(Status::failed_precondition(
+                "persistent workspace mount changed",
+            ));
+        }
+        let volume = self.docker.inspect_volume(&name).await.map_err(|error| {
+            if is_not_found_error(&error) {
+                Status::failed_precondition("persistent workspace volume no longer exists")
+            } else {
+                Status::unavailable("persistent workspace volume lookup failed")
+            }
+        })?;
+        validate_docker_workspace_volume(&volume, sandbox_id, &self.config)?;
+        Ok(Some(name))
     }
 
     async fn resolve_gpu_cdi_devices(
@@ -1750,6 +1806,15 @@ impl DockerComputeDriver {
                     DockerProvisioningFailure::new("ResourceAdmissionDenied", error.to_string())
                 })?,
             );
+        if validated.driver_config.persistent_workspace
+            && let Err(status) =
+                ensure_docker_workspace_volume(&self.docker, &sandbox.id, &self.config).await
+        {
+            let _ =
+                remove_docker_channel_volume_by_id(&self.docker, &sandbox.id, &self.config).await;
+            cleanup_docker_boundary_state(sandbox, &self.config);
+            return Err(DockerProvisioningFailure::from_admission_status(status));
+        }
         let create_result = async {
             openshell_otel::record_error_result(
                 self.docker
@@ -2146,6 +2211,12 @@ impl DockerComputeDriver {
             .await
             .map_err(|error| internal_status("list Docker startup volumes", error))?;
         for volume in volumes.volumes.unwrap_or_default() {
+            // No container is not evidence that retained user data is disposable.
+            if volume.labels.get(LABEL_ISOLATION_ROLE).map(String::as_str)
+                == Some(LABEL_ISOLATION_ROLE_WORKSPACE)
+            {
+                continue;
+            }
             let sandbox_id = volume.labels.get(LABEL_SANDBOX_ID);
             if sandbox_id.is_some_and(|id| sandbox_ids.contains(id)) {
                 continue;
@@ -2242,13 +2313,12 @@ impl DockerComputeDriver {
         sandbox_id: &str,
         sandbox_name: &str,
     ) -> Result<bool, Status> {
-        let pending = self
+        let mut pending = self
             .remove_pending_sandbox(sandbox_id, sandbox_name)
             .await?;
-        if let Some(record) = pending.as_ref()
-            && let Some(task) = record.task.as_ref()
-        {
+        if let Some(task) = pending.as_mut().and_then(|record| record.task.take()) {
             task.abort();
+            let _ = task.await;
         }
         if let Some(record) = pending.as_ref() {
             self.stop_control_process(&record.sandbox.id).await;
@@ -2278,6 +2348,12 @@ impl DockerComputeDriver {
                             &self.config,
                         )
                         .await?;
+                        remove_docker_workspace_volume_by_id(
+                            &self.docker,
+                            &record.sandbox.id,
+                            &self.config,
+                        )
+                        .await?;
                         cleanup_docker_boundary_state(&record.sandbox, &self.config);
                         return Ok(true);
                     }
@@ -2289,6 +2365,12 @@ impl DockerComputeDriver {
                             &self.config,
                         )
                         .await;
+                        remove_docker_workspace_volume_by_id(
+                            &self.docker,
+                            &record.sandbox.id,
+                            &self.config,
+                        )
+                        .await?;
                         cleanup_docker_boundary_state(&record.sandbox, &self.config);
                         return Ok(true);
                     }
@@ -2303,9 +2385,12 @@ impl DockerComputeDriver {
                     .remove_auxiliary_containers_for_sandbox(sandbox_id)
                     .await?;
                 remove_docker_channel_volume_by_id(&self.docker, sandbox_id, &self.config).await?;
+                let removed_workspace =
+                    remove_docker_workspace_volume_by_id(&self.docker, sandbox_id, &self.config)
+                        .await?;
                 cleanup_docker_boundary_state_by_id(sandbox_id, &self.config);
                 self.clear_runtime_failure(sandbox_id).await;
-                return Ok(removed);
+                return Ok(removed || removed_workspace);
             }
             return Ok(false);
         };
@@ -2333,6 +2418,12 @@ impl DockerComputeDriver {
                 self.clear_runtime_failure(resolved_sandbox_id).await;
                 remove_docker_channel_volume_by_id(&self.docker, resolved_sandbox_id, &self.config)
                     .await?;
+                remove_docker_workspace_volume_by_id(
+                    &self.docker,
+                    resolved_sandbox_id,
+                    &self.config,
+                )
+                .await?;
                 cleanup_docker_boundary_state_by_id(resolved_sandbox_id, &self.config);
                 Ok(true)
             }
@@ -2344,8 +2435,14 @@ impl DockerComputeDriver {
                     &self.config,
                 )
                 .await;
+                let removed_workspace = remove_docker_workspace_volume_by_id(
+                    &self.docker,
+                    resolved_sandbox_id,
+                    &self.config,
+                )
+                .await?;
                 cleanup_docker_boundary_state_by_id(resolved_sandbox_id, &self.config);
-                Ok(pending.is_some())
+                Ok(pending.is_some() || removed_workspace)
             }
             Err(err) => Err(internal_status("delete docker sandbox container", err)),
         }
@@ -4105,6 +4202,116 @@ fn docker_channel_volume_name_by_id(
     hasher.update(sandbox_id.as_bytes());
     let digest = format!("{:x}", hasher.finalize());
     format!("openshell-channel-{}", &digest[..32])
+}
+
+fn docker_workspace_volume_name_by_id(
+    sandbox_id: &str,
+    config: &DockerDriverRuntimeConfig,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(config.sandbox_namespace.as_bytes());
+    hasher.update([0]);
+    hasher.update(sandbox_id.as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    format!("openshell-workspace-{}", &digest[..32])
+}
+
+fn docker_workspace_volume_labels(
+    sandbox_id: &str,
+    config: &DockerDriverRuntimeConfig,
+) -> HashMap<String, String> {
+    HashMap::from([
+        (
+            LABEL_MANAGED_BY.to_string(),
+            LABEL_MANAGED_BY_VALUE.to_string(),
+        ),
+        (LABEL_SANDBOX_ID.to_string(), sandbox_id.to_string()),
+        (
+            LABEL_SANDBOX_NAMESPACE.to_string(),
+            config.sandbox_namespace.clone(),
+        ),
+        (
+            LABEL_ISOLATION_BACKEND.to_string(),
+            LABEL_ISOLATION_BACKEND_OPEN_SHELL.to_string(),
+        ),
+        (
+            LABEL_ISOLATION_ROLE.to_string(),
+            LABEL_ISOLATION_ROLE_WORKSPACE.to_string(),
+        ),
+    ])
+}
+
+fn validate_docker_workspace_volume(
+    volume: &bollard::models::Volume,
+    sandbox_id: &str,
+    config: &DockerDriverRuntimeConfig,
+) -> Result<(), Status> {
+    if volume.name != docker_workspace_volume_name_by_id(sandbox_id, config)
+        || volume.driver != "local"
+        || !volume.options.is_empty()
+        || docker_workspace_volume_labels(sandbox_id, config)
+            .iter()
+            .any(|(key, value)| volume.labels.get(key) != Some(value))
+    {
+        return Err(Status::failed_precondition(
+            "persistent workspace volume lacks the expected local-driver ownership",
+        ));
+    }
+    Ok(())
+}
+
+async fn ensure_docker_workspace_volume(
+    docker: &Docker,
+    sandbox_id: &str,
+    config: &DockerDriverRuntimeConfig,
+) -> Result<(), Status> {
+    let name = docker_workspace_volume_name_by_id(sandbox_id, config);
+    match docker.inspect_volume(&name).await {
+        Ok(volume) => return validate_docker_workspace_volume(&volume, sandbox_id, config),
+        Err(error) if is_not_found_error(&error) => {}
+        Err(error) => {
+            return Err(internal_status(
+                "inspect persistent Docker workspace volume",
+                error,
+            ));
+        }
+    }
+    // Docker CreateVolume can return a concurrently-created volume; always inspect its ownership.
+    docker
+        .create_volume(VolumeCreateRequest {
+            name: Some(name.clone()),
+            driver: Some("local".to_string()),
+            labels: Some(docker_workspace_volume_labels(sandbox_id, config)),
+            ..Default::default()
+        })
+        .await
+        .map_err(|error| internal_status("create persistent Docker workspace volume", error))?;
+    let volume = docker
+        .inspect_volume(&name)
+        .await
+        .map_err(|error| internal_status("inspect persistent Docker workspace volume", error))?;
+    validate_docker_workspace_volume(&volume, sandbox_id, config)
+}
+
+async fn remove_docker_workspace_volume_by_id(
+    docker: &Docker,
+    sandbox_id: &str,
+    config: &DockerDriverRuntimeConfig,
+) -> Result<bool, Status> {
+    let name = docker_workspace_volume_name_by_id(sandbox_id, config);
+    let volume = match docker.inspect_volume(&name).await {
+        Ok(volume) => volume,
+        Err(error) if is_not_found_error(&error) => return Ok(false),
+        Err(error) => {
+            return Err(internal_status(
+                "inspect persistent Docker workspace volume",
+                error,
+            ));
+        }
+    };
+    validate_docker_workspace_volume(&volume, sandbox_id, config)?;
+    remove_docker_volume(docker, &name).await?;
+    Ok(true)
 }
 
 fn docker_supervisor_volume_name(
@@ -5920,6 +6127,20 @@ fn build_container_create_body_for_image(
     )
     .map_err(Status::failed_precondition)?;
     let mut user_mounts = docker_driver_mounts(driver_config)?;
+    if driver_config.persistent_workspace {
+        user_mounts.push(Mount {
+            target: Some(workspace_root.clone()),
+            source: Some(docker_workspace_volume_name_by_id(&sandbox.id, config)),
+            typ: Some(MountTypeEnum::VOLUME),
+            read_only: Some(false),
+            // Docker copies the image workspace and its ownership into a new empty volume.
+            volume_options: Some(MountVolumeOptions {
+                no_copy: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    }
     user_mounts.push(Mount {
         target: Some(BOUNDARY_MOUNT_PATH.to_string()),
         source: Some(docker_channel_volume_name(sandbox, config)),
@@ -5940,6 +6161,10 @@ fn build_container_create_body_for_image(
         }]
     });
     let mut labels = template.labels.clone();
+    labels.remove(LABEL_PERSISTENT_WORKSPACE_ROOT);
+    if driver_config.persistent_workspace {
+        labels.insert(LABEL_PERSISTENT_WORKSPACE_ROOT.to_string(), workspace_root);
+    }
     labels.insert(
         "openshell.ai/private-image-volume-targets".into(),
         serde_json::to_string(&image.volumes)

@@ -34,6 +34,58 @@ pub(super) struct RelayContext<'a> {
     middleware_engine: &'a OpaEngine,
 }
 
+impl RelayContext<'_> {
+    /// The initial HTTP/2 transport preserves REST method/path admission and
+    /// header credential custody. Other inspection/transformation contracts
+    /// remain HTTP/1-only and must not be bypassed by negotiating HTTP/2.
+    pub(super) fn allows_http2(&self) -> bool {
+        let PreparedHttpPolicy::Inspect { configs, .. } = &self.policy else {
+            return false;
+        };
+        let [config] = configs.as_slice() else {
+            return false;
+        };
+        config.protocol == crate::l7::L7Protocol::Rest
+            && config.enforcement == crate::l7::EnforcementMode::Enforce
+            && !config.credential_signing.is_sigv4()
+            && !config.request_body_credential_rewrite
+            && !config.websocket_credential_rewrite
+            && matches!(
+                super::middleware_uninspectable_gate(self.middleware_engine, self.request),
+                Ok(crate::l7::middleware::UninspectableTrafficGate::Unrestricted)
+            )
+    }
+}
+
+pub(super) async fn relay_http2_stream<C, U>(
+    client: C,
+    upstream: U,
+    context: RelayContext<'_>,
+) -> Result<()>
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+    U: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    if !context.allows_http2() {
+        return Err(miette::miette!("HTTP/2 inspection contract is unsupported"));
+    }
+    let PreparedHttpPolicy::Inspect {
+        mut configs,
+        evaluator,
+    } = context.policy
+    else {
+        unreachable!()
+    };
+    crate::l7::http2::relay(
+        client,
+        upstream,
+        configs.remove(0),
+        *evaluator,
+        context.request.clone(),
+    )
+    .await
+}
+
 /// Non-blocking observation channels attached to an authorized HTTP relay.
 pub(super) struct RelaySignals {
     /// Receives general sandbox network activity.

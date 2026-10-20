@@ -349,8 +349,10 @@ matcher fields in one rule.
 - One denied call denies an entire batched request.
 - Server responses and server-to-client messages are not inspected.
 - Only an allow rule that names an extension method exactly can allow it.
-  Method globs and `mcp.allow_all_known_mcp_methods` do not. An extension
-  method is one that no supported MCP revision defines.
+  Method globs and `mcp.allow_all_known_mcp_methods` do not. Extensions include
+  methods unknown to every supported core revision and explicitly supported
+  extensions outside the selected core profile, such as the
+  [official Tasks extension](#official-tasks-extension).
 
 Under the 2025 revisions, a client sends `initialize` and `notifications/initialized` before calling tools. When `mcp.allow_all_known_mcp_methods` is omitted or `false`, allow both explicitly:
 
@@ -422,6 +424,48 @@ The following list covers client-to-server requests and notifications that OpenS
 For `2026-07-28` HTTP requests, cancel a request by closing its response stream. OpenShell rejects `notifications/cancelled` over HTTP in that revision.
 
 MCP introduced [tasks](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/tasks) as an experimental feature in `2025-11-25`, so the March and June 2025 revisions do not include the task methods or `notifications/tasks/status`. The default policy revision includes them, but using tasks also requires the peer's task capabilities and, for task-augmented tool calls, the tool's task-support declaration. The policy option does not negotiate these capabilities.
+
+#### Official Tasks Extension
+
+On builds with Tasks-extension inspection, MCP `2026-07-28` supports the official
+[`io.modelcontextprotocol/tasks` extension](https://github.com/modelcontextprotocol/ext-tasks/blob/main/specification/2026-07-28/tasks.md).
+Its client-to-server requests are `tasks/get`, `tasks/update`, and `tasks/cancel`.
+Each needs an exact method allow rule; `mcp.allow_all_known_mcp_methods` admits core
+methods only. For example, this endpoint permits the three Task-control methods:
+
+```yaml
+network_policies:
+  task_control:
+    endpoints:
+      - host: mcp.example.com
+        port: 443
+        path: /mcp
+        protocol: mcp
+        enforcement: enforce
+        mcp:
+          versions: ["2026-07-28"]
+          allow_all_known_mcp_methods: false
+        rules:
+          - allow: {method: tasks/get}
+          - allow: {method: tasks/update}
+          - allow: {method: tasks/cancel}
+    binaries:
+      - path: /usr/local/bin/task-client
+```
+
+Add discovery, tool calls, and subscriptions separately when the client needs them.
+Deny rules still take precedence. OpenShell validates the JSON-RPC request,
+`params.taskId`, the typed `inputResponses` map required by `tasks/update`, and the
+common per-request metadata. `Mcp-Method` must match the method and `Mcp-Name` must
+match `taskId`, using the same header encoding as other name-bearing requests.
+Capability declarations remain intact; the peers own extension negotiation and
+application authorization.
+
+The modern extension has no `tasks/result` or `tasks/list`; results arrive in
+`tasks/get` or server-to-client `notifications/tasks` updates through
+`subscriptions/listen`. A client cannot send `notifications/tasks` to impersonate
+the server. Legacy Tasks remain restricted to their existing `2025-11-25` profile;
+Task-control allow rules do not enable them in earlier revisions.
 
 #### MCP Version Selection
 
@@ -594,6 +638,16 @@ The endpoint `path` field, which selects among endpoints on the same host and
 port, uses different rules. An empty path, `**`, or `/**` matches every path,
 `/v1/**` matches `/v1` and every path under it, and in other patterns `*` also
 matches `/`.
+
+On builds with disjoint REST/MCP route admission, you can inspect REST and MCP
+on the same host and port when their endpoint `path` selectors do not overlap.
+For example, use REST at `/oauth/**` and MCP at `/mcp/local`. Set the endpoint
+selectors themselves; narrow HTTP allow-rule paths alone do not separate the
+parsers. Overlapping selectors are rejected even when their HTTP method rules
+or path specificity differ, because REST authorization must not admit an MCP
+call that its MCP rules deny. All MCP endpoints on that host and port must still
+agree on their inspection options. This does not enable arbitrary mixed protocols
+or change credential bindings, TLS verification or MCP method restrictions.
 
 ## Full Example
 

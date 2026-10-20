@@ -188,6 +188,14 @@ startup with `ConfigurationInvalid`. Repair the complete policy or provider
 selection using the published policy workflow; do not add
 `allow_uninspected_credentials` merely to bypass a startup error.
 
+For MCP, check the selected build's supported revisions and extension inspection
+before generating rules. On builds with official Tasks-extension inspection,
+`2026-07-28` Task control uses exact `tasks/get`, `tasks/update`, and `tasks/cancel`
+allow rules; `allow_all_known_mcp_methods` stays core-only. Do not generate modern
+`tasks/result` or `tasks/list` rules. See the published
+[Tasks policy contract](https://docs.nvidia.com/openshell/latest/how-it-works/policies/schema#official-tasks-extension)
+for metadata, routing headers, and peer-owned capability negotiation.
+
 ## Step 4: Choose Policy Shape
 
 Follow this decision tree based on the detail tier and user intent:
@@ -359,7 +367,7 @@ Use `allowed_ips` to pin the addresses an endpoint may reach. When it is set, ev
 
 The supervisor resolver is authoritative for hostname-only authorization. When a Linux explicit-proxy deployment exposes the workload process namespace to the supervisor, a sandbox `/etc/hosts` entry such as a Kubernetes `hostAliases` mapping is honored for an ordinary endpoint only if it sets `allowed_ips` to the exact IP or a narrow CIDR. OpenShell's driver-managed host-gateway aliases use a separate trusted IP pin.
 
-Loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), unspecified, and cloud metadata addresses are **always blocked** as upstream destinations regardless of `allowed_ips`.
+Loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), unspecified, and cloud metadata addresses are blocked as ordinary upstream destinations regardless of `allowed_ips`. On builds that support local gateway service names, a trusted local HTTPS gateway can separately resolve one-label `openshell.localhost` names to its exact pinned socket, subject to ordinary hostname, port, executable and request checks. Do not add a loopback `allowed_ips` override for that path. Check the selected build's network-rules documentation for its supported coordinates and trust requirements; stock releases may not include this path.
 
 The Google Cloud metadata emulator reserves `127.0.0.1:8174` in Linux sandboxes. OpenShell handles SDK discovery locally through the supervisor; do not add an `allowed_ips` exception or grant access to the host cloud metadata service. See the [Google provider documentation](https://docs.nvidia.com/openshell/latest/how-it-works/providers/google.md).
 
@@ -425,6 +433,8 @@ Before presenting the policy to the user, verify correctness **and** flag breadt
 
 ### Breadth Warnings
 
+For gRPC clients, consult the published [HTTP/2 inspection conditions](https://docs.nvidia.com/openshell/latest/how-it-works/policies/network-rules#connection-and-request-checks). Use an exact enforced REST RPC-path allowlist only when those conditions hold. REST inspection does not authorize or inspect protobuf fields; the upstream service must enforce resource permissions.
+
 Evaluate the generated policy for overly broad access and **include warnings in the output to the user**. These do not block generation, but the user must see them.
 
 | Condition | Warning to show |
@@ -474,6 +484,12 @@ The policy needs to go somewhere. Determine which mode applies:
 2. **Check for conflicts**:
    - Does a policy with the same key already exist? If so, ask the user whether to **replace** it, **merge** new endpoints/binaries into it, or use a different key.
    - Does an existing endpoint selector overlap the new selector? Compatible overlaps are allowed and can intentionally aggregate allow and deny rules. Reject or revise equally specific overlaps that disagree on connection or request-processing metadata, including TLS, destination constraints, protocol/parser behavior, enforcement, or credential handling. A more-specific path selector may override broader request-processing metadata.
+   - On builds with disjoint REST/MCP route admission, those protocols may share
+     a host and port only with nonoverlapping endpoint `path` selectors. Do not
+     use a broad REST endpoint over an MCP path, even with different HTTP methods
+     or a more-specific MCP selector. Narrow allow-rule paths alone do not select
+     the parser. Keep MCP inspection options consistent on that host and port;
+     do not assume other mixed MCP protocols are supported.
    - If the sandbox uses an attached provider credential, confirm the provider
      profile also declares the intended host, port, and path. A sandbox policy
      allow cannot expand the profile's static credential binding.

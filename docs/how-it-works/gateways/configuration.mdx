@@ -361,6 +361,31 @@ On Postgres, each replica opens both pools, so plan for `(database_max_connectio
 
 On SQLite, writers are serialized regardless of pool size, so a larger ceiling buys read concurrency only. A gateway that needs more write throughput wants an external Postgres database (`server.externalDbSecret`), not a larger SQLite pool.
 
+## TCP forwarding capacity
+
+Native `ForwardTcp` connections to TCP targets have independent, finite gateway
+budgets. Configure them in the trusted gateway file; changes require a gateway
+restart, without rebuilding sandbox or supervisor images:
+
+```toml
+[openshell.gateway.tcp_forwarding]
+active_per_sandbox = 128
+active_per_replica = 1024
+pending_per_sandbox = 128
+pending_per_replica = 512
+```
+
+These values are also the defaults. All four values must be nonzero. Active
+budgets count connected streams and opens awaiting their target; pending budgets
+count only relay opens not yet claimed by a supervisor. Each global budget may
+independently dominate its per-sandbox budget. A full budget returns gRPC
+`ResourceExhausted`; closing or cancelling a stream releases its slot. Native
+workspace authorization and loopback-target validation remain mandatory.
+
+SSH retains its existing three connections per session token, twenty per sandbox,
+and separate pending-open limits. A TCP request supplying an SSH session token
+still validates that token and observes its per-token limit.
+
 ## OCSF JSONL Output
 
 `[openshell.gateway.ocsf_log]` enables a gateway-local file containing native OCSF events emitted by the gateway, including events without a sandbox association. Omit the table to disable it. Restart the gateway after changing this configuration.
@@ -1132,6 +1157,33 @@ endpoints using `host.docker.internal`. Set `host_gateway_ip` only to override i
 In bridge mode, host services and the configured OTLP collector endpoint must
 be reachable from containers; native Linux loopback-only listeners are unreachable.
 Host mode on Docker Desktop requires host networking enabled.
+
+For persistent Docker sandboxes, set both fields on the native create request:
+
+- `annotations["openshell.nvidia.com/retention"] = "persistent"` retains the
+  sandbox's durable identity, specification and settings after compute loss or
+  failed creation. Start recreates missing compute with the same sandbox ID and a
+  new runtime generation. Explicit Delete removes the sandbox.
+- `spec.template.driver_config.docker.persistent_workspace = true` stores the
+  resolved OCI working directory in a managed local volume. It defaults to
+  `false`. The gateway must enable `allow_driver_config` to accept this option.
+
+The annotation belongs to the create request; annotations on a workload template
+are not inherited. Without the annotation, ordinary gateway cleanup still applies.
+Without the Docker option, files remain in the transient container writable layer.
+The existing `ephemeral` retention value still deletes a completed sandbox;
+unknown or combined retention values are refused.
+
+The driver chooses the volume name from the sandbox ID and namespace and fixes
+the mount target to the image's workdir. A new volume receives the image's initial
+workspace files and ownership. Caller mounts still cannot cover that directory.
+This managed volume does not require caller-volume approval labels; the driver
+verifies its own ownership and local backing on reuse.
+
+Stop, recreation, provisioning failure and gateway startup cleanup retain the
+volume. Explicit sandbox deletion removes it after ownership verification. A
+crash during deletion may leave an orphaned workspace volume; absence of a
+container never authorizes startup cleanup to discard retained data.
 
 Docker accepts `http://` and `https://` proxy URLs in explicit
 `scheme://host:port` form. `no_proxy` bypasses only the corporate proxy;

@@ -108,7 +108,7 @@ LSM decisions remain authoritative.
 | `network_mode = host` on the supervisor | Lets the trusted supervisor reach the gateway's primary loopback listener and originate approved upstream connections. |
 | `restart_policy = no` | Keeps canonical main-process exit terminal. |
 | `PidsLimit` | Applies the configured sandbox PID budget. Omit `sandbox_pids_limit` to use OpenShell's default. Explicit zero is invalid. |
-| Private named volumes | One carries the authenticated sandbox/supervisor channel. The other is mounted only into the supervisor and contains its JWT and private gateway credentials. |
+| Private named volumes | One carries the authenticated sandbox/supervisor channel. The other is mounted only into the supervisor and contains its JWT and private gateway credentials. An optional managed workspace volume contains workload data. |
 | In-memory `/run/openshell-supervisor-ca` tmpfs | Holds only the public supervisor CA certificate and trust bundle without making all of `/run` writable. |
 | CDI GPU request | Assigns the exact validated CDI devices requested by driver config or count-based selection. |
 
@@ -123,6 +123,40 @@ across gateway restarts.
 Delete force-removes both containers, the driver-owned runtime volumes, and the
 host-private runtime descriptor. Missing or altered descriptor and channel resources
 fail closed; the driver does not run an older combined-supervisor layout.
+
+### Persistent Workspace
+
+Persistent workspaces require two explicit settings in the native create request:
+
+- Set `CreateSandboxRequest.annotations["openshell.nvidia.com/retention"]` to
+  `"persistent"`. The gateway retains the sandbox row, specification, SSH identity
+  and settings after runtime loss or failed creation. A subsequent Start recreates
+  missing compute with the same sandbox ID and a fresh runtime generation.
+- Set `persistent_workspace` to `true` in the sandbox's Docker driver config to
+  retain its OCI working directory in a driver-owned local volume. The gateway
+  must allow caller driver config through `allow_driver_config`.
+
+The default retention is ordinary; `ephemeral` still deletes a completed sandbox.
+The default Docker option is `false`, which keeps files in the container's writable
+layer. Retention alone does not preserve container files, and the Docker storage
+option alone does not change gateway deletion intent. Workload-template annotations
+are not inherited by create requests; set the retention annotation on the request.
+
+The driver fixes the mount target to the resolved OCI workdir; callers cannot
+choose its volume name or substitute a mount covering that directory. Docker
+copies a new volume's initial files and ownership from the image. The supervisor
+still validates access under the resolved non-root identity.
+
+The volume name binds the stable sandbox ID and configured namespace. Create and
+start verify the local driver, empty driver options and managed-by, sandbox,
+namespace, backend and workspace-role labels before reusing it. This internal
+volume is separate from caller-supplied volumes and their label admission.
+
+Stop, container recreation, provisioning failure and gateway startup cleanup retain
+the workspace volume, including when no workload container remains. Explicit
+sandbox Delete removes only a verified owned workspace volume. A crash during
+deletion can leave an orphaned volume; startup cleanup deliberately retains it
+rather than infer that absent containers make user data disposable.
 
 ## Driver Config Mounts
 

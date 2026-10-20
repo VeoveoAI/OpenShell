@@ -15,7 +15,10 @@ use tower_mcp_types::{
         McpInspectionError, McpInspectionErrorKind, McpInspector,
         McpMethodClassification as TowerMcpMethodClassification,
     },
-    protocol::{InitializeParams, JSONRPC_VERSION, McpRequest, RequestMeta, validate_meta_object},
+    protocol::{
+        InitializeParams, InputResponses, JSONRPC_VERSION, McpRequest, RequestMeta,
+        validate_meta_object,
+    },
 };
 
 use crate::l7::provider::{L7Provider, L7Request};
@@ -207,7 +210,7 @@ pub struct JsonRpcRequestInfo {
 pub struct McpHttpRequestMetadata {
     /// The JSON-RPC method mirrored in `Mcp-Method`.
     pub method: String,
-    /// Tool or prompt name, or resource URI, mirrored in `Mcp-Name` when required.
+    /// Tool/prompt name, resource URI, or Tasks-extension task ID mirrored in `Mcp-Name`.
     pub name: Option<String>,
 }
 
@@ -309,15 +312,15 @@ impl std::error::Error for JsonRpcInspectionError {}
 /// Policy-relevant classification of one accepted MCP method.
 ///
 /// Known methods unavailable in the selected revision are rejected before a
-/// call is produced, so the policy boundary represents only core methods that
-/// are available and unknown extension methods that need an exact allow rule.
+/// call is produced, so the policy boundary represents only available core
+/// methods and supported or unknown extensions that need an exact allow rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum McpMethodClassification {
     /// A core method defined by the selected MCP revision.
     Available,
-    /// A method unknown to every supported core profile.
+    /// An extension outside the selected core profile, requiring an exact allow rule.
     Extension,
 }
 
@@ -758,6 +761,40 @@ fn parse_mcp_payload(
         Err(error) => return JsonRpcRequestInfo::rejected(payload.is_batch(), error),
     };
 
+    // The upstream inspector deliberately describes core profiles only. The
+    // official Tasks extension reuses two legacy method names, so it needs its
+    // own typed inspection rather than core availability or a policy bypass.
+    match inspect_mcp_tasks_extension(&payload, revision) {
+        Ok(Some(task_id)) => {
+            let Some(mut metadata) = mcp_http_metadata else {
+                return JsonRpcRequestInfo::rejected(
+                    false,
+                    JsonRpcInspectionError::invalid_message(
+                        "MCP Tasks extension requests require HTTP routing metadata",
+                    ),
+                );
+            };
+            metadata.name = Some(task_id);
+            return JsonRpcRequestInfo {
+                calls: vec![JsonRpcCallInfo {
+                    method: metadata.method.clone(),
+                    params: HashMap::new(),
+                    tool: None,
+                    mcp_classification: Some(McpMethodClassification::Extension),
+                    is_notification: false,
+                }],
+                is_batch: false,
+                receive_stream: false,
+                has_response: false,
+                mcp_revision: Some(revision),
+                mcp_http_metadata: Some(metadata),
+                error: None,
+            };
+        }
+        Ok(None) => {}
+        Err(error) => return JsonRpcRequestInfo::rejected(payload.is_batch(), error),
+    }
+
     let inspection =
         match inspect_mcp_payload_for_revision(&payload, revision, McpDirection::ClientToServer) {
             Ok(inspection) => inspection,
@@ -846,6 +883,69 @@ fn parse_mcp_payload(
         mcp_http_metadata,
         error: None,
     }
+}
+
+/// Inspect the official SEP-2663 extension without adding it to a core profile.
+/// Negotiation remains with the peers; this boundary validates the request and
+/// classifies it as an extension so only an exact method allow rule can admit it.
+fn inspect_mcp_tasks_extension(
+    payload: &JsonRpcPayload,
+    revision: McpProtocolVersion,
+) -> std::result::Result<Option<String>, JsonRpcInspectionError> {
+    if revision != McpProtocolVersion::V2026_07_28 {
+        return Ok(None);
+    }
+    let Some(envelope) = payload.as_single() else {
+        // Modern batches still go through the existing core rejection path.
+        return Ok(None);
+    };
+    if envelope_method(envelope) == Some("notifications/tasks") {
+        return Err(JsonRpcInspectionError::mcp_profile_violation(
+            "MCP Tasks status notifications are server-to-client only",
+        ));
+    }
+    if !matches!(
+        envelope_method(envelope),
+        Some("tasks/get" | "tasks/update" | "tasks/cancel")
+    ) {
+        return Ok(None);
+    }
+    let JsonRpcEnvelope::Request(request) = envelope else {
+        return Err(JsonRpcInspectionError::invalid_message(
+            "MCP Tasks extension control methods must be client-to-server requests with an id",
+        ));
+    };
+    // Reuse the protocol dependency's field types. Its update convenience type
+    // defaults inputResponses and stores arbitrary JSON values, so additionally
+    // require and decode the final extension's typed MRTR response map below.
+    let typed = McpRequest::from_jsonrpc(request).map_err(|_| {
+        JsonRpcInspectionError::invalid_message("invalid MCP Tasks extension parameters")
+    })?;
+    let task_id = match typed {
+        McpRequest::GetTaskInfo(params) => params.task_id,
+        McpRequest::CancelTask(params) => params.task_id,
+        McpRequest::UpdateTask(params) => {
+            let responses = request
+                .params
+                .as_ref()
+                .and_then(|params| params.get("inputResponses"))
+                .ok_or_else(|| {
+                    JsonRpcInspectionError::invalid_message(
+                        "MCP tasks/update requires inputResponses",
+                    )
+                })?;
+            serde_json::from_value::<InputResponses>(responses.clone()).map_err(|_| {
+                JsonRpcInspectionError::invalid_message("invalid MCP tasks/update inputResponses")
+            })?;
+            params.task_id
+        }
+        _ => {
+            return Err(JsonRpcInspectionError::invalid_message(
+                "MCP Tasks extension method has an unexpected typed request",
+            ));
+        }
+    };
+    Ok(Some(task_id))
 }
 
 /// Validate the common request contract before method-specific inspection.
@@ -1197,6 +1297,177 @@ mod tests {
             "io.modelcontextprotocol/clientCapabilities": {}
         });
         serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+    }
+
+    #[test]
+    fn mcp_tasks_extension_inspects_typed_requests_as_extensions() {
+        for (method, params) in [
+            ("tasks/get", serde_json::json!({"taskId": "task-opaque"})),
+            ("tasks/cancel", serde_json::json!({"taskId": "task-opaque"})),
+            (
+                "tasks/update",
+                serde_json::json!({"taskId": "task-opaque", "inputResponses": {}}),
+            ),
+            (
+                "tasks/update",
+                serde_json::json!({"taskId": "task-opaque", "inputResponses": {
+                    "approval": {"action": "accept", "content": {"approved": true}}
+                }}),
+            ),
+        ] {
+            for declared in [false, true] {
+                let mut request = sessionless_request(method, params.clone());
+                if declared {
+                    request["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"] =
+                        serde_json::json!({"extensions": {"io.modelcontextprotocol/tasks": {}}});
+                }
+                let info = parse_jsonrpc_body_with_options(
+                    &serde_json::to_vec(&request).unwrap(),
+                    mcp_options(McpProtocolVersion::V2026_07_28),
+                );
+                assert!(info.error.is_none(), "{method}: {:?}", info.error);
+                assert_eq!(info.calls.len(), 1);
+                assert_eq!(info.calls[0].method, method);
+                assert_eq!(
+                    info.calls[0].mcp_classification,
+                    Some(McpMethodClassification::Extension)
+                );
+                assert!(info.calls[0].tool.is_none());
+                assert!(info.calls[0].params.is_empty());
+                assert!(!info.calls[0].is_notification);
+                assert_eq!(
+                    info.mcp_http_metadata.unwrap().name.as_deref(),
+                    Some("task-opaque")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mcp_tasks_extension_rejects_invalid_params_and_client_notifications() {
+        for (method, params) in [
+            ("tasks/get", serde_json::json!({})),
+            ("tasks/get", serde_json::json!({"taskId": 42})),
+            ("tasks/cancel", serde_json::json!({"taskId": null})),
+            (
+                "tasks/update",
+                serde_json::json!({"taskId": "private-task-marker"}),
+            ),
+            (
+                "tasks/update",
+                serde_json::json!({"taskId": "private-task-marker", "inputResponses": null}),
+            ),
+            (
+                "tasks/update",
+                serde_json::json!({"taskId": "private-task-marker", "inputResponses": []}),
+            ),
+            (
+                "tasks/update",
+                serde_json::json!({"taskId": "private-task-marker", "inputResponses": {"private-response-marker": false}}),
+            ),
+            (
+                "tasks/update",
+                serde_json::json!({"taskId": "private-task-marker", "inputResponses": {"private-response-marker": {}}}),
+            ),
+        ] {
+            let request = sessionless_request(method, params);
+            let info = parse_jsonrpc_body_with_options(
+                &serde_json::to_vec(&request).unwrap(),
+                mcp_options(McpProtocolVersion::V2026_07_28),
+            );
+            assert!(info.calls.is_empty());
+            let detail = info.error.unwrap().to_string();
+            assert!(!detail.contains("private-task-marker"));
+            assert!(!detail.contains("private-response-marker"));
+        }
+        for method in [
+            "tasks/get",
+            "tasks/update",
+            "tasks/cancel",
+            "notifications/tasks",
+        ] {
+            let mut request = sessionless_request(
+                method,
+                serde_json::json!({"taskId": "task-opaque", "inputResponses": {}}),
+            );
+            request.as_object_mut().unwrap().remove("id");
+            let info = parse_jsonrpc_body_with_options(
+                &serde_json::to_vec(&request).unwrap(),
+                mcp_options(McpProtocolVersion::V2026_07_28),
+            );
+            assert!(info.error.is_some(), "client spoofed {method}");
+            assert!(info.calls.is_empty());
+        }
+    }
+
+    #[test]
+    fn mcp_tasks_extension_preserves_common_metadata_and_batch_validation() {
+        let mut request =
+            sessionless_request("tasks/get", serde_json::json!({"taskId": "task-opaque"}));
+        for meta in [
+            serde_json::json!({}),
+            serde_json::json!({"io.modelcontextprotocol/protocolVersion": "2025-11-25", "io.modelcontextprotocol/clientCapabilities": {}}),
+            serde_json::json!({"io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientCapabilities": null}),
+            serde_json::json!({"io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientCapabilities": {"extensions": {"io.modelcontextprotocol/tasks": false}}}),
+        ] {
+            request["params"]["_meta"] = meta;
+            let info = parse_jsonrpc_body_with_options(
+                &serde_json::to_vec(&request).unwrap(),
+                mcp_options(McpProtocolVersion::V2026_07_28),
+            );
+            assert!(info.error.is_some(), "invalid metadata accepted");
+            assert!(info.calls.is_empty());
+        }
+        let request =
+            sessionless_request("tasks/get", serde_json::json!({"taskId": "task-opaque"}));
+        let batch = serde_json::json!([request, request]);
+        let info = parse_jsonrpc_body_with_options(
+            &serde_json::to_vec(&batch).unwrap(),
+            mcp_options(McpProtocolVersion::V2026_07_28),
+        );
+        assert!(info.error.is_some(), "modern Task batch accepted");
+        assert!(info.calls.is_empty());
+        let duplicate = br#"{"jsonrpc":"2.0","id":1,"method":"tasks/get","params":{"taskId":"first","taskId":"second","_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}"#;
+        let info = parse_jsonrpc_body_with_options(
+            duplicate,
+            mcp_options(McpProtocolVersion::V2026_07_28),
+        );
+        assert!(info.error.is_some(), "duplicate routing field accepted");
+    }
+
+    #[test]
+    fn mcp_tasks_extension_keeps_core_revision_boundaries() {
+        for method in ["tasks/result", "tasks/list", "notifications/tasks/status"] {
+            let request = sessionless_request(method, serde_json::json!({"taskId": "task-opaque"}));
+            let info = parse_jsonrpc_body_with_options(
+                &serde_json::to_vec(&request).unwrap(),
+                mcp_options(McpProtocolVersion::V2026_07_28),
+            );
+            assert!(info.error.is_some(), "removed {method} accepted");
+        }
+        for revision in [
+            McpProtocolVersion::V2025_03_26,
+            McpProtocolVersion::V2025_06_18,
+            McpProtocolVersion::V2025_11_25,
+        ] {
+            for method in ["tasks/get", "tasks/cancel", "tasks/update"] {
+                let request = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": method,
+                    "params": {"taskId": "task-opaque", "inputResponses": {}}});
+                let info = parse_jsonrpc_body_with_options(
+                    &serde_json::to_vec(&request).unwrap(),
+                    mcp_options(revision),
+                );
+                let legacy =
+                    revision == McpProtocolVersion::V2025_11_25 && method != "tasks/update";
+                assert_eq!(info.error.is_none(), legacy, "{revision} {method}");
+                if legacy {
+                    assert_eq!(
+                        info.calls[0].mcp_classification,
+                        Some(McpMethodClassification::Available)
+                    );
+                }
+            }
+        }
     }
 
     #[test]

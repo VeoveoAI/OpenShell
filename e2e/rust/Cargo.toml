@@ -247,6 +247,8 @@ path = "tests/gpu.rs"
 required-features = ["e2e-gpu"]
 
 [dependencies]
+openshell-sdk = { path = "../../crates/openshell-sdk" }
+openshell-bootstrap = { path = "../../crates/openshell-bootstrap" }
 base64 = "0.22"
 bollard = "0.20"
 bytes = "1"
@@ -256,6 +258,7 @@ hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 prost = "0.14"
+prost-types = "0.14"
 tokio = { version = "1.43", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tempfile = "3"
@@ -293,3 +296,8 @@ missing_panics_doc = "allow"
 name = "live_internet_traffic_perf"
 path = "tests/live_internet_traffic_perf.rs"
 required-features = ["e2e-host-gateway"]
+
+[[test]]
+name = "docker_persistent_workspace"
+path = "tests/docker_persistent_workspace.rs"
+required-features = ["e2e-docker"]

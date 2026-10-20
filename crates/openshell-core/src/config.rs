@@ -248,6 +248,9 @@ pub struct Config {
     /// Gateway user authentication behavior.
     pub auth: GatewayAuthConfig,
 
+    /// Native TCP forwarding budgets; independent from SSH session limits.
+    pub tcp_forwarding: TcpForwardingConfig,
+
     /// Allow the WebSocket tunnel used by authenticated edge proxies.
     /// Disabled for local gateways by default.
     pub enable_websocket_tunnel: bool,
@@ -467,6 +470,31 @@ pub struct MtlsAuthConfig {
     /// this setting is independent of the selected compute driver.
     #[serde(default)]
     pub enabled: bool,
+}
+
+/// Gateway-owned native TCP relay budgets. Each budget is finite and nonzero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TcpForwardingConfig {
+    /// Active streams, including target establishment, for one sandbox.
+    pub active_per_sandbox: std::num::NonZeroUsize,
+    /// Active streams, including target establishment, on one gateway replica.
+    pub active_per_replica: std::num::NonZeroUsize,
+    /// Unclaimed relay opens for one sandbox.
+    pub pending_per_sandbox: std::num::NonZeroUsize,
+    /// Unclaimed relay opens on one gateway replica.
+    pub pending_per_replica: std::num::NonZeroUsize,
+}
+
+impl Default for TcpForwardingConfig {
+    fn default() -> Self {
+        Self {
+            active_per_sandbox: std::num::NonZeroUsize::new(128).unwrap(),
+            active_per_replica: std::num::NonZeroUsize::new(1024).unwrap(),
+            pending_per_sandbox: std::num::NonZeroUsize::new(128).unwrap(),
+            pending_per_replica: std::num::NonZeroUsize::new(512).unwrap(),
+        }
+    }
 }
 
 /// Gateway user authentication settings.
@@ -935,6 +963,7 @@ impl Config {
             tls,
             oidc: None,
             auth: GatewayAuthConfig::default(),
+            tcp_forwarding: TcpForwardingConfig::default(),
             enable_websocket_tunnel: false,
             gateway_interceptors: Vec::new(),
             provider_profile_sources: vec![GatewayProviderProfileSourceConfig::User],

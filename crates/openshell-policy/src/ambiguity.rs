@@ -94,8 +94,9 @@ pub fn find_endpoint_ambiguities(policy: &SandboxPolicy) -> Vec<EndpointAmbiguit
             if endpoint_contributes_request_pipeline_metadata(left.endpoint)
                 && endpoint_contributes_request_pipeline_metadata(right.endpoint)
                 && path_patterns_overlap(&left.endpoint.path, &right.endpoint.path)
-                && path_selector_specificity(&left.endpoint.path)
-                    == path_selector_specificity(&right.endpoint.path)
+                && (mcp_rest_pair(left.endpoint, right.endpoint)
+                    || path_selector_specificity(&left.endpoint.path)
+                        == path_selector_specificity(&right.endpoint.path))
             {
                 conflicts.extend(request_pipeline_conflicts(left.endpoint, right.endpoint));
             }
@@ -403,11 +404,31 @@ fn host_patterns_overlap(left: &str, right: &str) -> bool {
     glob_patterns_overlap(&left.to_ascii_lowercase(), &right.to_ascii_lowercase(), '.')
 }
 
-fn path_patterns_overlap(left: &str, right: &str) -> bool {
+// REST authorization is existential across matching endpoints. A broader REST
+// endpoint could admit an MCP request that the more-specific MCP parser denies,
+// so path specificity cannot make an overlapping REST/MCP pair safe.
+fn mcp_rest_pair(left: &NetworkEndpoint, right: &NetworkEndpoint) -> bool {
+    (left.protocol.eq_ignore_ascii_case("mcp") && right.protocol.eq_ignore_ascii_case("rest"))
+        || (left.protocol.eq_ignore_ascii_case("rest")
+            && right.protocol.eq_ignore_ascii_case("mcp"))
+}
+
+pub fn path_patterns_overlap(left: &str, right: &str) -> bool {
     if left.is_empty()
         || right.is_empty()
         || matches!(left, "**" | "/**")
         || matches!(right, "**" | "/**")
+    {
+        return true;
+    }
+    // The runtime's trailing `/**` selector also includes the subtree root,
+    // which is not part of the ordinary slash-plus-glob language below.
+    if left
+        .strip_suffix("/**")
+        .is_some_and(|root| openshell_core::endpoint_path::matches(right, root))
+        || right
+            .strip_suffix("/**")
+            .is_some_and(|root| openshell_core::endpoint_path::matches(left, root))
     {
         return true;
     }
@@ -816,6 +837,60 @@ mod tests {
         right.protocol = "rest".to_string();
 
         assert!(find_endpoint_ambiguities(&policy_with(left, right)).is_empty());
+    }
+
+    #[test]
+    fn rest_mcp_overlap_is_rejected_regardless_of_path_specificity_or_http_rules() {
+        for (rest_path, mcp_path, overlaps) in [
+            ("/oauth/**", "/mcp/local", false),
+            ("/mcp-other/**", "/mcp", false),
+            ("/v[12]/**", "/v[34]/mcp", false),
+            ("", "/mcp", true),
+            ("/**", "/mcp", true),
+            ("/mcp/**", "/mcp", true),
+            ("/mcp/*", "/mcp/a/b", true),
+            ("/m?p", "/mcp", true),
+            ("/v[12]/**", "/v2/mcp", true),
+            ("/mcp", "/**", true),
+        ] {
+            let mut rest = endpoint("api.example.com", 443);
+            rest.path = rest_path.into();
+            rest.protocol = "rest".into();
+            // GET-only authorization cannot separate parsers on the same path.
+            rest.rules = vec![L7Rule {
+                allow: Some(L7Allow {
+                    method: "GET".into(),
+                    path: "/**".into(),
+                    ..Default::default()
+                }),
+            }];
+            let mut mcp = endpoint("api.example.com", 443);
+            mcp.path = mcp_path.into();
+            mcp.protocol = "mcp".into();
+            for (left, right) in [(rest.clone(), mcp.clone()), (mcp, rest)] {
+                assert_eq!(
+                    !find_endpoint_ambiguities(&policy_with(left, right)).is_empty(),
+                    overlaps,
+                    "{rest_path:?} vs {mcp_path:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rest_mcp_overlap_checks_wildcard_hosts_and_all_ports() {
+        let mut rest = endpoint("*.example.com", 443);
+        rest.protocol = "rest".into();
+        rest.path = "/**".into();
+        let mut mcp = endpoint("api.example.com", 8443);
+        mcp.protocol = "mcp".into();
+        mcp.path = "/mcp".into();
+        assert!(find_endpoint_ambiguities(&policy_with(rest.clone(), mcp.clone())).is_empty());
+        rest.ports = vec![443, 8443];
+        assert_eq!(
+            find_endpoint_ambiguities(&policy_with(rest, mcp))[0].overlapping_ports,
+            [8443]
+        );
     }
 
     #[test]

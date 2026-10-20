@@ -554,6 +554,10 @@ fn prepare_server_config_with_drivers(
         .with_database_url(db_url)
         .with_database_max_connections(args.db_max_connections)
         .with_database_lock_max_connections(args.db_lock_max_connections);
+    config.tcp_forwarding = file
+        .as_ref()
+        .and_then(|file| file.openshell.gateway.tcp_forwarding)
+        .unwrap_or_default();
     if let Some(driver) = &args.compute_driver {
         config = config.with_compute_driver(driver);
     }

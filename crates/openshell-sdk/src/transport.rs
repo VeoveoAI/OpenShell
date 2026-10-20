@@ -93,7 +93,7 @@ pub async fn build_channel(config: &ClientConfig) -> Result<Channel> {
         return standard_endpoint(gateway.clone())?
             .connect()
             .await
-            .map_err(|e| SdkError::connect(format!("{e}")));
+            .map_err(SdkError::from_transport);
     }
 
     if !gateway.starts_with("https://") {
@@ -108,7 +108,7 @@ pub async fn build_channel(config: &ClientConfig) -> Result<Channel> {
         return standard_endpoint(format!("http://{local_addr}"))?
             .connect()
             .await
-            .map_err(|e| SdkError::connect(format!("{e}")));
+            .map_err(SdkError::from_transport);
     }
 
     // Branch 3 — insecure TLS (skip cert verification): swap the scheme to
@@ -123,7 +123,7 @@ pub async fn build_channel(config: &ClientConfig) -> Result<Channel> {
         return standard_endpoint(http_uri)?
             .connect_with_connector(connector)
             .await
-            .map_err(|e| SdkError::connect(format!("{e}")));
+            .map_err(SdkError::from_transport);
     }
 
     // Branch 4 — anonymous TLS or OIDC bearer over HTTPS: pin `ca_cert` when
@@ -140,7 +140,7 @@ pub async fn build_channel(config: &ClientConfig) -> Result<Channel> {
         .map_err(|e| SdkError::tls(format!("{e}")))?
         .connect()
         .await
-        .map_err(|e| SdkError::connect(format!("{e}")))
+        .map_err(SdkError::from_transport)
 }
 
 /// rustls verifier that accepts any server certificate.

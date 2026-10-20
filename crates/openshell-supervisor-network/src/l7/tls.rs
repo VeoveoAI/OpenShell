@@ -208,6 +208,10 @@ impl CertCache {
 pub struct ProxyTlsState {
     cert_cache: CertCache,
     upstream_config: Arc<ClientConfig>,
+    native_service_config: Option<(
+        crate::native_service::NativeServiceIngress,
+        Arc<ClientConfig>,
+    )>,
 }
 
 impl ProxyTlsState {
@@ -216,17 +220,62 @@ impl ProxyTlsState {
         Self {
             cert_cache,
             upstream_config,
+            native_service_config: None,
         }
     }
 
+    /// Trust the driver-owned gateway CA only on the exact native gateway socket.
+    pub(crate) fn configure_native_service_ingress(
+        &mut self,
+        ingress: crate::native_service::NativeServiceIngress,
+        system_ca_bundle: &str,
+        gateway_ca_pem: &str,
+    ) -> Result<()> {
+        let mut roots = build_upstream_root_store(system_ca_bundle)?;
+        let certs = rustls_pemfile::certs(&mut gateway_ca_pem.as_bytes())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| miette!("native gateway CA is invalid"))?;
+        if certs.is_empty() {
+            return Err(miette!("native gateway CA contains no certificates"));
+        }
+        for cert in certs {
+            roots
+                .add(cert)
+                .map_err(|_| miette!("native gateway CA is invalid"))?;
+        }
+        let mut config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        self.native_service_config = Some((ingress, Arc::new(config)));
+        Ok(())
+    }
+
+    pub(crate) fn upstream_config_for(
+        &self,
+        host: &str,
+        port: u16,
+        addresses: &[std::net::SocketAddr],
+    ) -> &Arc<ClientConfig> {
+        if let Some((ingress, config)) = &self.native_service_config
+            && ingress.permits_tls(host, port, addresses)
+        {
+            return config;
+        }
+        &self.upstream_config
+    }
+
     /// Get or generate a leaf cert for the hostname and return a TLS acceptor.
-    fn acceptor_for(&self, hostname: &str) -> Result<TlsAcceptor> {
+    fn acceptor_for(&self, hostname: &str, http2: bool) -> Result<TlsAcceptor> {
         let leaf = self.cert_cache.get_or_generate(hostname)?;
         let mut server_config = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(leaf.cert_chain.clone(), leaf.private_key.clone_key())
             .into_diagnostic()?;
         server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        if http2 {
+            server_config.alpn_protocols.insert(0, b"h2".to_vec());
+        }
         Ok(TlsAcceptor::from(Arc::new(server_config)))
     }
 
@@ -247,9 +296,26 @@ pub async fn tls_terminate_client<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let acceptor = tls_state.acceptor_for(hostname)?;
+    let acceptor = tls_state.acceptor_for(hostname, false)?;
     let tls_stream = acceptor.accept(client).await.into_diagnostic()?;
     Ok(tls_stream)
+}
+
+/// Negotiate HTTP/2 only when the caller has admitted an enforceable HTTP/2 route.
+pub(crate) async fn tls_terminate_http_client<S>(
+    client: S,
+    tls_state: &ProxyTlsState,
+    hostname: &str,
+    http2: bool,
+) -> Result<tokio_rustls::server::TlsStream<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    tls_state
+        .acceptor_for(hostname, http2)?
+        .accept(client)
+        .await
+        .into_diagnostic()
 }
 
 /// Connect TLS to an upstream server, verifying against the configured CA roots.
@@ -639,6 +705,143 @@ mod tests {
     }
 
     /// Helper: generate a self-signed CA and return its PEM string.
+    async fn native_tls_handshake(
+        state: &ProxyTlsState,
+        authority: &str,
+        port: u16,
+        addresses: &[std::net::SocketAddr],
+        cert_cache: &CertCache,
+    ) -> bool {
+        let leaf = cert_cache.get_or_generate(authority).unwrap();
+        let server = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(leaf.cert_chain.clone(), leaf.private_key.clone_key())
+            .unwrap();
+        let (client_io, server_io) = tokio::io::duplex(32768);
+        let server = tokio::spawn(async move {
+            TlsAcceptor::from(Arc::new(server))
+                .accept(server_io)
+                .await
+                .is_ok()
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tls_connect_upstream(
+                client_io,
+                authority,
+                state.upstream_config_for(authority, port, addresses),
+            ),
+        )
+        .await
+        .unwrap()
+        .is_ok();
+        let _ = server.await.unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn native_gateway_ca_is_scoped_to_verified_name_and_gateway_socket() {
+        let ingress = crate::native_service::NativeServiceIngress::from_endpoint(
+            Some("https://localhost:17670"),
+            Some("127.0.0.1".parse().unwrap()),
+        )
+        .unwrap();
+        let gateway_ca = SandboxCa::generate().unwrap();
+        let gateway_pem = gateway_ca.cert_pem().to_string();
+        let gateway_cache = CertCache::new(gateway_ca);
+        let ordinary = build_upstream_client_config("").unwrap();
+        let mut state = ProxyTlsState::new(
+            CertCache::new(SandboxCa::generate().unwrap()),
+            ordinary.clone(),
+        );
+        state
+            .configure_native_service_ingress(ingress, "", &gateway_pem)
+            .unwrap();
+        let host = "team--application.openshell.localhost";
+        assert!(
+            native_tls_handshake(&state, host, 17670, &[ingress.socket()], &gateway_cache).await
+        );
+        assert!(
+            native_tls_handshake(
+                &state,
+                "host.openshell.internal",
+                17670,
+                &[ingress.socket()],
+                &gateway_cache
+            )
+            .await
+        );
+        for (authority, port, socket) in [
+            (host, 443, "127.0.0.1:443"),
+            (host, 17670, "127.0.0.2:17670"),
+            ("host.openshell.internal", 443, "127.0.0.1:443"),
+            ("unrelated.example", 17670, "127.0.0.1:17670"),
+            ("nested.team.openshell.localhost", 17670, "127.0.0.1:17670"),
+        ] {
+            let addresses = [socket.parse().unwrap()];
+            assert!(Arc::ptr_eq(
+                state.upstream_config_for(authority, port, &addresses),
+                &ordinary
+            ));
+            assert!(
+                !native_tls_handshake(&state, authority, port, &addresses, &gateway_cache).await,
+                "{authority}:{port}"
+            );
+        }
+        let other_ca = CertCache::new(SandboxCa::generate().unwrap());
+        assert!(!native_tls_handshake(&state, host, 17670, &[ingress.socket()], &other_ca).await);
+        // Correct issuer alone does not waive the logical hostname/SNI check.
+        let leaf = gateway_cache
+            .get_or_generate("wrong.openshell.localhost")
+            .unwrap();
+        let server = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(leaf.cert_chain.clone(), leaf.private_key.clone_key())
+            .unwrap();
+        let (client_io, server_io) = tokio::io::duplex(32768);
+        let task = tokio::spawn(async move {
+            TlsAcceptor::from(Arc::new(server))
+                .accept(server_io)
+                .await
+                .is_ok()
+        });
+        assert!(
+            tls_connect_upstream(
+                client_io,
+                host,
+                state.upstream_config_for(host, 17670, &[ingress.socket()])
+            )
+            .await
+            .is_err()
+        );
+        let _ = task.await.unwrap();
+    }
+
+    #[test]
+    fn native_gateway_ca_rejects_empty_or_invalid_trust_material() {
+        let ingress = crate::native_service::NativeServiceIngress::from_endpoint(
+            Some("https://localhost:17670"),
+            Some("127.0.0.1".parse().unwrap()),
+        )
+        .unwrap();
+        for pem in [
+            "",
+            "not a certificate",
+            "-----BEGIN CERTIFICATE-----\ninvalid\n-----END CERTIFICATE-----",
+        ] {
+            let mut state = ProxyTlsState::new(
+                CertCache::new(SandboxCa::generate().unwrap()),
+                build_upstream_client_config("").unwrap(),
+            );
+            assert!(
+                state
+                    .configure_native_service_ingress(ingress, "", pem)
+                    .is_err()
+            );
+            assert!(state.native_service_config.is_none());
+        }
+    }
+
     fn generate_ca_pem() -> String {
         SandboxCa::generate().unwrap().ca_cert_pem
     }

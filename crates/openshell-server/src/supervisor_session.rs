@@ -69,21 +69,22 @@ pub(crate) enum SessionMode {
 const SESSION_WAIT_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 /// Maximum backoff between session-availability polls in `wait_for_session`.
 const SESSION_WAIT_MAX_BACKOFF: Duration = Duration::from_secs(2);
-/// Upper bound on unclaimed relay channels across all sandboxes. Caps the
+/// Upper bound on unclaimed SSH relay channels across all sandboxes. Caps the
 /// memory a misbehaving caller can pin by calling `open_relay` repeatedly
 /// while the supervisor never claims (or isn't responding). Sized generously
 /// so normal bursts pass through; exceeding it returns `ResourceExhausted`.
 const MAX_PENDING_RELAYS: usize = 256;
-/// Upper bound on concurrent unclaimed relay channels for a single sandbox.
+/// Upper bound on concurrent unclaimed SSH relay channels for a single sandbox.
 /// Enforces the same shape per sandbox so one misbehaving sandbox can't
 /// consume the entire global budget. Sits above the SSH-tunnel per-sandbox
 /// cap (20) so tunnel-specific limits still fire first for that caller.
 const MAX_PENDING_RELAYS_PER_SANDBOX: usize = 32;
-/// The replica relay cap above, published as a capacity gauge when the metrics recorder is
-/// installed.
-pub(crate) const RELAY_CAPACITY: RelayCapacity = RelayCapacity {
-    per_replica: MAX_PENDING_RELAYS,
-};
+/// Combined independent SSH and TCP pending capacity, published when metrics are installed.
+pub(super) fn relay_capacity(tcp: openshell_core::TcpForwardingConfig) -> RelayCapacity {
+    RelayCapacity {
+        per_replica: MAX_PENDING_RELAYS.saturating_add(tcp.pending_per_replica.get()),
+    }
+}
 const PEER_TLS_CA_FILE_ENV: &str = "OPENSHELL_PEER_TLS_CA_FILE";
 const PEER_TLS_CERT_FILE_ENV: &str = "OPENSHELL_PEER_TLS_CERT_FILE";
 const PEER_TLS_KEY_FILE_ENV: &str = "OPENSHELL_PEER_TLS_KEY_FILE";
@@ -360,6 +361,7 @@ type RelayStreamSender = oneshot::Sender<Result<tokio::io::DuplexStream, Status>
 /// Registry of active supervisor sessions and pending relay channels.
 #[derive(Default)]
 pub struct SupervisorSessionRegistry {
+    tcp_forwarding: openshell_core::TcpForwardingConfig,
     /// `sandbox_id` -> live session handle.
     sessions: Mutex<HashMap<String, LiveSession>>,
     /// `channel_id` -> oneshot sender for the reverse CONNECT stream.
@@ -402,6 +404,13 @@ impl std::fmt::Debug for SupervisorSessionRegistry {
 impl SupervisorSessionRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(super) fn with_tcp_forwarding(tcp_forwarding: openshell_core::TcpForwardingConfig) -> Self {
+        Self {
+            tcp_forwarding,
+            ..Self::default()
+        }
     }
 
     fn track_session(&self) -> Result<OwnedRwLockReadGuard<()>, Status> {
@@ -957,20 +966,22 @@ impl SupervisorSessionRegistry {
                         .is_some_and(|session| session.session_id == session_id)
                     {
                         let mut pending = self.pending_relays.lock().unwrap();
-                        if pending.len() >= MAX_PENDING_RELAYS {
+                        let kind = relay_kind(&relay_open);
+                        let (replica_limit, sandbox_limit) = if kind == RelayKind::Tcp {
+                            (self.tcp_forwarding.pending_per_replica.get(), self.tcp_forwarding.pending_per_sandbox.get())
+                        } else { (MAX_PENDING_RELAYS, MAX_PENDING_RELAYS_PER_SANDBOX) };
+                        let matching = pending.values().filter(|p| relay_kind(&p.relay_open) == kind);
+                        if matching.clone().count() >= replica_limit {
                             gateway_metrics::record_relay_rejected(RelayRejection::ReplicaCapacity);
                             return Err(Status::resource_exhausted(format!(
-                                "gateway relay capacity reached ({MAX_PENDING_RELAYS} in flight)"
+                                "gateway relay capacity reached ({replica_limit} {kind:?} opens in flight)"
                             )));
                         }
-                        let per_sandbox = pending
-                            .values()
-                            .filter(|p| p.sandbox_id == sandbox_id)
-                            .count();
-                        if per_sandbox >= MAX_PENDING_RELAYS_PER_SANDBOX {
+                        let per_sandbox = matching.filter(|p| p.sandbox_id == sandbox_id).count();
+                        if per_sandbox >= sandbox_limit {
                             gateway_metrics::record_relay_rejected(RelayRejection::SandboxCapacity);
                             return Err(Status::resource_exhausted(format!(
-                                "per-sandbox relay limit reached ({MAX_PENDING_RELAYS_PER_SANDBOX} in flight for {sandbox_id})"
+                                "per-sandbox relay limit reached ({sandbox_limit} {kind:?} opens in flight for {sandbox_id})"
                             )));
                         }
                         pending.insert(
@@ -3908,6 +3919,87 @@ mod tests {
         // Queue capacity is reserved before insertion, so no gauge slot was ever taken.
         assert_eq!(metrics.value(gateway_metrics::RELAY_PENDING), None);
         assert_eq!(metrics.value(gateway_metrics::RELAY_EXPIRED_TOTAL), None);
+    }
+
+    #[tokio::test]
+    async fn tcp_pending_limits_preserve_ssh_capacity_and_release_slots() {
+        let limits = openshell_core::TcpForwardingConfig {
+            pending_per_sandbox: std::num::NonZeroUsize::new(2).unwrap(),
+            pending_per_replica: std::num::NonZeroUsize::new(3).unwrap(),
+            ..Default::default()
+        };
+        let registry = SupervisorSessionRegistry::with_tcp_forwarding(limits);
+        let (tx, _rx) = mpsc::channel(16);
+        for name in ["tcp-a", "tcp-b", "tcp-c"] {
+            registry.register(name.into(), name.into(), tx.clone(), make_shutdown());
+        }
+        let target = relay_open::Target::Tcp(openshell_core::proto::TcpRelayTarget {
+            host: "127.0.0.1".into(),
+            port: 4096,
+        });
+        let mut opened = Vec::new();
+        for _ in 0..2 {
+            opened.push(
+                registry
+                    .open_relay_with_target(
+                        "tcp-a",
+                        target.clone(),
+                        String::new(),
+                        Duration::from_secs(1),
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            registry
+                .open_relay_with_target(
+                    "tcp-a",
+                    target.clone(),
+                    String::new(),
+                    Duration::from_secs(1)
+                )
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::ResourceExhausted
+        );
+        let ssh = registry
+            .open_relay("tcp-a", Duration::from_secs(1))
+            .await
+            .unwrap();
+        opened.push(
+            registry
+                .open_relay_with_target(
+                    "tcp-b",
+                    target.clone(),
+                    String::new(),
+                    Duration::from_secs(1),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            registry
+                .open_relay_with_target(
+                    "tcp-c",
+                    target.clone(),
+                    String::new(),
+                    Duration::from_secs(1)
+                )
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::ResourceExhausted
+        );
+        let (id, receiver) = opened.pop().unwrap();
+        registry.pending_relays.lock().unwrap().remove(&id);
+        drop(receiver);
+        let replacement = registry
+            .open_relay_with_target("tcp-c", target, String::new(), Duration::from_secs(1))
+            .await
+            .unwrap();
+        drop((replacement, opened, ssh));
     }
 
     #[tokio::test]

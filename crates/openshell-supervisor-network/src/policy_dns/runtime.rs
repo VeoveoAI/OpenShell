@@ -6,6 +6,7 @@
 #[cfg(test)]
 use openshell_sandbox_backend::test_support as rpc_test;
 
+use crate::native_service::NativeServiceIngress;
 use crate::opa::OpaEngine;
 use crate::policy_dns::resolver::MAX_DNS_MESSAGE_BYTES;
 use crate::policy_dns::store::{ResolvedEndpointStore, StoreConfig, SyntheticPools};
@@ -98,14 +99,18 @@ impl PolicyDnsRuntime {
         policy: Arc<OpaEngine>,
         source: Arc<NetworkMediationSource>,
         trusted_host_gateway: Option<IpAddr>,
+        native_service_ingress: Option<NativeServiceIngress>,
         config: PolicyDnsRuntimeConfig,
         mut engine_ready: tokio::sync::watch::Receiver<bool>,
     ) -> Result<Self> {
         let upstream = trusted_resolver_from_resolv_conf()?;
-        let store = Arc::new(ResolvedEndpointStore::new(
-            StoreConfig::new(config.pools, MAX_MAPPINGS)
-                .map_err(|error| miette::miette!(error.to_string()))?,
-        ));
+        let store = Arc::new(
+            ResolvedEndpointStore::new(
+                StoreConfig::new(config.pools, MAX_MAPPINGS)
+                    .map_err(|error| miette::miette!(error.to_string()))?,
+            )
+            .with_native_service_ingress(native_service_ingress),
+        );
         let service = Arc::new(PolicyDnsService::new(
             policy,
             SocketTrustedResolver::new(upstream),

@@ -5086,6 +5086,7 @@ dependencies = [
  "flate2",
  "futures",
  "glob",
+ "h2",
  "hex",
  "hickory-proto",
  "http 1.4.0",
@@ -5130,6 +5131,7 @@ dependencies = [
  "tower-mcp-types",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
  "webpki-roots",
 ]

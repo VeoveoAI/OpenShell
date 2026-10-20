@@ -139,7 +139,7 @@ fn scoped_context_for_request(
     Some(scoped)
 }
 
-fn credential_generation_guard(
+pub(super) fn credential_generation_guard(
     ctx: &L7EvalContext,
 ) -> Option<crate::l7::rest::CredentialGenerationGuard<'_>> {
     Some(
@@ -231,7 +231,7 @@ pub(crate) async fn prepare_inspected_request(
     Ok((req, scoped))
 }
 
-fn request_authority_matches_endpoint(
+pub(super) fn request_authority_matches_endpoint(
     request: &crate::l7::provider::L7Request,
     ctx: &L7EvalContext,
 ) -> bool {
@@ -1641,7 +1641,7 @@ fn select_l7_config_for_path<'a>(
         .max_by_key(|config| config.path_specificity())
 }
 
-fn emit_l7_request_log(
+pub(super) fn emit_l7_request_log(
     ctx: &L7EvalContext,
     action: &str,
     redacted_target: &str,
@@ -4137,6 +4137,38 @@ mod tests {
             .expect("Host header");
         assert_eq!(authority.authority.host(), "[2001:db8::1]");
         assert!(request_authority_matches_endpoint(&request, &ctx));
+    }
+
+    #[test]
+    fn native_service_authority_cannot_be_replaced_with_gateway_alias_or_another_port() {
+        let host = "team--application.openshell.localhost";
+        let ctx = L7EvalContext {
+            host: host.into(),
+            port: 17670,
+            request_default_port: Some(443),
+            ..Default::default()
+        };
+        for (authority, expected) in [
+            (format!("{host}:17670"), true),
+            (host.to_string(), false),
+            ("host.openshell.internal:17670".into(), false),
+            ("other.openshell.localhost:17670".into(), false),
+            (format!("{host}:443"), false),
+        ] {
+            let request = crate::l7::provider::L7Request {
+                action: "GET".into(),
+                target: "/mcp/local".into(),
+                query_params: TestHashMap::new(),
+                raw_header: format!("GET /mcp/local HTTP/1.1\r\nHost: {authority}\r\n\r\n")
+                    .into_bytes(),
+                body_length: crate::l7::provider::BodyLength::None,
+            };
+            assert_eq!(
+                request_authority_matches_endpoint(&request, &ctx),
+                expected,
+                "{authority}"
+            );
+        }
     }
 
     #[test]
@@ -9884,6 +9916,7 @@ network_policies:
     ) -> (Vec<L7EndpointConfig>, TunnelPolicyEngine, L7EvalContext) {
         let data = format!(
             r#"
+version: 1
 network_policies:
   shared_api:
     name: shared_api
@@ -9909,6 +9942,27 @@ network_policies:
       - {{ path: /usr/bin/python3 }}
 "#
         );
+        if protocol == "mcp" {
+            // Exercise real incremental admission before using these routes in
+            // relay regressions, rather than loading a hand-built bypass.
+            let mut policy = openshell_policy::parse_sandbox_policy(&data).unwrap();
+            let rule = policy.network_policies.get_mut("shared_api").unwrap();
+            let rest = rule.endpoints.pop().unwrap();
+            let incoming = openshell_core::proto::NetworkPolicyRule {
+                endpoints: vec![rest],
+                ..rule.clone()
+            };
+            let merged = openshell_policy::merge_policy(
+                policy,
+                &[openshell_policy::PolicyMergeOp::AddRule {
+                    rule_name: "shared_api".into(),
+                    rule: incoming,
+                }],
+            )
+            .expect("disjoint REST/MCP paths must pass incremental admission");
+            let admitted = openshell_policy::serialize_sandbox_policy(&merged.policy).unwrap();
+            return two_endpoint_route_configs(&admitted, "mcp.example.test", "shared_api");
+        }
         two_endpoint_route_configs(&data, "mcp.example.test", "shared_api")
     }
 
@@ -10162,6 +10216,52 @@ network_policies:
             assert!(
                 receiver.try_recv().is_err(),
                 "route_selected={route_selected}: one result per exchange"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn admitted_rest_mcp_routes_canonicalize_before_parser_and_authorization_selection() {
+        for path in ["/api/../mcp", "/%6dcp", "//mcp"] {
+            let (configs, engine, ctx) = jsonrpc_and_rest_route_configs("mcp", "enforce");
+            let (mut app, mut client) = tokio::io::duplex(8192);
+            let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+            let relay = tokio::spawn(async move {
+                relay_with_route_selection(&configs, engine, &mut client, &mut relay_upstream, &ctx)
+                    .await
+            });
+            let request = format!(
+                "POST {path} HTTP/1.1\r\nHost: mcp.example.test:8000\r\nContent-Type: application/json\r\nMCP-Protocol-Version: 2025-11-25\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                UNALLOWED_TOOL_CALL.len()
+            );
+            app.write_all(request.as_bytes()).await.unwrap();
+            app.write_all(UNALLOWED_TOOL_CALL).await.unwrap();
+            let mut response = Vec::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                app.read_to_end(&mut response),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let mut forwarded = Vec::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                upstream.read_to_end(&mut forwarded),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let response = String::from_utf8_lossy(&response);
+            assert!(response.starts_with("HTTP/1.1 403"), "{path}: {response}");
+            assert!(
+                forwarded.is_empty(),
+                "{path}: a denied MCP tool call reached upstream"
             );
         }
     }
@@ -11743,6 +11843,190 @@ network_policies:
                 let forwarded = String::from_utf8(forwarded).unwrap();
                 assert!(forwarded.contains(&headers), "{method}: headers changed");
                 assert!(forwarded.ends_with(&body), "{method}: body changed");
+            }
+        }
+    }
+
+    fn mcp_tasks_extension_relay_context(
+        method: &str,
+        exact_allow: bool,
+        deny: bool,
+    ) -> (L7EndpointConfig, TunnelPolicyEngine, L7EvalContext) {
+        let allow = if exact_allow {
+            format!("          - allow: {{method: '{method}'}}\n")
+        } else {
+            String::new()
+        };
+        let deny = if deny {
+            format!("        deny_rules:\n          - method: '{method}'\n")
+        } else {
+            String::new()
+        };
+        mcp_relay_context_from_data(&format!(
+            r#"
+network_policies:
+  mcp_api:
+    name: mcp_api
+    endpoints:
+      - host: mcp.example.test
+        port: 8000
+        path: /mcp
+        protocol: mcp
+        enforcement: enforce
+        mcp:
+          versions: ["2026-07-28"]
+          allow_all_known_mcp_methods: true
+        rules:
+          - allow: {{}}
+{allow}{deny}    binaries:
+      - {{path: /usr/bin/python3}}
+"#
+        ))
+    }
+
+    #[tokio::test]
+    async fn mcp_tasks_extension_relays_require_exact_allow_and_preserve_deny_precedence() {
+        for route_selected in [false, true] {
+            for method in ["tasks/get", "tasks/update", "tasks/cancel"] {
+                let body = sessionless_mcp_body(
+                    method,
+                    serde_json::json!({
+                        "taskId": "task-opaque", "inputResponses": {}
+                    }),
+                );
+                let headers = format!(
+                    "MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: {method}\r\nMcp-Name: task-opaque\r\n"
+                );
+                for (exact_allow, deny, allowed) in [
+                    (false, false, false),
+                    (true, false, true),
+                    (true, true, false),
+                ] {
+                    let (response, forwarded) = run_mcp_relay_case(
+                        mcp_tasks_extension_relay_context(method, exact_allow, deny),
+                        route_selected,
+                        &headers,
+                        &body,
+                        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                    let status = if allowed {
+                        "204 No Content"
+                    } else {
+                        "403 Forbidden"
+                    };
+                    assert!(
+                        response.starts_with(&format!("HTTP/1.1 {status}")),
+                        "{method}: {response}"
+                    );
+                    if allowed {
+                        let forwarded = String::from_utf8(forwarded).unwrap();
+                        assert!(forwarded.contains(&headers), "Task routing headers changed");
+                        assert!(forwarded.ends_with(&body), "Task request body changed");
+                    } else {
+                        assert!(
+                            forwarded.is_empty(),
+                            "Task request bypassed extension policy"
+                        );
+                        if deny {
+                            assert!(response.contains("deny rule"), "{response}");
+                        } else {
+                            assert!(response.contains("exact allow rule"), "{response}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_tasks_extension_relays_reject_routing_mismatch_and_notification_spoof() {
+        for route_selected in [false, true] {
+            for (method, name_header) in [
+                ("tasks/get", ""),
+                ("tasks/get", "Mcp-Name: wrong-task\r\n"),
+                (
+                    "tasks/get",
+                    "Mcp-Name: task-opaque\r\nMcp-Name: task-opaque\r\n",
+                ),
+                ("tasks/cancel", "Mcp-Name: task-opaque\r\n"),
+            ] {
+                let headers = format!(
+                    "MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: {method}\r\n{name_header}"
+                );
+                let body =
+                    sessionless_mcp_body("tasks/get", serde_json::json!({"taskId": "task-opaque"}));
+                let (response, forwarded) = run_mcp_relay_case(
+                    mcp_tasks_extension_relay_context("tasks/get", true, false),
+                    route_selected,
+                    &headers,
+                    &body,
+                    "",
+                )
+                .await;
+                assert!(
+                    response.starts_with("HTTP/1.1 400 Bad Request"),
+                    "{response}"
+                );
+                assert!(
+                    response.contains("invalid_mcp_request_metadata"),
+                    "{response}"
+                );
+                assert!(forwarded.is_empty());
+            }
+            let body = serde_json::json!({"jsonrpc": "2.0", "method": "notifications/tasks",
+                "params": {"taskId": "private-task-marker", "status": "completed"}})
+            .to_string();
+            let (response, forwarded) = run_mcp_relay_case(
+                mcp_tasks_extension_relay_context("notifications/tasks", true, false),
+                route_selected,
+                "MCP-Protocol-Version: 2026-07-28\r\n",
+                &body,
+                "",
+            )
+            .await;
+            assert!(
+                response.starts_with("HTTP/1.1 400 Bad Request"),
+                "{response}"
+            );
+            assert!(response.contains("server-to-client only"), "{response}");
+            assert!(!response.contains("private-task-marker"));
+            assert!(forwarded.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn final_mcp_tasks_extension_check_reinspects_changed_task_routing() {
+        let (config, _, ctx) = mcp_tasks_extension_relay_context("tasks/get", true, false);
+        for (header_method, task_id, valid) in [
+            ("tasks/get", "task-opaque", true),
+            ("tasks/cancel", "task-opaque", false),
+            ("tasks/get", "changed-task", false),
+        ] {
+            let body = sessionless_mcp_body("tasks/get", serde_json::json!({"taskId": task_id}));
+            let request = crate::l7::provider::L7Request {
+                action: "POST".into(), target: "/mcp".into(), query_params: TestHashMap::new(),
+                raw_header: format!("POST /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: {header_method}\r\nMcp-Name: task-opaque\r\nContent-Length: {}\r\n\r\n{body}", body.len()).into_bytes(),
+                body_length: crate::l7::provider::BodyLength::ContentLength(body.len() as u64),
+            };
+            let mut response = Vec::new();
+            let allowed = enforce_final_mcp_protocol_version(
+                &config,
+                &request,
+                &mut response,
+                &ctx,
+                "/mcp",
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(allowed, valid);
+            if !valid {
+                assert!(
+                    String::from_utf8(response)
+                        .unwrap()
+                        .contains("invalid_mcp_request_metadata")
+                );
             }
         }
     }
