@@ -230,7 +230,7 @@ pub async fn prepare_supervisor_auth_bundle(
 async fn prepare_supervisor_bundle(
     bundle: &crate::jwt::SupervisorAuthBundle,
     source: TokenSource,
-    exchange: impl std::future::Future<Output = Result<crate::proto::RefreshSandboxTokenResponse>>,
+    exchange: impl Future<Output = Result<crate::proto::RefreshSandboxTokenResponse>>,
 ) -> Result<crate::jwt::SupervisorAuthBundle> {
     let now = now_ms() / 1000;
     let expired = (bundle.gateway_expires_at > 0 && bundle.gateway_expires_at <= now)
@@ -628,7 +628,7 @@ async fn refresh_token_loop(
                                     continue;
                                 }
                                 Err(error) => {
-                                    warn!(%error, "gateway returned invalid rebootstrap credentials")
+                                    warn!(%error, "gateway returned invalid rebootstrap credentials");
                                 }
                             },
                             Err(e) => warn!(
@@ -944,7 +944,7 @@ mod auth_tests {
     async fn supervisor_rejected_bootstrap_keeps_the_original_bundle_unchanged() {
         let original = expired_supervisor_bundle();
         let result = prepare_supervisor_bundle(&original, TokenSource::K8sServiceAccount, async {
-            Err(grpc_status_error(tonic::Status::permission_denied(
+            Err(grpc_status_error(Status::permission_denied(
                 "compute runtime identity does not match the sandbox",
             )))
         })
@@ -962,7 +962,7 @@ mod auth_tests {
         for response in [
             crate::proto::RefreshSandboxTokenResponse {
                 token: "fresh-gateway".into(),
-                sandbox_token: "".into(),
+                sandbox_token: String::new(),
                 credential_epoch: 2,
                 session_id: "generation-test".into(),
                 ..Default::default()
