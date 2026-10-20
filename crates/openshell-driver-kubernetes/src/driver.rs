@@ -14,9 +14,9 @@ use crate::isolation::{
 use crate::lifecycle::LifecycleGates;
 use crate::sandbox_runtime::{
     BOUNDARY_CERTIFICATE_PATH, BOUNDARY_CONFIG_PATH, BOUNDARY_PRIVATE_KEY_PATH, ClientTlsMaterial,
-    SUPERVISOR_TERMINATION_GRACE_PERIOD_SECONDS, SandboxRuntimeNames, SupervisorClientTls,
-    boundary_service, generate_proxy_ca_material, image_pull_secret_copy, sandbox_bootstrap_secret,
-    sandbox_owner_reference as sandbox_runtime_sandbox_owner_reference,
+    SUPERVISOR_TERMINATION_GRACE_PERIOD_SECONDS, SandboxRuntimeNames, SupervisorCaBundles,
+    SupervisorClientTls, boundary_service, generate_proxy_ca_material, image_pull_secret_copy,
+    sandbox_bootstrap_secret, sandbox_owner_reference as sandbox_runtime_sandbox_owner_reference,
     supervisor_bootstrap_secret, supervisor_pod, workload_fence,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
@@ -2581,8 +2581,10 @@ impl KubernetesComputeDriver {
                         .zip(self.config.proxy_auth_secret_key.as_deref()),
                     self.config.proxy_auth_allow_insecure == Some(true),
                     self.config.proxy_connect_by_hostname == Some(true),
-                    upstream_proxy_ca_bundle.is_some(),
-                    additional_ca_bundle.is_some(),
+                    SupervisorCaBundles {
+                        upstream_proxy: upstream_proxy_ca_bundle.is_some(),
+                        additional: additional_ca_bundle.is_some(),
+                    },
                     self.config.provider_spiffe_enabled().then_some(
                         self.config
                             .provider_spiffe_workload_api_socket_path
@@ -3413,8 +3415,10 @@ impl KubernetesComputeDriver {
                         .zip(self.config.proxy_auth_secret_key.as_deref()),
                     self.config.proxy_auth_allow_insecure == Some(true),
                     self.config.proxy_connect_by_hostname == Some(true),
-                    upstream_proxy_ca_bundle.is_some(),
-                    additional_ca_bundle.is_some(),
+                    SupervisorCaBundles {
+                        upstream_proxy: upstream_proxy_ca_bundle.is_some(),
+                        additional: additional_ca_bundle.is_some(),
+                    },
                     self.config.provider_spiffe_enabled().then_some(
                         self.config
                             .provider_spiffe_workload_api_socket_path

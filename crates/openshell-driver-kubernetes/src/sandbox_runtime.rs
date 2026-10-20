@@ -81,6 +81,13 @@ pub enum SupervisorClientTls<'a> {
     Bootstrap,
 }
 
+/// Operator CA files present in the immutable supervisor bootstrap Secret.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SupervisorCaBundles {
+    pub upstream_proxy: bool,
+    pub additional: bool,
+}
+
 pub struct ProxyCaMaterial {
     pub certificate_pem: String,
     pub private_key_pem: String,
@@ -233,8 +240,7 @@ pub fn supervisor_pod(
     proxy_auth_secret: Option<(&str, &str)>,
     proxy_auth_allow_insecure: bool,
     proxy_connect_by_hostname: bool,
-    upstream_proxy_ca_bundle_staged: bool,
-    additional_ca_bundle_staged: bool,
+    ca_bundles: SupervisorCaBundles,
     provider_spiffe_socket_path: Option<&str>,
     owner: OwnerReference,
     tracing_environment: &[(&str, String)],
@@ -370,13 +376,13 @@ pub fn supervisor_pod(
     }
     // The bundle rides in the bootstrap Secret already mounted at
     // /.openshell/supervisor, so this needs no volume of its own.
-    if upstream_proxy_ca_bundle_staged {
+    if ca_bundles.upstream_proxy {
         command.extend([
             "--upstream-proxy-ca-bundle".to_string(),
             UPSTREAM_PROXY_CA_BUNDLE_PATH.to_string(),
         ]);
     }
-    if additional_ca_bundle_staged {
+    if ca_bundles.additional {
         command.extend([
             "--additional-ca-bundle".to_string(),
             ADDITIONAL_CA_BUNDLE_PATH.to_string(),
@@ -847,8 +853,7 @@ mod tests {
             None,
             false,
             false,
-            false,
-            false,
+            SupervisorCaBundles::default(),
             None,
             owner(),
             &[],
@@ -907,8 +912,7 @@ mod tests {
             None,
             false,
             false,
-            false,
-            false,
+            SupervisorCaBundles::default(),
             None,
             owner(),
             &[
@@ -1034,8 +1038,7 @@ mod tests {
             None,
             false,
             false,
-            false,
-            false,
+            SupervisorCaBundles::default(),
             None,
             owner(),
             &[],
@@ -1294,8 +1297,10 @@ mod tests {
             None,
             false,
             false,
-            proxy,
-            additional,
+            SupervisorCaBundles {
+                upstream_proxy: proxy,
+                additional,
+            },
             None,
             owner(),
             &[],
