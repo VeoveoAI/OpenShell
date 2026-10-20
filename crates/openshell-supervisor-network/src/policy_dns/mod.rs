@@ -75,7 +75,7 @@ pub(crate) enum PolicyDnsError {
     #[error("trusted host gateway is unavailable for the reserved alias")]
     TrustedGatewayUnavailable,
     #[error("trusted resolver failed: {0}")]
-    Resolver(#[from] resolver::ResolveError),
+    Resolver(#[from] ResolveError),
     #[error("no trusted resolver address passed endpoint destination policy")]
     NoValidAddress,
     #[error("policy generation changed before DNS mapping publication")]
@@ -130,7 +130,7 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
                     policy_generation: self.policy.current_generation(),
                 })
             } else {
-                Err(PolicyDnsError::Resolver(resolver::ResolveError::NoData))
+                Err(PolicyDnsError::Resolver(ResolveError::NoData))
             };
         }
         if is_host_gateway_alias(normalized_name.as_str()) && self.trusted_host_gateway.is_none() {
@@ -556,16 +556,16 @@ fn build_dns_denial_event(
         .build()
 }
 
-fn resolver_failure_detail(error: &resolver::ResolveError) -> &'static str {
+fn resolver_failure_detail(error: &ResolveError) -> &'static str {
     match error {
-        resolver::ResolveError::Timeout => "policy_dns_upstream_timeout",
-        resolver::ResolveError::Io(_) => "policy_dns_upstream_io_failed",
-        resolver::ResolveError::Oversized => "policy_dns_upstream_oversized_response",
-        resolver::ResolveError::Malformed => "policy_dns_upstream_malformed_response",
-        resolver::ResolveError::NxDomain => "policy_dns_upstream_nxdomain",
-        resolver::ResolveError::Response(_) => "policy_dns_upstream_error_response",
-        resolver::ResolveError::NoData => "policy_dns_upstream_no_data",
-        resolver::ResolveError::CnameLimit => "policy_dns_upstream_cname_limit",
+        ResolveError::Timeout => "policy_dns_upstream_timeout",
+        ResolveError::Io(_) => "policy_dns_upstream_io_failed",
+        ResolveError::Oversized => "policy_dns_upstream_oversized_response",
+        ResolveError::Malformed => "policy_dns_upstream_malformed_response",
+        ResolveError::NxDomain => "policy_dns_upstream_nxdomain",
+        ResolveError::Response(_) => "policy_dns_upstream_error_response",
+        ResolveError::NoData => "policy_dns_upstream_no_data",
+        ResolveError::CnameLimit => "policy_dns_upstream_cname_limit",
     }
 }
 
@@ -722,8 +722,8 @@ mod tests {
             &self,
             _name: &NormalizedName,
             _family: AddressFamily,
-        ) -> Result<TrustedAnswer, resolver::ResolveError> {
-            Err(resolver::ResolveError::NxDomain)
+        ) -> Result<TrustedAnswer, ResolveError> {
+            Err(ResolveError::NxDomain)
         }
     }
 
@@ -732,7 +732,7 @@ mod tests {
             &self,
             _name: &NormalizedName,
             _family: AddressFamily,
-        ) -> Result<TrustedAnswer, resolver::ResolveError> {
+        ) -> Result<TrustedAnswer, ResolveError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.answer.clone())
         }
@@ -785,7 +785,7 @@ mod tests {
             service
                 .answer_query("policy.local", AddressFamily::Ipv6, Instant::now())
                 .await,
-            Err(PolicyDnsError::Resolver(resolver::ResolveError::NoData))
+            Err(PolicyDnsError::Resolver(ResolveError::NoData))
         ));
     }
 
@@ -1206,7 +1206,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
 
         assert!(matches!(
             result,
-            Err(PolicyDnsError::Resolver(resolver::ResolveError::NxDomain))
+            Err(PolicyDnsError::Resolver(ResolveError::NxDomain))
         ));
         assert!(matches!(
             store.lookup(
@@ -1425,7 +1425,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             &self,
             _name: &NormalizedName,
             _family: AddressFamily,
-        ) -> Result<TrustedAnswer, resolver::ResolveError> {
+        ) -> Result<TrustedAnswer, ResolveError> {
             self.started.notify_one();
             self.release.notified().await;
             Ok(TrustedAnswer {
@@ -1542,11 +1542,11 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
     #[test]
     fn resolver_and_publication_failures_have_stable_reason_codes() {
         assert_eq!(
-            resolver_failure_detail(&resolver::ResolveError::NxDomain),
+            resolver_failure_detail(&ResolveError::NxDomain),
             "policy_dns_upstream_nxdomain"
         );
         assert_eq!(
-            resolver_failure_detail(&resolver::ResolveError::Timeout),
+            resolver_failure_detail(&ResolveError::Timeout),
             "policy_dns_upstream_timeout"
         );
         assert_eq!(

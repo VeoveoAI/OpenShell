@@ -17,7 +17,7 @@ use openshell_core::config::DEFAULT_SERVICE_ROUTING_DOMAIN;
 use url::{Host, Url};
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum NativeServiceResolutionError {
+pub enum NativeServiceResolutionError {
     #[error("configured native gateway HTTPS endpoint is invalid")]
     InvalidEndpoint,
     #[error("native gateway trusted resolver configuration is unavailable")]
@@ -215,7 +215,7 @@ fn sanitized_https_endpoint(raw: &str) -> Result<Url, NativeServiceResolutionErr
 fn normalized_ip(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or(IpAddr::V6(ip), IpAddr::V4),
-        ip => ip,
+        IpAddr::V4(ip) => IpAddr::V4(ip),
     }
 }
 pub fn is_reserved_service_host(host: &str) -> bool {
