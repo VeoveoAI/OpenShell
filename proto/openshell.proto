@@ -1071,8 +1071,11 @@ message SandboxSpec {
   // Gateway-owned attachment identity, changed atomically with the provider set.
   // Equality only: detach and reattach must not revive an older receipt.
   string provider_attachment_epoch = 14;
-  // Gateway-owned policy for replacing the sandbox runtime after the canonical
-  // main process exits. Unspecified is normalized to Never before persistence.
+  // Gateway-owned runtime replacement policy after canonical main-process exit
+  // or a driver's narrowly reported termination of an admitted runtime without
+  // a canonical result. Always/OnFailure may recover the latter without inferring
+  // a command exit code. Never and explicit Stop/Delete do not trigger revival.
+  // Unspecified is normalized to Never before persistence.
   SandboxRestartPolicy restart_policy = 15;
 }
 
@@ -3820,9 +3823,13 @@ enum ProviderCredentialRefreshRecoveryAction {
   PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_INVESTIGATE = 4;
 }
 
-// Policy applied when the canonical main process exits outside an intentional
-// stop or delete operation. Kept after existing enums so generated enum
-// descriptors remain stable.
+// Runtime replacement policy for canonical main-process exits outside explicit
+// Stop/Delete, and narrowly driver-reported termination of an admitted runtime
+// without a canonical result. Always/OnFailure may recover that infrastructure
+// loss; no command exit code is inferred. Never, explicit Stop/Delete and a
+// recorded terminal result are not revived by infrastructure-loss recovery.
+// This does not authorize automatic recovery of a generic missing runtime.
+// Kept after existing enums so generated enum descriptors remain stable.
 enum SandboxRestartPolicy {
   SANDBOX_RESTART_POLICY_UNSPECIFIED = 0;
   SANDBOX_RESTART_POLICY_NEVER = 1;

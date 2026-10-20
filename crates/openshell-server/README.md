@@ -18,6 +18,18 @@ Retries reuse that generation and session, including after gateway restart.
 Credential renewal retains both; credentials for an older launch cannot
 authorize the new one.
 
+## Runtime restart policy
+
+Besides canonical main-process exits, `Always` and `OnFailure` may replace a
+narrowly driver-reported terminated admitted runtime without a canonical result.
+For Kubernetes, this requires a live terminal supervisor observation with the
+admitted Pod identities and enforcement fences intact. The gateway uses the
+existing fenced Stop/Start path with a fresh generation and paired credentials;
+it does not infer a command exit code. `Never`, explicit Stop/Delete and recorded
+canonical terminal results are not revived by this infrastructure-loss path.
+Generic missing runtimes remain distinct: retained missing compute is reported
+as `Error/ComputeResourceMissing` and requires explicit Start as described below.
+
 ## Persistent sandbox intent
 
 Native create requests may set `openshell.nvidia.com/retention=persistent` in
