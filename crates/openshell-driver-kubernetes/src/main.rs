@@ -188,6 +188,11 @@ struct Args {
     #[arg(long, env = "OPENSHELL_UPSTREAM_PROXY_CA_BUNDLE")]
     proxy_ca_bundle: Option<String>,
 
+    /// Operator-owned public destination CA bundle for direct inspected HTTPS.
+    /// Independent of the corporate proxy; staged only into supervisor bootstrap.
+    #[arg(long, env = "OPENSHELL_SANDBOX_ADDITIONAL_CA_BUNDLE")]
+    additional_ca_bundle: Option<String>,
+
     #[arg(long, env = "OPENSHELL_ENABLE_USER_NAMESPACES")]
     enable_user_namespaces: bool,
 
@@ -294,6 +299,7 @@ async fn main() -> Result<()> {
             proxy_auth_allow_insecure: args.proxy_auth_allow_insecure.then_some(true),
             proxy_connect_by_hostname: args.proxy_connect_by_hostname.then_some(true),
             proxy_ca_bundle: args.proxy_ca_bundle,
+            additional_ca_bundle: args.additional_ca_bundle,
             grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
             supervisor_otlp_endpoint: args.otlp_endpoint.clone(),
             supervisor_gateway_name: args.gateway_name.clone(),
