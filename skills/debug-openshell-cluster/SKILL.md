@@ -1100,6 +1100,24 @@ done
 Any `no` result can strand recovery before workload Pod creation. Upgrade the
 OpenShell chart rather than treating missing workload Pods as Pod failures.
 
+#### Native service aliases through a Kubernetes gateway
+
+For a policy-admitted alias under `openshell.localhost`, inspect the trusted
+supervisor gateway endpoint and startup error before diagnosing workload DNS.
+A configured HTTPS gateway DNS name is resolved through the supervisor's trusted
+resolver at networking startup. Its validated A/AAAA address set and port remain
+fixed for that generation; individual aliases are never sent to workload DNS.
+Explicit `allowed_ips`, logical alias/port checks, and TLS verification remain
+in force. Numeric/localhost endpoints still require the backend-provided IP.
+
+`resolve trusted native gateway ingress` indicates startup resolution failed.
+No-data for one family is valid if the other returns usable addresses; NXDOMAIN,
+timeout, malformed replies, or no usable addresses stop startup for normal
+runtime recovery to retry. Check the supervisor resolver and gateway Service
+DNS/network reachability, not `/etc/hosts` in the workload. Do not add a static IP
+fallback or disable TLS. If the Service address set changes, replace the runtime
+generation; a running generation intentionally retains its original pins.
+
 #### Private destination CA trust
 
 A CA installed only in the workload image does not establish trust in the

@@ -224,7 +224,7 @@ impl ProxyTlsState {
         }
     }
 
-    /// Trust the driver-owned gateway CA only on the exact native gateway socket.
+    /// Trust the driver-owned gateway CA only on the pinned native gateway sockets.
     pub(crate) fn configure_native_service_ingress(
         &mut self,
         ingress: crate::native_service::NativeServiceIngress,
@@ -755,18 +755,19 @@ mod tests {
             ordinary.clone(),
         );
         state
-            .configure_native_service_ingress(ingress, "", &gateway_pem)
+            .configure_native_service_ingress(ingress.clone(), "", &gateway_pem)
             .unwrap();
         let host = "team--application.openshell.localhost";
         assert!(
-            native_tls_handshake(&state, host, 17670, &[ingress.socket()], &gateway_cache).await
+            native_tls_handshake(&state, host, 17670, &[ingress.sockets()[0]], &gateway_cache)
+                .await
         );
         assert!(
             native_tls_handshake(
                 &state,
                 "host.openshell.internal",
                 17670,
-                &[ingress.socket()],
+                &[ingress.sockets()[0]],
                 &gateway_cache
             )
             .await
@@ -789,7 +790,9 @@ mod tests {
             );
         }
         let other_ca = CertCache::new(SandboxCa::generate().unwrap());
-        assert!(!native_tls_handshake(&state, host, 17670, &[ingress.socket()], &other_ca).await);
+        assert!(
+            !native_tls_handshake(&state, host, 17670, &[ingress.sockets()[0]], &other_ca).await
+        );
         // Correct issuer alone does not waive the logical hostname/SNI check.
         let leaf = gateway_cache
             .get_or_generate("wrong.openshell.localhost")
@@ -809,7 +812,7 @@ mod tests {
             tls_connect_upstream(
                 client_io,
                 host,
-                state.upstream_config_for(host, 17670, &[ingress.socket()])
+                state.upstream_config_for(host, 17670, &[ingress.sockets()[0]])
             )
             .await
             .is_err()
@@ -835,7 +838,7 @@ mod tests {
             );
             assert!(
                 state
-                    .configure_native_service_ingress(ingress, "", pem)
+                    .configure_native_service_ingress(ingress.clone(), "", pem)
                     .is_err()
             );
             assert!(state.native_service_config.is_none());

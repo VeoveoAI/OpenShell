@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use miette::Result;
+use miette::{IntoDiagnostic, Result, WrapErr};
 use tracing::{debug, info, warn};
 
 use openshell_core::policy::{NetworkMode, SandboxPolicy};
@@ -112,7 +112,6 @@ impl TransparentRuntimeSetup {
 
 #[cfg(target_os = "linux")]
 fn advance_allocation_epoch(path: &std::path::Path, sandbox_id: Option<&str>) -> Result<u64> {
-    use miette::{IntoDiagnostic, WrapErr};
     use std::io::Write as _;
 
     let seed = sandbox_id.map_or(0, |value| {
@@ -372,10 +371,11 @@ pub async fn run_networking(
     // the proxy, so it's owned here.
     let identity_cache = opa_engine.map(|_| Arc::new(BinaryIdentityCache::new()));
 
-    let mut native_service_ingress = crate::native_service::NativeServiceIngress::from_endpoint(
-        openshell_endpoint,
-        host_gateway_ip,
-    );
+    let mut native_service_ingress =
+        crate::native_service::NativeServiceIngress::resolve(openshell_endpoint, host_gateway_ip)
+            .await
+            .into_diagnostic()
+            .wrap_err("resolve trusted native gateway ingress")?;
 
     // Load a provisioned CA when the boundary lifetime outlives this control
     // process; otherwise generate an ephemeral CA.
@@ -449,7 +449,7 @@ pub async fn run_networking(
                         let upstream_config = build_upstream_client_config(&system_ca_bundle)?;
                         let cert_cache = CertCache::new(ca);
                         let mut state = ProxyTlsState::new(cert_cache, upstream_config);
-                        if let Some(ingress) = native_service_ingress {
+                        if let Some(ingress) = native_service_ingress.as_ref() {
                             // This reserved input is provisioned into the trusted supervisor,
                             // not read from the workload environment or its filesystem.
                             let configured = (|| -> Result<()> {
@@ -458,7 +458,7 @@ pub async fn run_networking(
                                     path.as_deref().map(std::path::Path::new),
                                 )?;
                                 state.configure_native_service_ingress(
-                                    ingress,
+                                    ingress.clone(),
                                     &system_ca_bundle,
                                     &pem,
                                 )

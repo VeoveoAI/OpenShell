@@ -136,7 +136,7 @@ pub(crate) fn build_native_service_plan(
     ingress: Option<NativeServiceIngress>,
     raw_allowed_ips: &[String],
 ) -> Result<DestinationValidationPlan, DestinationDenial> {
-    let pin = ingress
+    let mut pin = ingress
         .and_then(|ingress| ingress.pin(host, port))
         .ok_or_else(|| {
             DestinationDenial::new(
@@ -152,7 +152,14 @@ pub(crate) fn build_native_service_plan(
                 })?,
             ),
         };
-        filter_resolved_addresses(&restricted, host, port, &[pin.socket().ip()])?;
+        let addresses = pin.sockets().iter().map(SocketAddr::ip).collect::<Vec<_>>();
+        let allowed = filter_resolved_addresses(&restricted, host, port, &addresses)?;
+        pin = pin.restrict_to(&allowed).ok_or_else(|| {
+            DestinationDenial::new(
+                DestinationDenialKind::TrustedGateway,
+                "native service address restrictions exclude the gateway".to_string(),
+            )
+        })?;
     }
     Ok(DestinationValidationPlan {
         address_authorization: AddressAuthorization::NativeServiceIngress(pin),
@@ -216,7 +223,8 @@ pub(crate) fn filter_resolved_addresses(
     for &ip in resolved_ips {
         let rejection = match &plan.address_authorization {
             AddressAuthorization::NativeServiceIngress(pin) => {
-                if !pin.matches(host, port) || pin.socket().ip() != ip {
+                if !pin.matches(host, port) || !pin.sockets().iter().any(|socket| socket.ip() == ip)
+                {
                     Some(
                         "native service destination does not match its logical socket pin"
                             .to_string(),
@@ -368,8 +376,9 @@ pub(crate) async fn validate_destination(
 
     let addrs = match &plan.address_authorization {
         AddressAuthorization::NativeServiceIngress(pin) => {
-            filter_resolved_addresses(plan, host, port, &[pin.socket().ip()])?;
-            vec![pin.socket()]
+            let addresses = pin.sockets().iter().map(SocketAddr::ip).collect::<Vec<_>>();
+            filter_resolved_addresses(plan, host, port, &addresses)?;
+            pin.sockets().to_vec()
         }
         AddressAuthorization::TrustedGatewayAlias { expected_ip } => {
             resolve_and_check_trusted_gateway(host, port, *expected_ip, sandbox_entrypoint_pid)
@@ -452,7 +461,7 @@ mod tests {
         )
         .unwrap();
         let host = "team--application.openshell.localhost";
-        let plan = build_native_service_plan(host, 17670, Some(ingress), &[]).unwrap();
+        let plan = build_native_service_plan(host, 17670, Some(ingress.clone()), &[]).unwrap();
         for (requested_host, port, allowed) in [
             (host, 17670, true),
             (host, 443, false),
@@ -474,7 +483,7 @@ mod tests {
         );
         assert!(build_native_service_plan(host, 17670, None, &[]).is_err());
         assert!(
-            build_native_service_plan(host, 17670, Some(ingress), &["192.0.2.0/24".into()])
+            build_native_service_plan(host, 17670, Some(ingress.clone()), &["192.0.2.0/24".into()])
                 .is_err()
         );
     }

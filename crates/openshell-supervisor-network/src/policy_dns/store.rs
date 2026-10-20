@@ -354,7 +354,7 @@ impl ResolvedEndpointStore {
     }
 
     pub(crate) fn native_service_ingress(&self) -> Option<NativeServiceIngress> {
-        self.native_service_ingress
+        self.native_service_ingress.clone()
     }
 
     pub(crate) fn publish(
@@ -1086,9 +1086,14 @@ mod tests {
         let mut request = request(host, 1, Duration::from_secs(5));
         request.contracts[0].port = 17670;
         request.contracts[0].destination_plan =
-            crate::proxy::destination::build_native_service_plan(host, 17670, Some(ingress), &[])
-                .unwrap();
-        request.contracts[0].pinned_addresses = vec![ingress.socket().ip()];
+            crate::proxy::destination::build_native_service_plan(
+                host,
+                17670,
+                Some(ingress.clone()),
+                &[],
+            )
+            .unwrap();
+        request.contracts[0].pinned_addresses = vec![ingress.sockets()[0].ip()];
         let now = Instant::now();
         let record = store.publish(request, 1, now).unwrap();
         let mut lookup = store
@@ -1101,7 +1106,7 @@ mod tests {
         ));
         assert_eq!(
             lookup.connector_for(&endpoint).await.unwrap().addrs(),
-            &[ingress.socket()]
+            &[ingress.sockets()[0]]
         );
         lookup.record.normalized_name = NormalizedName::parse("other.openshell.localhost").unwrap();
         assert!(matches!(

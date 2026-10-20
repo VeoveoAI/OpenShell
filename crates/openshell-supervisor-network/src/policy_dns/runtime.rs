@@ -312,7 +312,7 @@ impl Drop for PolicyDnsRuntime {
     }
 }
 
-fn trusted_resolver_from_resolv_conf() -> Result<SocketAddr> {
+pub(crate) fn trusted_resolver_from_resolv_conf() -> Result<SocketAddr> {
     let contents = std::fs::read_to_string("/etc/resolv.conf")
         .into_diagnostic()
         .wrap_err("failed to read trusted supervisor resolver configuration")?;

@@ -24,8 +24,12 @@ mod store;
 mod wire;
 
 pub(crate) use name::NormalizedName;
-pub(crate) use resolver::{AddressFamily, SocketTrustedResolver, TrustedAnswer, TrustedResolver};
-pub(crate) use runtime::{PolicyDnsRuntime, PolicyDnsRuntimeConfig};
+pub(crate) use resolver::{
+    AddressFamily, ResolveError, SocketTrustedResolver, TrustedAnswer, TrustedResolver,
+};
+pub(crate) use runtime::{
+    PolicyDnsRuntime, PolicyDnsRuntimeConfig, trusted_resolver_from_resolv_conf,
+};
 pub(crate) use store::{
     MappingLookup, MappingLookupError, PolicyEndpointId, PublishError, PublishRequest,
     ResolvedEndpointRecord, ResolvedEndpointStore, ResolvedPortContract, StoreConfig,
@@ -166,14 +170,21 @@ impl<R: TrustedResolver> PolicyDnsService<R> {
         // proved policy eligibility. It never consults sandbox resolver state.
         let endpoint_context = eligible_endpoint_context(&eligible);
         let trusted_answer = if is_reserved_service_host(normalized_name.as_str()) {
-            let address = self
+            let ingress = self
                 .store
                 .native_service_ingress()
-                .map(|ingress| ingress.socket().ip())
-                .filter(|address| family.accepts(*address))
                 .ok_or(PolicyDnsError::NoValidAddress)?;
+            let addresses = ingress
+                .sockets()
+                .iter()
+                .map(std::net::SocketAddr::ip)
+                .filter(|address| family.accepts(*address))
+                .collect::<Vec<_>>();
+            if addresses.is_empty() {
+                return Err(PolicyDnsError::NoValidAddress);
+            }
             TrustedAnswer {
-                addresses: vec![address],
+                addresses,
                 ttl: MAX_MAPPING_TTL,
             }
         } else if is_host_gateway_alias(normalized_name.as_str()) {
@@ -392,16 +403,19 @@ fn eligible_endpoints(
         let raw_allowed_ips = value_string_array(&endpoint.endpoint, "allowed_ips");
         let exact_declared_host = !pattern.contains('*') && pattern == name.as_str();
         let destination_plan = if is_reserved_service_host(name.as_str()) {
-            let Some(ingress) = native_service_ingress else {
+            let Some(ingress) = native_service_ingress.as_ref() else {
                 continue;
             };
-            ports.retain(|port| *port == ingress.socket().port());
+            ports.retain(|port| *port == ingress.port());
             let Some(port) = ports.first() else {
                 continue;
             };
-            let Ok(plan) =
-                build_native_service_plan(name.as_str(), *port, Some(ingress), &raw_allowed_ips)
-            else {
+            let Ok(plan) = build_native_service_plan(
+                name.as_str(),
+                *port,
+                Some(ingress.clone()),
+                &raw_allowed_ips,
+            ) else {
                 continue;
             };
             plan

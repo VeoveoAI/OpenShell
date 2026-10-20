@@ -7929,7 +7929,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
                 Arc::try_unwrap(policy_dns_test_store())
                     .ok()
                     .unwrap()
-                    .with_native_service_ingress(Some(ingress)),
+                    .with_native_service_ingress(Some(ingress.clone())),
             );
             let record = store
                 .publish(
@@ -7948,11 +7948,11 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
                             destination_plan: destination::build_native_service_plan(
                                 host,
                                 17670,
-                                Some(ingress),
+                                Some(ingress.clone()),
                                 &[],
                             )
                             .unwrap(),
-                            pinned_addresses: vec![ingress.socket().ip()],
+                            pinned_addresses: vec![ingress.sockets()[0].ip()],
                         }],
                     },
                     engine.current_generation(),
@@ -7987,7 +7987,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
                     decision.endpoint.destination.unwrap().address_authorization,
                     destination::AddressAuthorization::NativeServiceIngress(_)
                 ));
-                assert_eq!(connector.addrs(), &[ingress.socket()]);
+                assert_eq!(connector.addrs(), &[ingress.sockets()[0]]);
             } else {
                 assert!(accepted.is_none());
                 assert!(matches!(

@@ -881,6 +881,22 @@ Kubernetes configurations set `namespace`, `service_account_name`, and `enable_u
 
 The gateway runs as a Pod and creates paired workload and supervisor Pods in another namespace. The gateway CA is projected from a Kubernetes Secret into supervisor Pods; user client certificate and key entries in that Secret are not exposed to either Pod.
 
+Native service aliases under `openshell.localhost` use the trusted configured
+HTTPS gateway endpoint. When that endpoint is a DNS name, such as a Kubernetes
+Service, the supervisor resolves its A and AAAA records through its own trusted
+resolver at networking startup. It retains the validated address set and exact
+port for that runtime generation; it never resolves individual service aliases
+through workload DNS. Policy hostname, port, executable, and explicit
+`allowed_ips` restrictions still apply, along with TLS hostname verification.
+Numeric and localhost endpoints keep their existing isolation-backend IP match.
+
+An empty answer for one address family is allowed when the other family has
+valid addresses. A resolver failure, malformed answer, or no usable addresses
+fails supervisor startup so normal runtime recovery can retry. A running
+generation does not refresh this gateway address set. Replace the generation
+when the gateway Service addresses change; changing an MCP request destination
+behind the gateway does not require changing those gateway coordinates.
+
 For private destination CAs, set `additional_ca_bundle` under
 `[openshell.drivers.kubernetes]` to an operator-owned PEM file on the gateway
 filesystem. This is independent of `https_proxy` and `proxy_ca_bundle`. Mount a
