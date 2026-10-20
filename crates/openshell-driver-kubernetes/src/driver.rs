@@ -5902,28 +5902,13 @@ async fn sandbox_from_object_with_sandbox_runtime_readiness(
         ));
         let (dependencies, workload_generation, supervisor_generation) =
             tokio::join!(dependencies, workload_generation, supervisor_generation);
-        if sandbox_runtime_recovery_required(
+        if project_sandbox_runtime_terminal_generation(
             &obj,
             &dependencies,
             workload_generation,
             supervisor_generation,
+            &mut sandbox,
         ) {
-            mark_sandbox_runtime_control_unavailable(&mut sandbox);
-            if let Some(status) = sandbox.status.as_mut() {
-                status
-                    .conditions
-                    .retain(|condition| condition.r#type != SANDBOX_SUSPENDED_CONDITION);
-                if let Some(ready) = status
-                    .conditions
-                    .iter_mut()
-                    .find(|condition| condition.r#type == "Ready")
-                {
-                    ready.reason = "SandboxRuntimeTerminated".to_string();
-                    ready.message =
-                        "Admitted supervisor generation terminated; fresh runtime required"
-                            .to_string();
-                }
-            }
             return Ok((name, sandbox));
         }
         let dependencies = dependencies.availability();
@@ -5943,7 +5928,7 @@ async fn sandbox_from_object_with_sandbox_runtime_readiness(
     Ok((name, sandbox))
 }
 
-fn sandbox_runtime_recovery_required(
+fn sandbox_runtime_terminal_generation_admitted(
     object: &DynamicObject,
     observation: &SandboxRuntimeControlObservation,
     workload_generation: SandboxRuntimeControlAvailability,
@@ -5952,7 +5937,35 @@ fn sandbox_runtime_recovery_required(
     sandbox_runtime_should_run(object)
         && object.metadata.deletion_timestamp.is_none()
         && !sandbox_runtime_bootstrap_in_progress(object)
-        && object
+        && workload_generation == SandboxRuntimeControlAvailability::Available
+        && supervisor_generation == SandboxRuntimeControlAvailability::Available
+        && observation.admitted_terminal_supervisor(object)
+}
+
+fn project_sandbox_runtime_terminal_generation(
+    object: &DynamicObject,
+    observation: &SandboxRuntimeControlObservation,
+    workload_generation: SandboxRuntimeControlAvailability,
+    supervisor_generation: SandboxRuntimeControlAvailability,
+    sandbox: &mut Sandbox,
+) -> bool {
+    if !sandbox_runtime_terminal_generation_admitted(
+        object,
+        observation,
+        workload_generation,
+        supervisor_generation,
+    ) {
+        return false;
+    }
+    mark_sandbox_runtime_control_unavailable(sandbox);
+    if let Some(status) = sandbox.status.as_mut() {
+        // v1beta1 retains Suspended=True after resume. A terminal admitted
+        // generation still desired Running must remain Provisioning before
+        // reconciliation publishes loss, not become a durable operator Stop.
+        status
+            .conditions
+            .retain(|condition| condition.r#type != SANDBOX_SUSPENDED_CONDITION);
+        let published = object
             .metadata
             .annotations
             .as_ref()
@@ -5960,10 +5973,19 @@ fn sandbox_runtime_recovery_required(
                 annotations
                     .get(ANNOTATION_SANDBOX_RUNTIME_READINESS)
                     .is_some_and(|state| state == "terminated")
-            })
-        && workload_generation == SandboxRuntimeControlAvailability::Available
-        && supervisor_generation == SandboxRuntimeControlAvailability::Available
-        && observation.admitted_terminal_supervisor(object)
+            });
+        if published
+            && let Some(ready) = status
+                .conditions
+                .iter_mut()
+                .find(|condition| condition.r#type == "Ready")
+        {
+            ready.reason = "SandboxRuntimeTerminated".to_string();
+            ready.message =
+                "Admitted supervisor generation terminated; fresh runtime required".to_string();
+        }
+    }
+    true
 }
 
 fn mark_sandbox_runtime_bootstrapping(sandbox: &mut Sandbox) {
@@ -13046,7 +13068,7 @@ mod tests {
             }),
         };
         let recover = |object: &DynamicObject, observation: &SandboxRuntimeControlObservation| {
-            sandbox_runtime_recovery_required(object, observation, Available, Available)
+            sandbox_runtime_terminal_generation_admitted(object, observation, Available, Available)
         };
         for phase in ["Failed", "Succeeded"] {
             let mut observed = observation();
@@ -13080,21 +13102,85 @@ mod tests {
         let mut altered_fence = observation();
         altered_fence.fence_metadata.as_mut().unwrap().generation = Some(4);
         assert!(!recover(&object, &altered_fence));
-        assert!(!sandbox_runtime_recovery_required(
+        assert!(!sandbox_runtime_terminal_generation_admitted(
             &object,
             &observation(),
             Unavailable,
             Available
         ));
-        assert!(!sandbox_runtime_recovery_required(
+        assert!(!sandbox_runtime_terminal_generation_admitted(
             &object,
             &observation(),
             Available,
             Unknown
         ));
+        let stale_status = || Sandbox {
+            status: Some(SandboxStatus {
+                conditions: vec![
+                    SandboxCondition {
+                        r#type: "Ready".to_string(),
+                        status: "True".to_string(),
+                        ..Default::default()
+                    },
+                    SandboxCondition {
+                        r#type: SANDBOX_SUSPENDED_CONDITION.to_string(),
+                        status: "True".to_string(),
+                        reason: "PodTerminated".to_string(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut before_publication = object.clone();
+        before_publication
+            .metadata
+            .annotations
+            .as_mut()
+            .unwrap()
+            .insert(
+                ANNOTATION_SANDBOX_RUNTIME_READINESS.to_string(),
+                "ready".to_string(),
+            );
+        for (snapshot, reason) in [
+            (&before_publication, "DependenciesNotReady"),
+            (&object, "SandboxRuntimeTerminated"),
+        ] {
+            let mut sandbox = stale_status();
+            assert!(project_sandbox_runtime_terminal_generation(
+                snapshot,
+                &observation(),
+                Available,
+                Available,
+                &mut sandbox
+            ));
+            let conditions = &sandbox.status.as_ref().unwrap().conditions;
+            assert!(
+                !conditions
+                    .iter()
+                    .any(|condition| condition.r#type == SANDBOX_SUSPENDED_CONDITION)
+            );
+            let ready = conditions
+                .iter()
+                .find(|condition| condition.r#type == "Ready")
+                .unwrap();
+            assert_eq!(ready.status, "False");
+            assert_eq!(ready.reason, reason);
+        }
         let mut stopped = object.clone();
         stopped.data["spec"]["operatingMode"] = serde_json::json!("Suspended");
         assert!(!recover(&stopped, &observation()));
+        let mut explicit_stop = stale_status();
+        let original_status = explicit_stop.status.clone();
+        assert!(!project_sandbox_runtime_terminal_generation(
+            &stopped,
+            &observation(),
+            Available,
+            Available,
+            &mut explicit_stop
+        ));
+        assert_eq!(explicit_stop.status, original_status);
         let mut starting = object;
         starting.metadata.annotations.as_mut().unwrap().insert(
             ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING.to_string(),
