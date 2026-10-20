@@ -4012,7 +4012,7 @@ impl ComputeRuntime {
             .list_persisted_sandbox_ids("lifecycle recovery")
             .await?;
         for sandbox_id in sandbox_ids {
-            let _lifecycle_guard = self.lifecycle_gates.lock_for(&sandbox_id).await;
+            let lifecycle_guard = self.lifecycle_gates.lock_for(&sandbox_id).await;
             let sandbox = match self.store.get_message::<Sandbox>(&sandbox_id).await {
                 Ok(Some(sandbox)) => sandbox,
                 Ok(None) => continue,
@@ -4086,7 +4086,7 @@ impl ComputeRuntime {
                 SandboxPhase::Starting if is_automatic_restart_transition(&sandbox) => {
                     // Replay the owned STOP/authenticated START sequence, not
                     // an unfenced raw START with an empty launch bundle.
-                    drop(_lifecycle_guard);
+                    drop(lifecycle_guard);
                     if let Err(error) = self.restart_sandbox_runtime(sandbox.object_id()).await {
                         warn!(sandbox_id, %error, "Failed to recover scheduled sandbox restart");
                     }
