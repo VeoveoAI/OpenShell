@@ -218,6 +218,15 @@ for `nvidia.com/gpu` and requests the configured GPU count in the workload spec.
 When no count is set, the driver requests one GPU resource. The sandbox image
 must provide the user-space libraries needed by the agent workload.
 
+The driver derives the trusted `openshell.gpu` boundary claim from the admitted
+agent container's positive integer `nvidia.com/gpu` limit on both creation and
+restart. The shared sandbox runtime then admits the GPU device filesystem paths
+visible in that workload. A RuntimeClass, environment variable or caller metadata
+alone does not grant device access. This path accepts the native renderer's
+unsigned decimal GPU counts; unsupported quantity spellings fail provisioning.
+After upgrading this provisioning behavior, use native Stop/Start to create a
+fresh runtime generation. Existing immutable bootstrap material is not rewritten.
+
 ## Driver Config
 
 Following RFC 0006, this driver accepts the selected

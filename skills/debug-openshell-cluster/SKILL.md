@@ -486,6 +486,16 @@ the release. Look for failed installs, unexpected values, missing namespace, wro
 image tag, TLS settings that do not match the registered endpoint, and
 scheduling failures.
 
+For a GPU sandbox, distinguish node capacity, the agent container's admitted
+`nvidia.com/gpu` limit, and usable CUDA access inside the workload. A selected
+NVIDIA RuntimeClass or device-plugin readiness alone does not prove workload
+access. The Kubernetes driver must carry the admitted agent allocation into the
+trusted sandbox boundary; do not repair a missing claim with caller metadata or
+broader filesystem policy. After a GPU-provisioning gateway fix, use the installed
+CLI's native `sandbox stop` and `sandbox start` to obtain a fresh generation;
+existing immutable bootstrap material is not updated in place. Verify the new
+generation and workload CUDA availability before starting model inference.
+
 When checking a Helm values migration, compare the rendered `gateway.toml`
 with the intended `gatewayConfig` tables. Explicit resource-admission settings
 and the Kubernetes Secrets credential namespace take precedence over deprecated
