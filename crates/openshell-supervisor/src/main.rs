@@ -369,17 +369,13 @@ fn main() -> Result<()> {
     validate_role_arguments(&args)?;
     arm_parent_liveness(args.parent_liveness_stdin)?;
     validate_main_exit_marker(args.main_exit_marker.as_deref())?;
-    let isolation_inputs = if args.role == SupervisorRole::IsolationBackend {
+    let mut isolation_inputs = if args.role == SupervisorRole::IsolationBackend {
         let admitted_backend =
             std::env::var(openshell_core::sandbox_env::ADMITTED_ISOLATION_BACKEND)
                 .map_err(|_| miette::miette!("driver must supply an admitted isolation backend"))?;
         let setup = backend_setup(&args, &admitted_backend)?;
         let descriptor = backend_descriptor(&args, &admitted_backend)?;
         let auth = auth_bundle(&args)?;
-        // Install the driver-provisioned session before starting log push or
-        // any other gateway client. `run_sandbox` obtains the same Sandbox
-        // Protocol bearer slot after validating the descriptor binding.
-        let _ = openshell_core::grpc_client::install_supervisor_auth_bundle(&auth)?;
         Some((setup, descriptor, auth, admitted_backend))
     } else {
         None
@@ -391,6 +387,16 @@ fn main() -> Result<()> {
         .enable_all()
         .build()
         .into_diagnostic()?;
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    if let Some((_, _, auth, _)) = isolation_inputs.as_mut() {
+        *auth = runtime.block_on(openshell_core::grpc_client::prepare_supervisor_auth_bundle(
+            auth,
+            args.openshell_endpoint.as_deref(),
+        ))?;
+        // Complete declared native bootstrap before log push or policy discovery
+        // can consume either credential or start periodic renewal.
+        let _ = openshell_core::grpc_client::install_supervisor_auth_bundle(auth)?;
+    }
     let export_config = |endpoint| openshell_otel::OtlpExportConfig {
         endpoint,
         service_name: openshell_otel::ServiceName::Fixed(SERVICE_NAME),
@@ -419,7 +425,6 @@ fn main() -> Result<()> {
     let ocsf_layer = ocsf_export.as_ref().map(openshell_otel::OcsfOtlp::layer);
 
     let exit_code = runtime.block_on(async move {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let log_push_state = if args.role == SupervisorRole::IsolationBackend
             && let (Some(sandbox_id), Some(endpoint)) = (&args.sandbox_id, &args.openshell_endpoint)
         {

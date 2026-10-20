@@ -4112,11 +4112,33 @@ impl KubernetesComputeDriver {
                     warn!(sandbox_id, %error, "failed to reconcile sandbox-runtime supervisor Pod");
                 }
             }
-            let availability =
-                sandbox_runtime_control_availability(&self.client, namespace, &sandbox_id).await;
+            let observation =
+                sandbox_runtime_control_observation(&self.client, namespace, &sandbox_id).await;
+            let availability = observation.availability();
+            if desired_running && observation.admitted_terminal_supervisor(&object) {
+                // The generation cannot be restarted by kubelet (restartPolicy
+                // Never). Preserve desired Running and ask the gateway's native
+                // restart-policy controller for a fresh fenced generation.
+                warn!(sandbox_id, supervisor_phase = ?observation.supervisor_phase,
+                    supervisor_reason = ?observation.supervisor_reason,
+                    "admitted sandbox-runtime supervisor terminated; publishing infrastructure loss");
+                self.publish_sandbox_runtime_readiness_state(&lookup_api, &object, "terminated")
+                    .await;
+                continue;
+            }
             if desired_running && availability == SandboxRuntimeControlAvailability::Unavailable {
                 warn!(
                     sandbox_id,
+                    namespace,
+                    generation = ?sandbox_runtime_generation(&object),
+                    supervisor_uid = ?observation.supervisor_uid,
+                    supervisor_phase = ?observation.supervisor_phase,
+                    supervisor_reason = ?observation.supervisor_reason,
+                    supervisor_deleting = ?observation.supervisor_deleting,
+                    supervisor = ?observation.supervisor,
+                    boundary_service = ?observation.service,
+                    workload_fence = ?observation.fence,
+                    supervisor_fence = ?observation.supervisor_fence,
                     "sandbox-runtime supervisor is unavailable; suspending workload"
                 );
                 self.suspend_sandbox_runtime_after_dependency_failure(&lookup_api, &object)
@@ -4240,6 +4262,16 @@ impl KubernetesComputeDriver {
         let Some(state) = sandbox_runtime_readiness_state(availability) else {
             return;
         };
+        self.publish_sandbox_runtime_readiness_state(lookup_api, object, state)
+            .await;
+    }
+
+    async fn publish_sandbox_runtime_readiness_state(
+        &self,
+        lookup_api: &AgentSandboxApi,
+        object: &DynamicObject,
+        state: &str,
+    ) {
         if object
             .metadata
             .annotations
@@ -5559,11 +5591,74 @@ fn sandbox_runtime_control_availability_from_pod(pod: &Pod) -> SandboxRuntimeCon
     }
 }
 
+// Keep the dependency observations from the same API reads that decide
+// readiness, so an unavailable boundary can be diagnosed without a later,
+// potentially different snapshot or any credential-bearing Pod spec.
+struct SandboxRuntimeControlObservation {
+    supervisor: SandboxRuntimeControlAvailability,
+    service: SandboxRuntimeControlAvailability,
+    fence: SandboxRuntimeControlAvailability,
+    supervisor_fence: SandboxRuntimeControlAvailability,
+    supervisor_uid: Option<String>,
+    supervisor_phase: Option<String>,
+    supervisor_reason: Option<String>,
+    supervisor_deleting: Option<bool>,
+    fence_metadata: Option<ObjectMeta>,
+}
+
+impl SandboxRuntimeControlObservation {
+    fn admitted_terminal_supervisor(&self, object: &DynamicObject) -> bool {
+        let expected_uid = object
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID));
+        self.supervisor_uid
+            .as_ref()
+            .is_some_and(|uid| Some(uid) == expected_uid)
+            && self.supervisor_deleting == Some(false)
+            && matches!(
+                self.supervisor_phase.as_deref(),
+                Some("Failed" | "Succeeded")
+            )
+            && [self.service, self.fence, self.supervisor_fence]
+                == [SandboxRuntimeControlAvailability::Available; 3]
+            && self.fence_metadata.as_ref().is_some_and(|metadata| {
+                sandbox_runtime_namespace_fence_generation_matches(
+                    &NetworkPolicy {
+                        metadata: metadata.clone(),
+                        ..Default::default()
+                    },
+                    object,
+                )
+            })
+    }
+
+    fn availability(&self) -> SandboxRuntimeControlAvailability {
+        combine_sandbox_runtime_control_availability([
+            self.supervisor,
+            self.service,
+            self.fence,
+            self.supervisor_fence,
+        ])
+    }
+}
+
 async fn sandbox_runtime_control_availability(
     client: &Client,
     namespace: &str,
     sandbox_id: &str,
 ) -> SandboxRuntimeControlAvailability {
+    sandbox_runtime_control_observation(client, namespace, sandbox_id)
+        .await
+        .availability()
+}
+
+async fn sandbox_runtime_control_observation(
+    client: &Client,
+    namespace: &str,
+    sandbox_id: &str,
+) -> SandboxRuntimeControlObservation {
     let names = SandboxRuntimeNames::new(sandbox_id);
     let pods = Api::<Pod>::namespaced(client.clone(), namespace);
     let services = Api::<Service>::namespaced(client.clone(), namespace);
@@ -5586,8 +5681,18 @@ async fn sandbox_runtime_control_availability(
     ));
     let (supervisor, service, fence, supervisor_fence) =
         tokio::join!(supervisor, service, fence, supervisor_fence);
+    let mut supervisor_uid = None;
+    let mut supervisor_phase = None;
+    let mut supervisor_reason = None;
+    let mut supervisor_deleting = None;
     let control = match supervisor {
-        Ok(Ok(Some(pod))) => sandbox_runtime_control_availability_from_pod(&pod),
+        Ok(Ok(Some(pod))) => {
+            supervisor_uid.clone_from(&pod.metadata.uid);
+            supervisor_phase = pod.status.as_ref().and_then(|status| status.phase.clone());
+            supervisor_reason = pod.status.as_ref().and_then(|status| status.reason.clone());
+            supervisor_deleting = Some(pod.metadata.deletion_timestamp.is_some());
+            sandbox_runtime_control_availability_from_pod(&pod)
+        }
         Ok(Ok(None)) => SandboxRuntimeControlAvailability::Unavailable,
         Ok(Err(error)) => {
             warn!(sandbox_id, %error, "could not determine sandbox-runtime control availability");
@@ -5620,8 +5725,12 @@ async fn sandbox_runtime_control_availability(
     // Supervisor readiness alone is not sufficient: deletion of the shared
     // fence would otherwise leave a live boundary with direct pod
     // egress while the driver continued to publish Ready.
+    let mut fence_metadata = None;
     let fence = match fence {
-        Ok(Ok(Some(_))) => SandboxRuntimeControlAvailability::Available,
+        Ok(Ok(Some(policy))) => {
+            fence_metadata = Some(policy.metadata);
+            SandboxRuntimeControlAvailability::Available
+        }
         Ok(Ok(None)) => SandboxRuntimeControlAvailability::Unavailable,
         Ok(Err(error)) => {
             warn!(sandbox_id, %error, "could not determine sandbox-runtime workload fence availability");
@@ -5650,7 +5759,17 @@ async fn sandbox_runtime_control_availability(
             SandboxRuntimeControlAvailability::Unknown
         }
     };
-    combine_sandbox_runtime_control_availability([control, service, fence, supervisor_fence])
+    SandboxRuntimeControlObservation {
+        supervisor: control,
+        service,
+        fence,
+        supervisor_fence,
+        supervisor_uid,
+        supervisor_phase,
+        supervisor_reason,
+        supervisor_deleting,
+        fence_metadata,
+    }
 }
 
 fn combine_sandbox_runtime_control_availability(
@@ -5764,7 +5883,7 @@ async fn sandbox_from_object_with_sandbox_runtime_readiness(
         mark_sandbox_runtime_bootstrapping(&mut sandbox);
     }
     if !sandbox_id.is_empty() {
-        let dependencies = Box::pin(sandbox_runtime_control_availability(
+        let dependencies = Box::pin(sandbox_runtime_control_observation(
             client,
             &object_namespace,
             &sandbox_id,
@@ -5783,6 +5902,31 @@ async fn sandbox_from_object_with_sandbox_runtime_readiness(
         ));
         let (dependencies, workload_generation, supervisor_generation) =
             tokio::join!(dependencies, workload_generation, supervisor_generation);
+        if sandbox_runtime_recovery_required(
+            &obj,
+            &dependencies,
+            workload_generation,
+            supervisor_generation,
+        ) {
+            mark_sandbox_runtime_control_unavailable(&mut sandbox);
+            if let Some(status) = sandbox.status.as_mut() {
+                status
+                    .conditions
+                    .retain(|condition| condition.r#type != SANDBOX_SUSPENDED_CONDITION);
+                if let Some(ready) = status
+                    .conditions
+                    .iter_mut()
+                    .find(|condition| condition.r#type == "Ready")
+                {
+                    ready.reason = "SandboxRuntimeTerminated".to_string();
+                    ready.message =
+                        "Admitted supervisor generation terminated; fresh runtime required"
+                            .to_string();
+                }
+            }
+            return Ok((name, sandbox));
+        }
+        let dependencies = dependencies.availability();
         // A transient API read failure is not evidence that the running
         // boundary disappeared. Preserve the CR's published readiness for
         // Unknown and let periodic reconciliation retry.
@@ -5797,6 +5941,29 @@ async fn sandbox_from_object_with_sandbox_runtime_readiness(
         }
     }
     Ok((name, sandbox))
+}
+
+fn sandbox_runtime_recovery_required(
+    object: &DynamicObject,
+    observation: &SandboxRuntimeControlObservation,
+    workload_generation: SandboxRuntimeControlAvailability,
+    supervisor_generation: SandboxRuntimeControlAvailability,
+) -> bool {
+    sandbox_runtime_should_run(object)
+        && object.metadata.deletion_timestamp.is_none()
+        && !sandbox_runtime_bootstrap_in_progress(object)
+        && object
+            .metadata
+            .annotations
+            .as_ref()
+            .is_some_and(|annotations| {
+                annotations
+                    .get(ANNOTATION_SANDBOX_RUNTIME_READINESS)
+                    .is_some_and(|state| state == "terminated")
+            })
+        && workload_generation == SandboxRuntimeControlAvailability::Available
+        && supervisor_generation == SandboxRuntimeControlAvailability::Available
+        && observation.admitted_terminal_supervisor(object)
 }
 
 fn mark_sandbox_runtime_bootstrapping(sandbox: &mut Sandbox) {
@@ -12847,6 +13014,93 @@ mod tests {
             sandbox_runtime_control_availability_from_pod(&deleting),
             SandboxRuntimeControlAvailability::Unavailable
         );
+    }
+
+    #[test]
+    fn sandbox_runtime_terminal_recovery_requires_admitted_generation_and_fences() {
+        use SandboxRuntimeControlAvailability::{Available, Unavailable, Unknown};
+        let object: DynamicObject = serde_json::from_value(serde_json::json!({
+            "apiVersion": "agents.x-k8s.io/v1beta1", "kind": "Sandbox",
+            "metadata": {"annotations": {
+                ANNOTATION_SANDBOX_RUNTIME_READINESS: "terminated",
+                ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID: "admitted-supervisor",
+                ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_UID: "admitted-fence",
+                ANNOTATION_SANDBOX_RUNTIME_NETWORK_POLICY_GENERATION: "3"
+            }},
+            "spec": {"operatingMode": "Running"}
+        }))
+        .unwrap();
+        let observation = || SandboxRuntimeControlObservation {
+            supervisor: Unavailable,
+            service: Available,
+            fence: Available,
+            supervisor_fence: Available,
+            supervisor_uid: Some("admitted-supervisor".to_string()),
+            supervisor_phase: Some("Failed".to_string()),
+            supervisor_reason: Some("Shutdown".to_string()),
+            supervisor_deleting: Some(false),
+            fence_metadata: Some(ObjectMeta {
+                uid: Some("admitted-fence".to_string()),
+                generation: Some(3),
+                ..Default::default()
+            }),
+        };
+        let recover = |object: &DynamicObject, observation: &SandboxRuntimeControlObservation| {
+            sandbox_runtime_recovery_required(object, observation, Available, Available)
+        };
+        for phase in ["Failed", "Succeeded"] {
+            let mut observed = observation();
+            observed.supervisor_phase = Some(phase.to_string());
+            assert!(recover(&object, &observed));
+        }
+        for phase in [None, Some("Pending"), Some("Running"), Some("Unknown")] {
+            let mut observed = observation();
+            observed.supervisor_phase = phase.map(str::to_string);
+            assert!(!recover(&object, &observed));
+        }
+        let mut wrong_uid = observation();
+        wrong_uid.supervisor_uid = Some("replacement-supervisor".to_string());
+        assert!(!recover(&object, &wrong_uid));
+        wrong_uid.supervisor_uid = None;
+        assert!(!recover(&object, &wrong_uid));
+        let mut deleting = observation();
+        deleting.supervisor_deleting = Some(true);
+        assert!(!recover(&object, &deleting));
+        for dependency in [Unavailable, Unknown] {
+            let mut observed = observation();
+            observed.service = dependency;
+            assert!(!recover(&object, &observed));
+            let mut observed = observation();
+            observed.fence = dependency;
+            assert!(!recover(&object, &observed));
+            let mut observed = observation();
+            observed.supervisor_fence = dependency;
+            assert!(!recover(&object, &observed));
+        }
+        let mut altered_fence = observation();
+        altered_fence.fence_metadata.as_mut().unwrap().generation = Some(4);
+        assert!(!recover(&object, &altered_fence));
+        assert!(!sandbox_runtime_recovery_required(
+            &object,
+            &observation(),
+            Unavailable,
+            Available
+        ));
+        assert!(!sandbox_runtime_recovery_required(
+            &object,
+            &observation(),
+            Available,
+            Unknown
+        ));
+        let mut stopped = object.clone();
+        stopped.data["spec"]["operatingMode"] = serde_json::json!("Suspended");
+        assert!(!recover(&stopped, &observation()));
+        let mut starting = object;
+        starting.metadata.annotations.as_mut().unwrap().insert(
+            ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING.to_string(),
+            "true".to_string(),
+        );
+        assert!(!recover(&starting, &observation()));
     }
 
     #[test]

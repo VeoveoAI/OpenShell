@@ -140,6 +140,26 @@ idle does not shorten it. Resource and Event
 watches recover in place with API-friendly backoff after transient watcher
 errors, avoiding a gateway-side watch restart and its associated watch gap.
 
+## Runtime Recovery
+
+Workload and supervisor Pods use `restartPolicy: Never`: their bootstrap belongs
+only to the admitted runtime generation. A same-UID supervisor in `Pending` or
+unready `Running` is reconciling, so readiness remains unavailable without
+changing desired running intent. If the admitted supervisor becomes terminal
+(`Failed` or `Succeeded`), with the exact workload/supervisor UIDs and namespace
+fence generation still present, the driver publishes `SandboxRuntimeTerminated`
+instead of suspending the Sandbox. The gateway applies its existing
+`Always`/`OnFailure` policy and fenced STOP → fresh paired credentials → START
+sequence. This infrastructure loss has no inferred canonical process exit code.
+
+Missing/deleting Pods, changed identities and missing or altered enforcement
+fences retain their fail-closed paths. Explicit Stop/Delete, `Never`, and a
+recorded canonical command completion are not revived by infrastructure
+recovery. A queued old terminal observation is re-read under the gateway's
+lifecycle gate before scheduling replacement. Replacement Pods and runtime
+identities change; retained workspace claims are reused. These source semantics
+still require deployed reboot qualification.
+
 ## Workspace Persistence
 
 Sandbox pods use a PVC-backed `/sandbox` workspace. An init container seeds the

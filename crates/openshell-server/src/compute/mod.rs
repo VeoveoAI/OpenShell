@@ -4083,6 +4083,14 @@ impl ComputeRuntime {
                         }
                     }
                 }
+                SandboxPhase::Starting if is_automatic_restart_transition(&sandbox) => {
+                    // Replay the owned STOP/authenticated START sequence, not
+                    // an unfenced raw START with an empty launch bundle.
+                    drop(_lifecycle_guard);
+                    if let Err(error) = self.restart_sandbox_runtime(sandbox.object_id()).await {
+                        warn!(sandbox_id, %error, "Failed to recover scheduled sandbox restart");
+                    }
+                }
                 SandboxPhase::Starting => {
                     if let Err(error) = self.validate_isolation_backend_binding(&sandbox) {
                         warn!(%error, "Rejected pending isolation backend selection");
@@ -4104,7 +4112,9 @@ impl ComputeRuntime {
                     }
                     let sandbox_id = sandbox.object_id().to_string();
                     let expected_runtime_identity = sandbox_compute_runtime_identity(&sandbox);
-                    let launch_authentication = if self.isolation_backend.is_some() {
+                    let launch_authentication = if self.isolation_backend.is_some()
+                        || self.supports_sandbox_authentication()
+                    {
                         let authority = self.restart_authority.get().and_then(Option::as_deref);
                         match self
                             .encode_persisted_launch_authentication(authority, &sandbox)
@@ -4557,9 +4567,8 @@ impl ComputeRuntime {
                                 r#type: "Ready".to_string(),
                                 status: "False".to_string(),
                                 reason: "SandboxRestarting".to_string(),
-                                message:
-                                    "Replacing sandbox runtime after canonical main process exit"
-                                        .to_string(),
+                                message: "Replacing terminated sandbox runtime generation"
+                                    .to_string(),
                                 transition_time: None,
                             },
                         );
@@ -5097,7 +5106,10 @@ impl ComputeRuntime {
         let ready_container_exit = existing_phase == SandboxPhase::Ready
             && (driver_snapshot_confirms_stopped(&incoming)
                 || driver_snapshot_reports_runtime_restart(&incoming));
-        if existing_phase != SandboxPhase::Starting && !ready_container_exit {
+        let infrastructure_loss = driver_snapshot_reports_infrastructure_loss(&incoming)
+            && sandbox_phase_should_be_running(existing_phase);
+        if existing_phase != SandboxPhase::Starting && !ready_container_exit && !infrastructure_loss
+        {
             return self.apply_sandbox_update_locked(incoming, existing).await;
         }
 
@@ -5135,9 +5147,7 @@ impl ComputeRuntime {
 
         match observed {
             Ok(Some(live)) if live.id == incoming.id && live.status.is_some() => incoming = live,
-            Ok(Some(_) | None) | Err(_)
-                if matches!(current_phase, SandboxPhase::Starting | SandboxPhase::Ready) =>
-            {
+            Ok(Some(_) | None) | Err(_) if sandbox_phase_should_be_running(current_phase) => {
                 warn!(
                     sandbox_id = %incoming.id,
                     "Could not validate driver snapshot against current runtime; retaining current sandbox state"
@@ -5219,6 +5229,9 @@ impl ComputeRuntime {
 
         self.sandbox_index.update_from_sandbox(&sandbox);
         self.sandbox_watch_bus.notify(sandbox.object_id());
+        if is_automatic_restart_transition(&sandbox) {
+            self.restart_notify.notify_one();
+        }
         if existing_phase != SandboxPhase::Stopped
             && sandbox.phase() == SandboxPhase::Stopped as i32
         {
@@ -5455,6 +5468,7 @@ impl ComputeRuntime {
                             // An admission-only update leaves restart state to
                             // the instance that last connected.
                             if runtime_ready {
+                                clear_infrastructure_restart(status);
                                 let same_instance =
                                     Some(status.main_process_instance_id.as_str()) == instance_id;
                                 status.main_process_instance_id =
@@ -6316,6 +6330,7 @@ fn apply_main_process_exit(sandbox: &mut Sandbox, instance_id: &str, exit_code: 
     // other infrastructure errors.
     let preserve_infrastructure_error = has_specific_infrastructure_error(sandbox);
     let status = sandbox.status.get_or_insert_with(SandboxStatus::default);
+    clear_infrastructure_restart(status);
     status.main_process_instance_id = instance_id.to_string();
     status.exit_code = Some(exit_code);
     if preserve_infrastructure_error {
@@ -6379,7 +6394,35 @@ fn should_restart_main_process(policy: i32, exit_code: i32) -> bool {
 }
 
 fn is_automatic_restart_status(status: &SandboxStatus) -> bool {
-    status.restart_count > 0 && status.exit_code.is_some()
+    status.restart_count > 0 && (status.exit_code.is_some() || has_infrastructure_restart(status))
+}
+
+fn clear_infrastructure_restart(status: &mut SandboxStatus) {
+    status
+        .conditions
+        .retain(|condition| condition.r#type != "InfrastructureRestart");
+}
+
+fn driver_snapshot_reports_infrastructure_loss(incoming: &DriverSandbox) -> bool {
+    incoming.status.as_ref().is_some_and(|status| {
+        !status.deleting
+            && status.conditions.iter().any(|condition| {
+                condition.r#type == "Ready"
+                    && condition.status == "False"
+                    && condition.reason == "SandboxRuntimeTerminated"
+            })
+            && !status
+                .conditions
+                .iter()
+                .any(|condition| condition.r#type == "Suspended" && condition.status == "True")
+    })
+}
+
+fn has_infrastructure_restart(status: &SandboxStatus) -> bool {
+    status
+        .conditions
+        .iter()
+        .any(|condition| condition.r#type == "InfrastructureRestart" && condition.status == "True")
 }
 
 fn is_automatic_restart_transition(sandbox: &Sandbox) -> bool {
@@ -6482,6 +6525,68 @@ fn restart_timestamp(millis: i64) -> Option<prost_types::Timestamp> {
         .flatten()
 }
 
+/// A terminal admitted runtime is not a canonical command exit. Schedule it
+/// through the same fenced replacement controller without fabricating an exit
+/// code or converting desired Running into an operator Stop.
+fn schedule_infrastructure_restart(
+    sandbox: &mut Sandbox,
+    incoming: &DriverSandbox,
+    now_ms: i64,
+) -> bool {
+    let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+    if !driver_snapshot_reports_infrastructure_loss(incoming)
+        || !sandbox_phase_should_be_running(phase)
+        || is_automatic_restart_transition(sandbox)
+        || provisioning_deadline::timed_out(sandbox)
+        || sandbox
+            .status
+            .as_ref()
+            .is_some_and(|status| status.exit_code.is_some())
+        || !sandbox.spec.as_ref().is_some_and(|spec| {
+            matches!(
+                SandboxRestartPolicy::try_from(spec.restart_policy),
+                Ok(SandboxRestartPolicy::Always | SandboxRestartPolicy::OnFailure)
+            )
+        })
+    {
+        return false;
+    }
+    let status = sandbox.status.get_or_insert_with(Default::default);
+    let stable_run = main_process_started_at_ms(status) > 0
+        && now_ms.saturating_sub(main_process_started_at_ms(status)) >= RESTART_STABILITY_WINDOW_MS;
+    status.restart_count = if stable_run || status.restart_count == 0 {
+        1
+    } else {
+        status.restart_count.saturating_add(1)
+    };
+    let delay_ms = restart_delay_ms(status.restart_count);
+    set_main_process_started_at_ms(status, 0);
+    set_next_restart_at_ms(status, now_ms.saturating_add(delay_ms));
+    status
+        .conditions
+        .retain(|condition| condition.r#type != "InfrastructureRestart");
+    status.conditions.push(SandboxCondition {
+        r#type: "InfrastructureRestart".to_string(),
+        status: "True".to_string(),
+        reason: "SandboxRuntimeTerminated".to_string(),
+        message: "Admitted runtime terminated without a canonical process result".to_string(),
+        transition_time: None,
+    });
+    upsert_ready_condition(
+        &mut sandbox.status,
+        SandboxCondition {
+            r#type: "Ready".to_string(),
+            status: "False".to_string(),
+            reason: "InfrastructureRestartScheduled".to_string(),
+            message: "Fresh fenced runtime generation scheduled under sandbox restart policy"
+                .to_string(),
+            transition_time: None,
+        },
+    );
+    sandbox.set_phase(SandboxPhase::Starting as i32);
+    true
+}
+
 fn apply_main_process_restart(
     sandbox: &mut Sandbox,
     instance_id: &str,
@@ -6489,6 +6594,7 @@ fn apply_main_process_restart(
     now_ms: i64,
 ) {
     let status = sandbox.status.get_or_insert_with(SandboxStatus::default);
+    clear_infrastructure_restart(status);
     let stable_run = main_process_started_at_ms(status) > 0
         && now_ms.saturating_sub(main_process_started_at_ms(status)) >= RESTART_STABILITY_WINDOW_MS;
     status.restart_count = if stable_run || status.restart_count == 0 {
@@ -7044,6 +7150,10 @@ fn apply_driver_snapshot(
     let old_phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
     let sandbox_name = &incoming.name;
 
+    if schedule_infrastructure_restart(sandbox, incoming, openshell_core::time::now_ms()) {
+        return;
+    }
+
     // Infrastructure errors and successful main-process completions are
     // sticky until an explicit lifecycle operation changes desired state. A
     // late signal-exit snapshot must also not overwrite the terminal reason
@@ -7100,6 +7210,15 @@ fn apply_driver_snapshot(
         new_status.restart_count = old_status.restart_count;
         new_status.next_restart_time = old_status.next_restart_time;
         new_status.main_process_started_time = old_status.main_process_started_time;
+        if is_automatic_restart_transition(sandbox) {
+            new_status.conditions.extend(
+                old_status
+                    .conditions
+                    .iter()
+                    .filter(|condition| condition.r#type == "InfrastructureRestart")
+                    .cloned(),
+            );
+        }
     }
 
     phase = match old_phase {
@@ -7154,6 +7273,9 @@ fn apply_driver_snapshot(
     };
 
     if let Some(status) = status.as_mut() {
+        if phase == SandboxPhase::Ready {
+            clear_infrastructure_restart(status);
+        }
         status.phase = phase as i32;
         status.endpoint_statuses = endpoint_statuses;
     }
@@ -7617,6 +7739,7 @@ fn apply_lifecycle_phase(
     sandbox.set_phase(phase as i32);
     if matches!(phase, SandboxPhase::Stopping | SandboxPhase::Starting) {
         let status = sandbox.status.get_or_insert_with(Default::default);
+        clear_infrastructure_restart(status);
         // Retain the previous instance id as a tombstone until the restarted
         // supervisor registers its new id.
         status.exit_code = None;
@@ -10570,6 +10693,300 @@ mod tests {
         let status = sandbox.status.unwrap();
         assert_eq!(status.restart_count, 6);
         assert_eq!(next_restart_at_ms(&status), now_ms + 16_000);
+    }
+
+    fn infrastructure_loss_snapshot() -> DriverSandbox {
+        DriverSandbox {
+            id: "sb-1".to_string(),
+            name: "sandbox-a".to_string(),
+            status: Some(DriverSandboxStatus {
+                conditions: vec![DriverCondition {
+                    r#type: "Ready".to_string(),
+                    status: "False".to_string(),
+                    reason: "SandboxRuntimeTerminated".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn infrastructure_restart_obeys_policy_and_terminal_intent_without_exit_code() {
+        for policy in [
+            SandboxRestartPolicy::Always,
+            SandboxRestartPolicy::OnFailure,
+            SandboxRestartPolicy::Never,
+            SandboxRestartPolicy::Unspecified,
+        ] {
+            for phase in [
+                SandboxPhase::Ready,
+                SandboxPhase::Provisioning,
+                SandboxPhase::Stopped,
+                SandboxPhase::Stopping,
+                SandboxPhase::Deleting,
+                SandboxPhase::Completed,
+                SandboxPhase::Error,
+            ] {
+                let mut sandbox = sandbox_record("sb-1", "sandbox-a", phase);
+                sandbox.spec = Some(SandboxSpec {
+                    restart_policy: policy as i32,
+                    ..Default::default()
+                });
+                let expected =
+                    matches!(
+                        policy,
+                        SandboxRestartPolicy::Always | SandboxRestartPolicy::OnFailure
+                    ) && matches!(phase, SandboxPhase::Ready | SandboxPhase::Provisioning);
+                assert_eq!(
+                    schedule_infrastructure_restart(
+                        &mut sandbox,
+                        &infrastructure_loss_snapshot(),
+                        10_000
+                    ),
+                    expected,
+                    "{policy:?} {phase:?}"
+                );
+                assert_eq!(sandbox.status.as_ref().unwrap().exit_code, None);
+                if expected {
+                    assert!(is_automatic_restart_transition(&sandbox));
+                    assert!(!schedule_infrastructure_restart(
+                        &mut sandbox,
+                        &infrastructure_loss_snapshot(),
+                        20_000
+                    ));
+                    assert_eq!(sandbox.status.as_ref().unwrap().restart_count, 1);
+                } else {
+                    assert_eq!(sandbox.phase(), phase as i32);
+                }
+            }
+        }
+        let mut completed = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        completed.spec = Some(SandboxSpec {
+            restart_policy: SandboxRestartPolicy::Always as i32,
+            ..Default::default()
+        });
+        completed.status.as_mut().unwrap().exit_code = Some(0);
+        assert!(!schedule_infrastructure_restart(
+            &mut completed,
+            &infrastructure_loss_snapshot(),
+            10_000
+        ));
+    }
+
+    #[test]
+    fn infrastructure_restart_marker_clears_on_lifecycle_and_canonical_result() {
+        for terminal in [false, true] {
+            let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+            sandbox.spec = Some(SandboxSpec {
+                restart_policy: SandboxRestartPolicy::Always as i32,
+                ..Default::default()
+            });
+            assert!(schedule_infrastructure_restart(
+                &mut sandbox,
+                &infrastructure_loss_snapshot(),
+                10_000
+            ));
+            if terminal {
+                apply_main_process_exit(&mut sandbox, "instance", 0);
+                assert_eq!(sandbox.phase(), SandboxPhase::Completed as i32);
+            } else {
+                apply_lifecycle_phase(
+                    &mut sandbox,
+                    SandboxPhase::Stopping,
+                    "Stopping",
+                    "Explicit stop",
+                    60,
+                );
+            }
+            assert!(!has_infrastructure_restart(
+                sandbox.status.as_ref().unwrap()
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn infrastructure_restart_rotates_generation_and_paired_launch_authentication() {
+        let driver = ControlledDriver::new();
+        driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(
+            infrastructure_loss_snapshot(),
+        )));
+        driver.set_runtime_identity("replacement-runtime");
+        let mut runtime = test_runtime(driver.clone()).await;
+        enable_runtime_identity_binding(&mut runtime);
+        runtime
+            .restart_authority
+            .set(Some(Arc::new(test_session_authority())))
+            .unwrap();
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        sandbox.spec = Some(SandboxSpec {
+            restart_policy: SandboxRestartPolicy::Always as i32,
+            ..Default::default()
+        });
+        set_compute_runtime_binding(&mut sandbox, "admitted-runtime");
+        let previous_generation = sandbox_runtime_generation(&sandbox).unwrap();
+        runtime.store.put_message(&sandbox).await.unwrap();
+        runtime
+            .apply_sandbox_update(infrastructure_loss_snapshot())
+            .await
+            .unwrap();
+        let scheduled = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(is_automatic_restart_transition(&scheduled));
+        assert_eq!(scheduled.status.as_ref().unwrap().exit_code, None);
+        // A repeated observation cannot cancel or duplicate the owned restart.
+        runtime
+            .apply_sandbox_update(infrastructure_loss_snapshot())
+            .await
+            .unwrap();
+        runtime.restart_due_sandboxes().await.unwrap();
+        let restarted = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(driver.stop_calls(), 1);
+        assert_eq!(driver.start_calls(), 1);
+        assert_ne!(
+            sandbox_runtime_generation(&restarted).unwrap(),
+            previous_generation
+        );
+        assert_eq!(
+            sandbox_compute_runtime_identity(&restarted),
+            "replacement-runtime"
+        );
+        assert_eq!(restarted.status.as_ref().unwrap().exit_code, None);
+        assert_eq!(
+            driver.start_expected_runtime_identities(),
+            vec!["admitted-runtime"]
+        );
+        let authentication: openshell_core::jwt::SandboxLaunchAuthentication =
+            serde_json::from_slice(&driver.start_authentications()[0]).unwrap();
+        assert_eq!(
+            authentication.supervisor.runtime_generation,
+            sandbox_runtime_generation(&restarted).unwrap()
+        );
+        assert!(
+            !authentication
+                .supervisor
+                .gateway_token
+                .expose_secret()
+                .is_empty()
+        );
+        assert!(
+            !authentication
+                .supervisor
+                .sandbox_token
+                .expose_secret()
+                .is_empty()
+        );
+        runtime
+            .supervisor_session_connected("sb-1", "replacement-instance")
+            .await
+            .unwrap();
+        let ready = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ready.phase(), SandboxPhase::Ready as i32);
+        assert!(!has_infrastructure_restart(ready.status.as_ref().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn infrastructure_restart_queued_old_terminal_observation_is_revalidated() {
+        for phase in [SandboxPhase::Ready, SandboxPhase::Provisioning] {
+            let driver = ControlledDriver::new();
+            driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(
+                ready_driver_sandbox("sb-1", "sandbox-a"),
+            )));
+            let runtime = test_runtime(driver.clone()).await;
+            let mut replacement = sandbox_record("sb-1", "sandbox-a", phase);
+            replacement.spec = Some(SandboxSpec {
+                restart_policy: SandboxRestartPolicy::Always as i32,
+                ..Default::default()
+            });
+            runtime.store.put_message(&replacement).await.unwrap();
+            runtime
+                .apply_sandbox_update(infrastructure_loss_snapshot())
+                .await
+                .unwrap();
+            let current = runtime
+                .store
+                .get_message::<Sandbox>("sb-1")
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!is_automatic_restart_transition(&current));
+            assert_eq!(current.status.as_ref().unwrap().restart_count, 0);
+            assert_eq!(
+                sandbox_runtime_generation(&current).unwrap(),
+                sandbox_runtime_generation(&replacement).unwrap()
+            );
+            runtime.restart_due_sandboxes().await.unwrap();
+            assert_eq!(driver.stop_calls(), 0);
+            assert_eq!(driver.start_calls(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn infrastructure_restart_cannot_override_concurrent_stop() {
+        let driver = ControlledDriver::new();
+        driver.set_get_outcome(ControlledGetOutcome::Sandbox(Box::new(
+            infrastructure_loss_snapshot(),
+        )));
+        driver.block_stop();
+        let runtime = test_runtime(driver.clone()).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        sandbox.spec = Some(SandboxSpec {
+            restart_policy: SandboxRestartPolicy::Always as i32,
+            ..Default::default()
+        });
+        runtime.store.put_message(&sandbox).await.unwrap();
+        runtime
+            .apply_sandbox_update(infrastructure_loss_snapshot())
+            .await
+            .unwrap();
+        let worker = runtime.clone();
+        let restart = tokio::spawn(async move { worker.restart_due_sandboxes().await });
+        driver.stop_started.notified().await;
+        let claimed = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        runtime
+            .store
+            .update_message_cas::<Sandbox, _>(
+                "sb-1",
+                sandbox_resource_version(&claimed),
+                |sandbox| {
+                    sandbox.set_phase(SandboxPhase::Stopping as i32);
+                },
+            )
+            .await
+            .unwrap();
+        driver.release_stop();
+        restart.await.unwrap().unwrap();
+        assert_eq!(driver.start_calls(), 0);
+        assert_eq!(
+            runtime
+                .store
+                .get_message::<Sandbox>("sb-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .phase(),
+            SandboxPhase::Stopping as i32
+        );
     }
 
     #[tokio::test]
