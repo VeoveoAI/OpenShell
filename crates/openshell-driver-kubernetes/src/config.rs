@@ -243,6 +243,12 @@ pub struct KubernetesComputeConfig {
     /// Only meaningful with `https_proxy` set; the bundle must exist and
     /// contain at least one usable trust anchor.
     pub proxy_ca_bundle: Option<String>,
+    /// Public PEM destination roots for direct, inspected HTTPS egress, independent
+    /// of the corporate proxy. Read only from the trusted gateway filesystem,
+    /// validated there and staged in each immutable supervisor bootstrap Secret.
+    /// The supervisor adds them to system roots and the workload trust bundle.
+    /// Workload driver JSON cannot select or override this trust input.
+    pub additional_ca_bundle: Option<String>,
     pub grpc_endpoint: String,
     /// OTLP/gRPC collector endpoint passed to supervisor pods. The gateway
     /// supplies its own export endpoint; driver TOML cannot set it.
@@ -377,6 +383,7 @@ impl Default for KubernetesComputeConfig {
             proxy_auth_allow_insecure: None,
             proxy_connect_by_hostname: None,
             proxy_ca_bundle: None,
+            additional_ca_bundle: None,
             grpc_endpoint: String::new(),
             supervisor_otlp_endpoint: None,
             supervisor_ocsf_export: None,
@@ -1413,6 +1420,24 @@ mod tests {
             ..KubernetesComputeConfig::default()
         };
         assert!(cfg.validate_upstream_proxy_config().is_ok());
+    }
+
+    #[test]
+    fn additional_ca_bundle_is_optional_and_independent_of_proxy_configuration() {
+        assert!(
+            KubernetesComputeConfig::default()
+                .additional_ca_bundle
+                .is_none()
+        );
+        let config: KubernetesComputeConfig =
+            toml::from_str(r#"additional_ca_bundle = "/etc/openshell/destination-ca/ca.pem""#)
+                .unwrap();
+        assert!(config.https_proxy.is_none());
+        assert!(config.validate_upstream_proxy_config().is_ok());
+        assert_eq!(
+            config.additional_ca_bundle.as_deref(),
+            Some("/etc/openshell/destination-ca/ca.pem")
+        );
     }
 
     #[test]

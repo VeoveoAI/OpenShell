@@ -1100,6 +1100,25 @@ done
 Any `no` result can strand recovery before workload Pod creation. Upgrade the
 OpenShell chart rather than treating missing workload Pods as Pod failures.
 
+#### Private destination CA trust
+
+A CA installed only in the workload image does not establish trust in the
+separately scheduled Kubernetes supervisor. For direct, policy-inspected HTTPS,
+use the trusted driver setting `additional_ca_bundle`, not `proxy_ca_bundle`
+(which requires a corporate proxy). Mount a public PEM bundle into the gateway
+with the chart's existing `server.extraVolumes`/`server.extraVolumeMounts` and
+set `gatewayConfig["openshell.drivers.kubernetes"].additional_ca_bundle` to that
+path. See the published [gateway configuration reference](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration).
+
+Check the configured path, gateway startup validation, and the selected
+generation's supervisor `--additional-ca-bundle` argument. The driver copies
+validated bytes into the existing immutable supervisor bootstrap Secret; do not
+print other keys in that Secret. A new generation reads changed bundle bytes;
+running generations retain their selected roots. The supervisor adds these roots
+to its destination verifier and workload trust, while policy and hostname checks
+remain enforced. Do not diagnose a workload-only CA mount as supervisor trust,
+reuse corporate-proxy settings without a proxy, or disable TLS verification.
+
 #### Corporate upstream proxy
 
 When the deployment routes sandbox egress through a corporate HTTP forward

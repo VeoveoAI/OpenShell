@@ -38,6 +38,8 @@ pub const PROXY_CA_PRIVATE_KEY: &str = "proxy-ca.key";
 /// bundle (`proxy_ca_bundle`). Distinct from [`PROXY_CA_CERTIFICATE_KEY`],
 /// which is the sandbox's own generated TLS-interception CA.
 pub const UPSTREAM_PROXY_CA_BUNDLE_KEY: &str = "upstream-proxy-ca.pem";
+/// Operator-owned roots for inspected destination HTTPS, independent of proxies.
+pub const ADDITIONAL_CA_BUNDLE_KEY: &str = "additional-ca.pem";
 pub const CLIENT_TLS_CA_KEY: &str = "client-ca.crt";
 pub const SANDBOX_BOOTSTRAP_INPUT_PATH: &str = "/.openshell/bootstrap-input";
 pub const BOUNDARY_CONFIG_PATH: &str = "/.openshell/state/bootstrap/boundary.json";
@@ -53,6 +55,7 @@ pub const PROXY_CA_PRIVATE_KEY_PATH: &str = "/.openshell/supervisor/proxy-ca.key
 /// `/.openshell/supervisor` with no `items` filter, so the key appears here
 /// without a dedicated volume or mount.
 pub const UPSTREAM_PROXY_CA_BUNDLE_PATH: &str = "/.openshell/supervisor/upstream-proxy-ca.pem";
+pub const ADDITIONAL_CA_BUNDLE_PATH: &str = "/.openshell/supervisor/additional-ca.pem";
 pub const CLIENT_TLS_CA_PATH: &str = "/.openshell/supervisor/client-ca.crt";
 pub const CONTROL_HEALTH_SOCKET_PATH: &str = "/run/openshell/health.sock";
 /// Kubelet `tcpSocket` readiness port. An exec probe would start a supervisor
@@ -231,6 +234,7 @@ pub fn supervisor_pod(
     proxy_auth_allow_insecure: bool,
     proxy_connect_by_hostname: bool,
     upstream_proxy_ca_bundle_staged: bool,
+    additional_ca_bundle_staged: bool,
     provider_spiffe_socket_path: Option<&str>,
     owner: OwnerReference,
     tracing_environment: &[(&str, String)],
@@ -370,6 +374,12 @@ pub fn supervisor_pod(
         command.extend([
             "--upstream-proxy-ca-bundle".to_string(),
             UPSTREAM_PROXY_CA_BUNDLE_PATH.to_string(),
+        ]);
+    }
+    if additional_ca_bundle_staged {
+        command.extend([
+            "--additional-ca-bundle".to_string(),
+            ADDITIONAL_CA_BUNDLE_PATH.to_string(),
         ]);
     }
     if let Some((secret_name, secret_key)) = proxy_auth_secret {
@@ -538,6 +548,7 @@ pub fn supervisor_bootstrap_secret(
     proxy_ca_certificate: Vec<u8>,
     proxy_ca_private_key: Vec<u8>,
     upstream_proxy_ca_bundle: Option<Vec<u8>>,
+    additional_ca_bundle: Option<Vec<u8>>,
     client_tls: Option<ClientTlsMaterial>,
     owner: OwnerReference,
 ) -> Secret {
@@ -563,6 +574,9 @@ pub fn supervisor_bootstrap_secret(
     // supervisor keys its behavior off the argument, not the file's presence.
     if let Some(bundle) = upstream_proxy_ca_bundle {
         data.insert(UPSTREAM_PROXY_CA_BUNDLE_KEY.to_string(), ByteString(bundle));
+    }
+    if let Some(bundle) = additional_ca_bundle {
+        data.insert(ADDITIONAL_CA_BUNDLE_KEY.to_string(), ByteString(bundle));
     }
     if let Some(tls) = client_tls {
         data.insert(
@@ -798,6 +812,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             None,
+            None,
             Some(ClientTlsMaterial {
                 ca_certificate: b"ca".to_vec(),
             }),
@@ -830,6 +845,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             false,
             false,
             false,
@@ -889,6 +905,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             false,
             false,
             false,
@@ -1015,6 +1032,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             false,
             false,
             false,
@@ -1199,6 +1217,7 @@ mod tests {
             Vec::new(),
             None,
             None,
+            None,
             owner(),
         );
         assert_eq!(
@@ -1234,6 +1253,7 @@ mod tests {
             Vec::new(),
             Some(b"-----BEGIN CERTIFICATE-----\n".to_vec()),
             None,
+            None,
             owner(),
         );
         assert_eq!(staged.immutable, Some(true));
@@ -1249,9 +1269,8 @@ mod tests {
         assert!(staged_data.contains_key(PROXY_CA_CERTIFICATE_KEY));
     }
 
-    /// Render a supervisor Pod configured for an `https://` corporate proxy,
-    /// varying only whether the operator CA bundle was staged.
-    fn supervisor_pod_with_staged_proxy_ca(staged: bool) -> Pod {
+    /// Render operator trust inputs independently, including direct egress.
+    fn supervisor_pod_with_staged_ca_bundles(proxy: bool, additional: bool) -> Pod {
         let names = SandboxRuntimeNames::new("pair");
         supervisor_pod(
             "sandbox",
@@ -1270,12 +1289,13 @@ mod tests {
             "{}",
             "info",
             600,
-            Some("https://proxy.corp.example:3130"),
+            proxy.then_some("https://proxy.corp.example:3130"),
             None,
             None,
             false,
             false,
-            staged,
+            proxy,
+            additional,
             None,
             owner(),
             &[],
@@ -1284,8 +1304,79 @@ mod tests {
     }
 
     #[test]
+    fn additional_ca_bundle_is_staged_only_for_the_supervisor_without_a_proxy() {
+        let names = SandboxRuntimeNames::for_generation("pair", "generation");
+        let pem = b"destination CA bytes".to_vec();
+        let secret = supervisor_bootstrap_secret(
+            "sandbox",
+            &names,
+            "pair",
+            Vec::new(),
+            Vec::new(),
+            b"interception certificate".to_vec(),
+            b"interception private key".to_vec(),
+            None,
+            Some(pem.clone()),
+            None,
+            owner(),
+        );
+        assert_eq!(secret.immutable, Some(true));
+        let data = secret.data.unwrap();
+        assert_eq!(data[ADDITIONAL_CA_BUNDLE_KEY].0, pem);
+        assert!(!data.contains_key(UPSTREAM_PROXY_CA_BUNDLE_KEY));
+        assert_eq!(
+            data[PROXY_CA_CERTIFICATE_KEY].0,
+            b"interception certificate"
+        );
+        let pod = supervisor_pod_with_staged_ca_bundles(false, true);
+        let spec = pod.spec.unwrap();
+        let command = spec.containers[0].command.as_ref().unwrap();
+        assert!(
+            command
+                .windows(2)
+                .any(|pair| pair == ["--additional-ca-bundle", ADDITIONAL_CA_BUNDLE_PATH])
+        );
+        assert!(
+            !command
+                .iter()
+                .any(|arg| arg == "--upstream-proxy" || arg == "--upstream-proxy-ca-bundle")
+        );
+        let mounts = spec.containers[0].volume_mounts.as_ref().unwrap();
+        assert!(
+            mounts
+                .iter()
+                .any(|mount| mount.mount_path == "/.openshell/supervisor"
+                    && mount.read_only == Some(true))
+        );
+        let bare = supervisor_pod_with_staged_ca_bundles(false, false);
+        assert!(
+            !bare.spec.as_ref().unwrap().containers[0]
+                .command
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|arg| arg == "--additional-ca-bundle")
+        );
+        let workload = sandbox_bootstrap_secret(
+            "sandbox",
+            &names,
+            "pair",
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            owner(),
+        );
+        assert!(
+            !workload
+                .data
+                .unwrap()
+                .contains_key(ADDITIONAL_CA_BUNDLE_KEY)
+        );
+    }
+
+    #[test]
     fn supervisor_pod_passes_upstream_proxy_ca_bundle_argument() {
-        let pod = supervisor_pod_with_staged_proxy_ca(true);
+        let pod = supervisor_pod_with_staged_ca_bundles(true, false);
         let spec = pod.spec.as_ref().expect("Pod spec");
         let container = &spec.containers[0];
         let command = container.command.as_ref().expect("supervisor command");
@@ -1301,7 +1392,7 @@ mod tests {
     fn supervisor_pod_omits_the_ca_bundle_argument_when_unstaged() {
         // The supervisor keys its behavior off the argument, so an unstaged
         // bundle must not leave a dangling path on the argv.
-        let pod = supervisor_pod_with_staged_proxy_ca(false);
+        let pod = supervisor_pod_with_staged_ca_bundles(false, false);
         let spec = pod.spec.as_ref().expect("Pod spec");
         let command = spec.containers[0]
             .command
@@ -1321,8 +1412,8 @@ mod tests {
         // mounts every key at /.openshell/supervisor. A new volume here would
         // mean the Secret is being projected with an `items` filter that would
         // silently drop the new key.
-        let staged = supervisor_pod_with_staged_proxy_ca(true);
-        let bare = supervisor_pod_with_staged_proxy_ca(false);
+        let staged = supervisor_pod_with_staged_ca_bundles(true, false);
+        let bare = supervisor_pod_with_staged_ca_bundles(false, false);
         let volume_names = |pod: &Pod| {
             pod.spec
                 .as_ref()

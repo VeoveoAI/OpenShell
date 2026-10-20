@@ -881,6 +881,22 @@ Kubernetes configurations set `namespace`, `service_account_name`, and `enable_u
 
 The gateway runs as a Pod and creates paired workload and supervisor Pods in another namespace. The gateway CA is projected from a Kubernetes Secret into supervisor Pods; user client certificate and key entries in that Secret are not exposed to either Pod.
 
+For private destination CAs, set `additional_ca_bundle` under
+`[openshell.drivers.kubernetes]` to an operator-owned PEM file on the gateway
+filesystem. This is independent of `https_proxy` and `proxy_ca_bundle`. Mount a
+public certificate-only ConfigMap through the chart's existing
+`server.extraVolumes` and `server.extraVolumeMounts`, then set the path through
+`gatewayConfig`. The driver validates the bounded file at startup and reads it
+again for each runtime generation. It stages the bytes in that generation's
+immutable supervisor bootstrap Secret and passes `--additional-ca-bundle`.
+The workload never selects this file or receives the supervisor bootstrap mount.
+The supervisor adds these roots to both its upstream TLS verifier and the
+workload's trust bundle, alongside system roots. Hostname verification and policy
+admission remain required. Trust applies to every admitted destination, so include
+only controlled public roots. A missing, invalid or oversized file fails closed.
+A new generation reads changed file bytes; a running generation retains its
+original trust. No image rebuild is needed to select a new public CA bundle.
+
 ```toml
 [openshell]
 version = 2
@@ -963,6 +979,10 @@ supervisor_image_pull_policy   = "if_not_present"
 # and its TLS stack, so a full merged trust bundle wastes the sandbox
 # boundary's control-frame budget on duplicated roots.
 # proxy_ca_bundle              = "/etc/openshell-tls/proxy-ca/ca.crt"
+# Independent public destination roots for direct, inspected HTTPS egress.
+# Mount this operator-owned PEM file into the gateway with existing Helm
+# server.extraVolumes/extraVolumeMounts. No corporate proxy is required.
+# additional_ca_bundle         = "/etc/openshell/destination-ca/ca.pem"
 # Required in raw gateway TOML because `namespace` identifies sandbox
 # placement, not the gateway Service. Helm renders this from the release's
 # gateway Service name and namespace.
