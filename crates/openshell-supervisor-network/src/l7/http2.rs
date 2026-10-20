@@ -18,7 +18,7 @@ use tokio::task::JoinSet;
 
 use super::provider::{L7Provider, L7Request};
 use super::relay::{L7EvalContext, evaluate_l7_request, prepare_inspected_request};
-use super::{L7EndpointConfig, L7RequestInfo};
+use super::{EndpointObservationSender, L7EndpointConfig, L7RequestInfo};
 use crate::opa::{PolicyGenerationGuard, TunnelPolicyEngine};
 
 const MAX_HEADERS: usize = 16 * 1024;
@@ -274,6 +274,13 @@ async fn exchange(
     engine: Arc<TunnelPolicyEngine>,
     context: Arc<L7EvalContext>,
 ) -> Result<()> {
+    // Capture authority before parsing or credential preparation can await.
+    let observation_context = context
+        .endpoint_observation_tx
+        .as_ref()
+        .filter(|_| context.token_grant_resolver.is_some())
+        .and_then(EndpointObservationSender::capture);
+    let request_id = uuid::Uuid::new_v4().to_string();
     let request_headers = inspected_request(&request).await?;
     if !super::relay::request_authority_matches_endpoint(&request_headers, &context) {
         return Err(miette!(
@@ -306,7 +313,15 @@ async fn exchange(
         return Ok(());
     }
     let (prepared, scoped) = tokio::select! {
-        prepared = prepare_inspected_request(request_headers, &context, &engine, &config, &info) => prepared?,
+        prepared = prepare_inspected_request(
+            request_headers,
+            &context,
+            &engine,
+            &config,
+            &info,
+            &request_id,
+            observation_context.as_ref(),
+        ) => prepared?,
         _ = std::future::poll_fn(|cx| downstream.poll_reset(cx)) => {
             return Err(miette!("HTTP/2 client cancelled before request admission"));
         }
