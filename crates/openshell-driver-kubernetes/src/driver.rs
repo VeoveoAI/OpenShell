@@ -5503,7 +5503,13 @@ fn sandbox_runtime_control_availability_from_pod(pod: &Pod) -> SandboxRuntimeCon
         });
     if ready {
         SandboxRuntimeControlAvailability::Available
-    } else if status.and_then(|status| status.phase.as_deref()) == Some("Running") {
+    } else if matches!(
+        status.and_then(|status| status.phase.as_deref()),
+        Some("Pending" | "Running")
+    ) {
+        // Kubelet may return the admitted Pod to Pending while recreating its
+        // containers after a node restart. Keep its running intent while it
+        // recovers; UID/generation and enforcement-fence checks remain separate.
         SandboxRuntimeControlAvailability::Degraded
     } else {
         SandboxRuntimeControlAvailability::Unavailable
@@ -12631,7 +12637,7 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_runtime_unready_running_supervisor_is_degraded_not_unavailable() {
+    fn sandbox_runtime_recovering_supervisor_is_degraded_not_unavailable() {
         let pod_with = |status: serde_json::Value| Pod {
             status: Some(serde_json::from_value(status).expect("valid Pod status")),
             ..Default::default()
@@ -12646,7 +12652,35 @@ mod tests {
             SandboxRuntimeControlAvailability::Degraded
         );
 
-        for phase in ["Failed", "Succeeded", "Pending"] {
+        let creating = pod_with(serde_json::json!({
+            "phase": "Pending",
+            "conditions": [{"type": "Ready", "status": "False"}],
+            "containerStatuses": [{
+                "name": "supervisor",
+                "image": "supervisor:test",
+                "imageID": "",
+                "ready": false,
+                "restartCount": 1,
+                "state": {"waiting": {"reason": "ContainerCreating"}}
+            }]
+        }));
+        let availability = sandbox_runtime_control_availability_from_pod(&creating);
+        assert_eq!(availability, SandboxRuntimeControlAvailability::Degraded);
+        assert_eq!(
+            combine_sandbox_runtime_control_availability([
+                availability,
+                SandboxRuntimeControlAvailability::Available,
+                SandboxRuntimeControlAvailability::Available,
+                SandboxRuntimeControlAvailability::Available,
+            ]),
+            SandboxRuntimeControlAvailability::Degraded
+        );
+        assert_eq!(
+            sandbox_runtime_readiness_state(availability),
+            Some("unavailable")
+        );
+
+        for phase in ["Failed", "Succeeded", "Unknown"] {
             let pod = pod_with(serde_json::json!({
                 "phase": phase,
                 "conditions": [{"type": "Ready", "status": "False"}]
