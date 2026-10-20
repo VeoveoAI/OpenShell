@@ -159,20 +159,128 @@ fn validate_sandbox_refresh(
     })
 }
 
+fn install_refreshed_credentials(
+    slot: &TokenSlot,
+    response: crate::proto::RefreshSandboxTokenResponse,
+) -> Result<()> {
+    let gateway = validate_gateway_bearer(&response.token)?;
+    #[cfg(feature = "jwt")]
+    {
+        let sandbox = validate_sandbox_refresh(&response).into_diagnostic()?;
+        if let Some(sandbox_slot) = SANDBOX_BEARER_SLOT.get() {
+            sandbox_slot
+                .update(sandbox.token, sandbox.expires_at, sandbox.credential_epoch)
+                .into_diagnostic()?;
+        }
+    }
+    *slot
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = gateway;
+    Ok(())
+}
+
 /// Install the gateway-session credential supplied in trusted supervisor
 /// launch state before any gateway client is constructed.
 #[cfg(feature = "jwt")]
 pub fn install_supervisor_auth_bundle(
     bundle: &crate::jwt::SupervisorAuthBundle,
 ) -> Result<crate::jwt::SessionBearerTokenSlot> {
-    install_token_slot(bundle.gateway_token.expose_secret())?;
-    let _ = TOKEN_REFRESH_MODE.set(RefreshMode::GatewayJwt(TokenSource::File));
     let slot = bundle
         .sandbox_bearer_slot()
         .into_diagnostic()
         .wrap_err("invalid Sandbox Protocol credential")?;
+    let gateway = validate_gateway_bearer(bundle.gateway_token.expose_secret())?;
+    install_validated_token_slot(gateway);
+    let _ = TOKEN_REFRESH_MODE.set(RefreshMode::GatewayJwt(supervisor_token_source()));
     let _ = SANDBOX_BEARER_SLOT.set(slot.clone());
     Ok(SANDBOX_BEARER_SLOT.get().cloned().unwrap_or(slot))
+}
+
+/// The Kubernetes driver declares this input only in the trusted supervisor Pod;
+/// workload environment and ordinary token files do not select this source.
+#[cfg(feature = "jwt")]
+fn supervisor_token_source() -> TokenSource {
+    match std::env::var(sandbox_env::K8S_SA_TOKEN_FILE) {
+        Ok(path) if !path.is_empty() => TokenSource::K8sServiceAccount,
+        _ => TokenSource::File,
+    }
+}
+
+/// Restore both credentials before any gateway or Sandbox Protocol RPC. The
+/// immutable launch bundle can outlive its original JWTs across a Pod restart.
+#[cfg(feature = "jwt")]
+pub async fn prepare_supervisor_auth_bundle(
+    bundle: &crate::jwt::SupervisorAuthBundle,
+    endpoint: Option<&str>,
+) -> Result<crate::jwt::SupervisorAuthBundle> {
+    prepare_supervisor_bundle(bundle, supervisor_token_source(), async {
+        let endpoint = endpoint.ok_or_else(|| {
+            miette::miette!("Kubernetes supervisor bootstrap requires a gateway endpoint")
+        })?;
+        let path = std::env::var(sandbox_env::K8S_SA_TOKEN_FILE)
+            .into_diagnostic()
+            .wrap_err("Kubernetes supervisor bootstrap requires its declared SA token file")?;
+        let channel = build_plain_channel(endpoint).await?;
+        refresh_k8s_sandbox_session(endpoint, &channel, &path).await
+    })
+    .await
+}
+
+#[cfg(feature = "jwt")]
+async fn prepare_supervisor_bundle(
+    bundle: &crate::jwt::SupervisorAuthBundle,
+    source: TokenSource,
+    exchange: impl std::future::Future<Output = Result<crate::proto::RefreshSandboxTokenResponse>>,
+) -> Result<crate::jwt::SupervisorAuthBundle> {
+    let now = now_ms() / 1000;
+    let expired = (bundle.gateway_expires_at > 0 && bundle.gateway_expires_at <= now)
+        || (bundle.sandbox_expires_at > 0 && bundle.sandbox_expires_at <= now);
+    // Fresh launches already have valid credentials and may precede persistence
+    // of the driver's runtime identity required by IssueSandboxToken.
+    if source != TokenSource::K8sServiceAccount || !expired {
+        return Ok(bundle.clone());
+    }
+    let response = exchange.await?;
+    if response.session_id != bundle.runtime_generation.as_str() {
+        return Err(miette::miette!(
+            "Kubernetes supervisor bootstrap returned a different runtime generation"
+        ));
+    }
+    let sandbox = validate_sandbox_refresh(&response).into_diagnostic()?;
+    let _ = validate_gateway_bearer(&response.token)?;
+    let gateway = crate::jwt::SecretJwt::parse(response.token).into_diagnostic()?;
+    let gateway_expires_at = response
+        .expiration_time
+        .as_ref()
+        .map(|time| {
+            crate::time::validate_timestamp(time).into_diagnostic()?;
+            if time.seconds <= now_ms() / 1000 {
+                return Err(miette::miette!(
+                    "Kubernetes supervisor bootstrap returned an expired gateway credential"
+                ));
+            }
+            Ok::<_, miette::Report>(time.seconds)
+        })
+        .transpose()?
+        .unwrap_or(0);
+    if sandbox.credential_epoch < bundle.auth_epoch {
+        return Err(miette::miette!(
+            "Kubernetes supervisor bootstrap returned an older credential epoch"
+        ));
+    }
+    let mut prepared = bundle.clone();
+    prepared.gateway_token = gateway;
+    prepared.gateway_expires_at = gateway_expires_at;
+    prepared.sandbox_token = sandbox.token;
+    prepared.sandbox_expires_at = sandbox.expires_at;
+    prepared.auth_epoch = sandbox.credential_epoch;
+    prepared.validate().into_diagnostic()?;
+    prepared
+        .sandbox_bearer_slot()
+        .into_diagnostic()?
+        .authorization_metadata()
+        .into_diagnostic()?;
+    Ok(prepared)
 }
 
 /// gRPC interceptor that injects `authorization: Bearer <token>` on every
@@ -426,6 +534,24 @@ async fn acquire_k8s_sandbox_token(
     Ok(resp.into_inner().token)
 }
 
+async fn refresh_k8s_sandbox_session(
+    endpoint: &str,
+    plain_channel: &Channel,
+    sa_path: &str,
+) -> Result<crate::proto::RefreshSandboxTokenResponse> {
+    let token = acquire_k8s_sandbox_token(endpoint, plain_channel, sa_path).await?;
+    let bearer = Arc::new(RwLock::new(validate_gateway_bearer(&token)?));
+    let channel = InterceptedService::new(plain_channel.clone(), AuthInterceptor::new(bearer));
+    OpenShellClient::new(channel)
+        .refresh_sandbox_token(RefreshSandboxTokenRequest {
+            extension_service_names: Vec::new(),
+        })
+        .await
+        .map(tonic::Response::into_inner)
+        .map_err(grpc_status_error)
+        .wrap_err("Kubernetes supervisor paired-credential bootstrap failed")
+}
+
 /// Build an authenticated channel for direct external use (e.g. the
 /// long-lived `supervisor_session` control stream).
 pub async fn connect_channel_pub(endpoint: &str) -> Result<AuthedChannel> {
@@ -478,36 +604,9 @@ async fn refresh_token_loop(
             .await
         {
             Ok(resp) => {
-                let response = resp.into_inner();
-                #[cfg(feature = "jwt")]
-                let sandbox_refresh = match validate_sandbox_refresh(&response) {
-                    Ok(refresh) => refresh,
-                    Err(error) => {
-                        warn!(%error, "gateway returned an invalid Sandbox Protocol credential");
-                        continue;
-                    }
-                };
-                let gateway_bearer = match validate_gateway_bearer(&response.token) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        warn!(%error, "refreshed JWT contained invalid header bytes");
-                        continue;
-                    }
-                };
-
-                *slot
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = gateway_bearer;
-                #[cfg(feature = "jwt")]
-                if let Some(sandbox_slot) = SANDBOX_BEARER_SLOT.get()
-                    && let Err(error) = sandbox_slot.update(
-                        sandbox_refresh.token,
-                        sandbox_refresh.expires_at,
-                        sandbox_refresh.credential_epoch,
-                    )
-                    && error != crate::jwt::SessionJwtError::StaleCredentialEpoch
-                {
-                    warn!(%error, "gateway returned an invalid Sandbox Protocol credential");
+                if let Err(error) = install_refreshed_credentials(&slot, resp.into_inner()) {
+                    warn!(%error, "gateway returned invalid paired supervisor credentials");
+                    continue;
                 }
                 info!("renewed gateway and Sandbox Protocol credentials in-place");
             }
@@ -519,24 +618,19 @@ async fn refresh_token_loop(
                         .ok()
                         .filter(|p| !p.is_empty())
                     {
-                        match acquire_k8s_sandbox_token(&endpoint, &plain_channel, &sa_path).await {
-                            Ok(new_token) => {
-                                match AsciiMetadataValue::try_from(format!("Bearer {new_token}")) {
-                                    Ok(value) => {
-                                        if let Ok(mut guard) = slot.write() {
-                                            *guard = value;
-                                            info!(
-                                                "rebootstrapped gateway sandbox JWT after refresh authentication failure"
-                                            );
-                                            continue;
-                                        }
-                                    }
-                                    Err(e) => warn!(
-                                        error = %e,
-                                        "rebootstrapped JWT contained invalid header bytes"
-                                    ),
+                        match refresh_k8s_sandbox_session(&endpoint, &plain_channel, &sa_path).await
+                        {
+                            Ok(response) => match install_refreshed_credentials(&slot, response) {
+                                Ok(()) => {
+                                    info!(
+                                        "rebootstrapped paired supervisor credentials after refresh authentication failure"
+                                    );
+                                    continue;
                                 }
-                            }
+                                Err(error) => {
+                                    warn!(%error, "gateway returned invalid rebootstrap credentials")
+                                }
+                            },
                             Err(e) => warn!(
                                 error = %e,
                                 "K8s ServiceAccount bootstrap retry failed after refresh authentication failure"
@@ -720,6 +814,189 @@ fn parse_jwt_exp_ms(jwt: &str) -> Option<i64> {
 #[cfg(test)]
 mod auth_tests {
     use super::*;
+
+    #[cfg(feature = "jwt")]
+    fn expired_supervisor_bundle() -> crate::jwt::SupervisorAuthBundle {
+        crate::jwt::SupervisorAuthBundle {
+            session_id: crate::SandboxSessionId::new(),
+            runtime_generation: crate::sandbox_generation::SandboxGenerationId::parse(
+                "generation-test",
+            )
+            .unwrap(),
+            session_rotation: crate::jwt::SessionRotation::new(1).unwrap(),
+            auth_epoch: crate::jwt::CredentialEpoch::new(1).unwrap(),
+            gateway_token: crate::jwt::SecretJwt::parse("expired-gateway").unwrap(),
+            gateway_expires_at: 1,
+            sandbox_token: crate::jwt::SecretJwt::parse("expired-sandbox").unwrap(),
+            sandbox_expires_at: 1,
+            ssh_host_private_key: None,
+            ocsf_otlp_headers: None,
+        }
+    }
+
+    #[cfg(feature = "jwt")]
+    #[tokio::test]
+    async fn supervisor_bootstrap_restores_both_expired_credentials_before_use() {
+        let expiry = now_ms() / 1000 + 3600;
+        for (gateway_expiry, sandbox_expiry) in [(1, 1), (1, expiry), (expiry, 1)] {
+            let mut original = expired_supervisor_bundle();
+            original.gateway_expires_at = gateway_expiry;
+            original.sandbox_expires_at = sandbox_expiry;
+            let prepared =
+                prepare_supervisor_bundle(&original, TokenSource::K8sServiceAccount, async {
+                    Ok(crate::proto::RefreshSandboxTokenResponse {
+                        token: "fresh-gateway".into(),
+                        expiration_time: Some(prost_types::Timestamp {
+                            seconds: expiry,
+                            nanos: 0,
+                        }),
+                        sandbox_token: "fresh-sandbox".into(),
+                        sandbox_expiration_time: Some(prost_types::Timestamp {
+                            seconds: expiry,
+                            nanos: 0,
+                        }),
+                        credential_epoch: 2,
+                        session_id: "generation-test".into(),
+                        ..Default::default()
+                    })
+                })
+                .await
+                .unwrap();
+            assert_eq!(prepared.gateway_token.expose_secret(), "fresh-gateway");
+            assert_eq!(prepared.gateway_expires_at, expiry);
+            assert_eq!(prepared.sandbox_expires_at, expiry);
+            assert_eq!(prepared.auth_epoch.get(), 2);
+            assert_eq!(prepared.runtime_generation, original.runtime_generation);
+            assert_eq!(prepared.session_id, original.session_id);
+            assert_eq!(prepared.session_rotation, original.session_rotation);
+            assert_eq!(
+                prepared
+                    .sandbox_bearer_slot()
+                    .unwrap()
+                    .authorization_metadata()
+                    .unwrap(),
+                "Bearer fresh-sandbox"
+            );
+        }
+    }
+
+    #[cfg(feature = "jwt")]
+    #[tokio::test]
+    async fn supervisor_static_bundle_never_uses_service_account_exchange() {
+        for source in [TokenSource::Env, TokenSource::File] {
+            let original = expired_supervisor_bundle();
+            let prepared = prepare_supervisor_bundle(&original, source, async {
+                panic!("static supervisor credentials must not perform an SA exchange")
+            })
+            .await
+            .unwrap();
+            assert_eq!(prepared.gateway_token.expose_secret(), "expired-gateway");
+            assert_eq!(prepared.sandbox_token.expose_secret(), "expired-sandbox");
+            assert_eq!(prepared.auth_epoch, original.auth_epoch);
+        }
+    }
+
+    #[cfg(feature = "jwt")]
+    #[tokio::test]
+    async fn supervisor_fresh_bundle_does_not_race_runtime_identity_persistence() {
+        for expiry in [0, now_ms() / 1000 + 3600] {
+            let mut original = expired_supervisor_bundle();
+            original.gateway_expires_at = expiry;
+            original.sandbox_expires_at = expiry;
+            let prepared =
+                prepare_supervisor_bundle(&original, TokenSource::K8sServiceAccount, async {
+                    panic!("fresh launch must not require the not-yet-persisted runtime binding")
+                })
+                .await
+                .unwrap();
+            assert_eq!(prepared.gateway_expires_at, expiry);
+            assert_eq!(prepared.sandbox_expires_at, expiry);
+            assert_eq!(prepared.auth_epoch, original.auth_epoch);
+        }
+    }
+
+    #[cfg(feature = "jwt")]
+    #[tokio::test]
+    async fn supervisor_bootstrap_rejects_a_different_runtime_generation() {
+        let original = expired_supervisor_bundle();
+        let result = prepare_supervisor_bundle(&original, TokenSource::K8sServiceAccount, async {
+            Ok(crate::proto::RefreshSandboxTokenResponse {
+                token: "fresh-gateway".into(),
+                sandbox_token: "fresh-sandbox".into(),
+                credential_epoch: 2,
+                session_id: "different-generation".into(),
+                ..Default::default()
+            })
+        })
+        .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("different runtime generation")
+        );
+        assert_eq!(original.gateway_token.expose_secret(), "expired-gateway");
+        assert_eq!(original.sandbox_token.expose_secret(), "expired-sandbox");
+    }
+
+    #[cfg(feature = "jwt")]
+    #[tokio::test]
+    async fn supervisor_rejected_bootstrap_keeps_the_original_bundle_unchanged() {
+        let original = expired_supervisor_bundle();
+        let result = prepare_supervisor_bundle(&original, TokenSource::K8sServiceAccount, async {
+            Err(grpc_status_error(tonic::Status::permission_denied(
+                "compute runtime identity does not match the sandbox",
+            )))
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(original.gateway_token.expose_secret(), "expired-gateway");
+        assert_eq!(original.sandbox_token.expose_secret(), "expired-sandbox");
+        assert_eq!(original.auth_epoch.get(), 1);
+    }
+
+    #[cfg(feature = "jwt")]
+    #[tokio::test]
+    async fn supervisor_invalid_paired_bootstrap_never_returns_partial_credentials() {
+        let original = expired_supervisor_bundle();
+        for response in [
+            crate::proto::RefreshSandboxTokenResponse {
+                token: "fresh-gateway".into(),
+                sandbox_token: "".into(),
+                credential_epoch: 2,
+                session_id: "generation-test".into(),
+                ..Default::default()
+            },
+            crate::proto::RefreshSandboxTokenResponse {
+                token: "invalid gateway".into(),
+                sandbox_token: "fresh-sandbox".into(),
+                credential_epoch: 2,
+                session_id: "generation-test".into(),
+                ..Default::default()
+            },
+            crate::proto::RefreshSandboxTokenResponse {
+                token: "fresh-gateway".into(),
+                sandbox_token: "expired-sandbox".into(),
+                sandbox_expiration_time: Some(prost_types::Timestamp {
+                    seconds: 1,
+                    nanos: 0,
+                }),
+                credential_epoch: 2,
+                session_id: "generation-test".into(),
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                prepare_supervisor_bundle(&original, TokenSource::K8sServiceAccount, async {
+                    Ok(response)
+                })
+                .await
+                .is_err()
+            );
+            assert_eq!(original.gateway_token.expose_secret(), "expired-gateway");
+            assert_eq!(original.sandbox_token.expose_secret(), "expired-sandbox");
+        }
+    }
 
     #[cfg(feature = "jwt")]
     #[test]
