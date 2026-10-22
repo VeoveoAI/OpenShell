@@ -17,6 +17,7 @@ use hyper_util::{
     service::TowerToHyperService,
 };
 use metrics::{counter, histogram};
+use openshell_core::config::ServiceRoutingConfig;
 use openshell_core::proto::open_shell_server::OpenShellServer;
 use openshell_core::{
     Config,
@@ -323,7 +324,8 @@ impl MultiplexService {
         let grpc_service = request_id_middleware!(grpc_service);
         let http_service = request_id_middleware!(http_service);
 
-        let service = MultiplexedService::new(grpc_service, http_service);
+        let service = MultiplexedService::new(grpc_service, http_service)
+            .with_service_routing(self.state.config.service_routing.clone());
 
         let mut builder = Builder::new(TokioExecutor::new());
         // Server-side HTTP/2 keepalive: supervisors hold long-lived sessions, and without
@@ -1263,13 +1265,26 @@ where
 pub struct MultiplexedService<G, H> {
     grpc: G,
     http: H,
+    service_routing: Option<ServiceRoutingConfig>,
 }
 
 impl<G, H> MultiplexedService<G, H> {
     /// Create a new multiplexed service from gRPC and HTTP services.
     #[must_use]
     pub fn new(grpc: G, http: H) -> Self {
-        Self { grpc, http }
+        Self {
+            grpc,
+            http,
+            service_routing: None,
+        }
+    }
+
+    /// Send requests for sandbox service hosts to the HTTP service even when they
+    /// carry gRPC, so a sandbox can serve gRPC through its service endpoint.
+    #[must_use]
+    pub fn with_service_routing(mut self, config: ServiceRoutingConfig) -> Self {
+        self.service_routing = Some(config);
+        self
     }
 }
 
@@ -1291,10 +1306,15 @@ where
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn call(&self, req: Request<Incoming>) -> Self::Future {
-        let is_grpc = req
-            .headers()
-            .get("content-type")
-            .is_some_and(|v| v.as_bytes().starts_with(b"application/grpc"));
+        let is_sandbox_service = self
+            .service_routing
+            .as_ref()
+            .is_some_and(|config| crate::service_routing::is_sandbox_service_request(&req, config));
+        let is_grpc = !is_sandbox_service
+            && req
+                .headers()
+                .get("content-type")
+                .is_some_and(|v| v.as_bytes().starts_with(b"application/grpc"));
 
         if is_grpc {
             let method = grpc_method_from_path(req.uri().path());
@@ -2801,6 +2821,71 @@ mod tests {
         }
 
         assert_eq!(*calls.lock().unwrap(), vec!["openshell", "reflection"]);
+    }
+
+    #[tokio::test]
+    async fn grpc_for_a_sandbox_service_host_goes_to_service_routing() {
+        async fn route_for(addr: std::net::SocketAddr, host: &str) -> String {
+            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                .await
+                .unwrap();
+            tokio::spawn(conn);
+            let response = sender
+                .send_request(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/pkg.Service/Method")
+                        .header("host", host)
+                        .header("content-type", "application/grpc")
+                        .body(Empty::<Bytes>::new())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            response.headers()["x-route"].to_str().unwrap().to_string()
+        }
+
+        let grpc = tower::service_fn(|_request: Request<BoxBody>| async {
+            Ok::<_, Infallible>(
+                Response::builder()
+                    .header("x-route", "grpc")
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
+            )
+        });
+        let http = tower::service_fn(|_request: Request<BoxBody>| async {
+            Ok::<_, Infallible>(
+                Response::builder()
+                    .header("x-route", "http")
+                    .body(Full::new(Bytes::new()))
+                    .unwrap(),
+            )
+        });
+        let config = ServiceRoutingConfig {
+            base_domains: vec!["openshell.localhost".to_string()],
+            ..ServiceRoutingConfig::default()
+        };
+        let service = MultiplexedService::new(grpc, http).with_service_routing(config);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let service = service.clone();
+                tokio::spawn(async move {
+                    let _ = Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+
+        assert_eq!(
+            route_for(addr, "ws--sandbox--grpc.openshell.localhost:8080").await,
+            "http"
+        );
+        assert_eq!(route_for(addr, "127.0.0.1:8080").await, "grpc");
     }
 
     #[tokio::test]

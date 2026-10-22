@@ -52,6 +52,8 @@ Custom HTTPS service domains use the gateway server SAN configuration. Add a wil
 
 For remote or non-loopback gateways, browser service URLs remain HTTPS and require normal gateway authentication.
 
+Service URLs also carry gRPC. A gRPC request addressed to a sandbox service hostname reaches the service over HTTP/2, including streaming calls, rather than the gateway's own API. The service must accept cleartext HTTP/2 on its loopback port. To pass the caller's bearer token through to the service, expose it with `--authorization-mode bearer-passthrough`.
+
 ## Register an Existing Gateway
 
 Use `openshell gateway add` to register any reachable gateway endpoint so the CLI can target it.

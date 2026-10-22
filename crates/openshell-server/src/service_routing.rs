@@ -8,7 +8,7 @@ use axum::{
     response::{IntoResponse, Response as AxumResponse},
 };
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, header};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use openshell_core::ObjectId;
 use openshell_core::config::ServiceRoutingConfig;
 use openshell_core::proto::{
@@ -444,6 +444,21 @@ async fn proxy_to_endpoint(
         return Err(err);
     }
 
+    // gRPC needs HTTP/2 end to end, including trailers, so it gets its own
+    // HTTP/2 connection through the relay instead of the pooled HTTP/1.1 path.
+    if is_grpc_request(&req) {
+        let upstream = build_upstream_grpc_request(req, target_port, authorization_mode)?;
+        let mut sender = open_upstream_http2(&state, &sandbox, &endpoint, target_port).await?;
+        let response = sender.send_request(upstream).await.map_err(|err| {
+            warn!(error = %err, "sandbox service routing: upstream gRPC request failed");
+            let route_err = ServiceRouteError::service_unreachable();
+            emit_service_relay_failure(&endpoint, target_port, route_err.reason);
+            route_err
+        })?;
+        let (parts, body) = response.into_parts();
+        return Ok(Response::from_parts(parts, Body::new(body)));
+    }
+
     let websocket_upgrade = is_websocket_upgrade(&req);
     let downstream_upgrade = websocket_upgrade.then(|| hyper::upgrade::on(&mut req));
 
@@ -539,6 +554,72 @@ async fn open_upstream(
     target_port: u16,
     websocket_upgrade: bool,
 ) -> Result<UpstreamSender, ServiceRouteError> {
+    let relay = open_relay(state, sandbox, endpoint, target_port).await?;
+
+    let (sender, conn) = hyper::client::conn::http1::Builder::new()
+        .handshake(TokioIo::new(relay))
+        .await
+        .map_err(|err| {
+            warn!(error = %err, "sandbox service routing: failed to start upstream HTTP client");
+            let route_err = ServiceRouteError::service_unreachable();
+            emit_service_relay_failure(endpoint, target_port, route_err.reason);
+            route_err
+        })?;
+
+    if websocket_upgrade {
+        tokio::spawn(async move {
+            if let Err(err) = conn.with_upgrades().await {
+                warn!(error = %err, "sandbox service routing: upstream WebSocket connection failed");
+            }
+        });
+    } else {
+        tokio::spawn(async move {
+            if let Err(err) = conn.await {
+                warn!(error = %err, "sandbox service routing: upstream HTTP connection failed");
+            }
+        });
+    }
+
+    Ok(sender)
+}
+
+/// An HTTP/2 connection through the relay, for gRPC to the sandbox service.
+async fn open_upstream_http2(
+    state: &Arc<ServerState>,
+    sandbox: &Sandbox,
+    endpoint: &ServiceEndpoint,
+    target_port: u16,
+) -> Result<hyper::client::conn::http2::SendRequest<Body>, ServiceRouteError> {
+    let relay = open_relay(state, sandbox, endpoint, target_port).await?;
+
+    let (sender, conn) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
+        .handshake(TokioIo::new(relay))
+        .await
+        .map_err(|err| {
+            warn!(error = %err, "sandbox service routing: failed to start upstream HTTP/2 client");
+            let route_err = ServiceRouteError::service_unreachable();
+            emit_service_relay_failure(endpoint, target_port, route_err.reason);
+            route_err
+        })?;
+
+    tokio::spawn(async move {
+        if let Err(err) = conn.await {
+            warn!(error = %err, "sandbox service routing: upstream HTTP/2 connection failed");
+        }
+    });
+
+    Ok(sender)
+}
+
+async fn open_relay(
+    state: &Arc<ServerState>,
+    sandbox: &Sandbox,
+    endpoint: &ServiceEndpoint,
+    target_port: u16,
+) -> Result<
+    impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    ServiceRouteError,
+> {
     let (_channel_id, relay_rx) = crate::supervisor_session::open_routed_relay_with_target(
         state,
         sandbox.object_id(),
@@ -576,31 +657,7 @@ async fn open_upstream(
             route_err
         })?;
 
-    let (sender, conn) = hyper::client::conn::http1::Builder::new()
-        .handshake(TokioIo::new(relay))
-        .await
-        .map_err(|err| {
-            warn!(error = %err, "sandbox service routing: failed to start upstream HTTP client");
-            let route_err = ServiceRouteError::service_unreachable();
-            emit_service_relay_failure(endpoint, target_port, route_err.reason);
-            route_err
-        })?;
-
-    if websocket_upgrade {
-        tokio::spawn(async move {
-            if let Err(err) = conn.with_upgrades().await {
-                warn!(error = %err, "sandbox service routing: upstream WebSocket connection failed");
-            }
-        });
-    } else {
-        tokio::spawn(async move {
-            if let Err(err) = conn.await {
-                warn!(error = %err, "sandbox service routing: upstream HTTP connection failed");
-            }
-        });
-    }
-
-    Ok(sender)
+    Ok(relay)
 }
 
 async fn load_endpoint(
@@ -680,6 +737,42 @@ fn build_upstream_request(
     builder
         .body(body)
         .map_err(|_| ServiceRouteError::internal_error())
+}
+
+fn is_grpc_request<B>(req: &Request<B>) -> bool {
+    req.headers()
+        .get(header::CONTENT_TYPE)
+        .is_some_and(|value| value.as_bytes().starts_with(b"application/grpc"))
+}
+
+/// The upstream form of a gRPC request: HTTP/2 with an absolute URI for the
+/// sandbox listener, keeping `te: trailers`, which gRPC requires.
+fn build_upstream_grpc_request(
+    req: Request<Body>,
+    target_port: u16,
+    authorization_mode: ServiceAuthorizationMode,
+) -> Result<Request<Body>, ServiceRouteError> {
+    let te_trailers = req
+        .headers()
+        .get(header::TE)
+        .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"trailers"));
+    let mut upstream = build_upstream_request(req, target_port, false, authorization_mode)?;
+    let path = upstream
+        .uri()
+        .path_and_query()
+        .map_or("/", |path| path.as_str())
+        .to_string();
+    *upstream.uri_mut() = format!("http://127.0.0.1:{target_port}{path}")
+        .parse()
+        .map_err(|_| ServiceRouteError::invalid_request())?;
+    *upstream.version_mut() = http::Version::HTTP_2;
+    upstream.headers_mut().remove(header::HOST);
+    if te_trailers {
+        upstream
+            .headers_mut()
+            .insert(header::TE, HeaderValue::from_static("trailers"));
+    }
+    Ok(upstream)
 }
 
 fn upstream_uri_path(req: &Request<Body>) -> Result<&str, ServiceRouteError> {
@@ -1412,6 +1505,44 @@ mod tests {
             "theme=dark; app=session"
         );
         assert_eq!(upstream.headers()["x-app-header"], "kept");
+    }
+
+    #[test]
+    fn grpc_upstream_request_is_http2_and_keeps_trailers() {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("https://my-sandbox--grpc.dev.openshell.localhost/pkg.Service/Method?x=1")
+            .version(http::Version::HTTP_2)
+            .header(header::CONTENT_TYPE, "application/grpc")
+            .header(header::TE, "trailers")
+            .header(header::AUTHORIZATION, "Bearer gateway-token")
+            .header("x-app-header", "kept")
+            .body(Body::empty())
+            .unwrap();
+
+        assert!(is_grpc_request(&request));
+        let upstream =
+            build_upstream_grpc_request(request, 9090, ServiceAuthorizationMode::Strip).unwrap();
+
+        assert_eq!(upstream.version(), http::Version::HTTP_2);
+        assert_eq!(
+            upstream.uri(),
+            "http://127.0.0.1:9090/pkg.Service/Method?x=1"
+        );
+        assert_eq!(upstream.headers()[header::TE], "trailers");
+        assert!(!upstream.headers().contains_key(header::HOST));
+        assert!(!upstream.headers().contains_key(header::AUTHORIZATION));
+        assert_eq!(upstream.headers()["x-app-header"], "kept");
+    }
+
+    #[test]
+    fn plain_http_request_is_not_grpc() {
+        let request = Request::builder()
+            .uri("https://my-sandbox--web.dev.openshell.localhost/")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!is_grpc_request(&request));
     }
 
     #[test]
