@@ -2537,9 +2537,9 @@ impl KubernetesComputeDriver {
             let owner = position(WORKSPACE_OWNER_CONTAINER_NAME)
                 .filter(|owner| *owner < seed)
                 .ok_or_else(|| fail("workspace owner init container must run before the seed"))?;
-            check_workspace_owner(&init_containers[owner], uid, gid).map_err(|reason| {
-                fail(&format!("workspace owner init container changed: {reason}"))
-            })?;
+            check_workspace_owner(&init_containers[owner], bootstrap, uid, gid).map_err(
+                |reason| fail(&format!("workspace owner init container changed: {reason}")),
+            )?;
         } else if position(WORKSPACE_OWNER_CONTAINER_NAME).is_some() {
             return Err(fail(
                 "workspace owner init container without a workspace seed",
@@ -5386,15 +5386,22 @@ fn runtime_pod_owner(name: &str, uid: &str) -> OwnerReference {
     }
 }
 
-/// Whether `container` is exactly the workspace owner step for `uid:gid`: root in the
-/// sandbox group with only `CHOWN` and `FOWNER`, no privilege escalation, a read-only
-/// root filesystem, the staged runtime's `own-workspace` and only the workspace and
-/// the read-only runtime mounted.
+/// Whether `container` is exactly the workspace owner step for `uid:gid`: the
+/// bootstrap's sandbox runtime image and pull policy, root in the sandbox group with
+/// only `CHOWN` and `FOWNER`, no privilege escalation, a read-only root filesystem,
+/// that image's own `openshell-sandbox own-workspace` and only the workspace mounted.
 fn check_workspace_owner(
     container: &k8s_openapi::api::core::v1::Container,
+    bootstrap: &k8s_openapi::api::core::v1::Container,
     uid: u32,
     gid: u32,
 ) -> Result<(), &'static str> {
+    if container.image.is_none()
+        || container.image != bootstrap.image
+        || container.image_pull_policy != bootstrap.image_pull_policy
+    {
+        return Err("image");
+    }
     let context = container
         .security_context
         .as_ref()
@@ -5419,7 +5426,7 @@ fn check_workspace_owner(
         return Err("security context");
     }
     let command = [
-        format!("{SANDBOX_RUNTIME_MOUNT_PATH}/openshell-sandbox"),
+        SANDBOX_RUNTIME_IMAGE_BINARY.to_string(),
         "own-workspace".to_string(),
         uid.to_string(),
         gid.to_string(),
@@ -5440,13 +5447,7 @@ fn check_workspace_owner(
             && mount.sub_path.is_none()
             && mount.sub_path_expr.is_none()
     });
-    let runtime = mounts.iter().any(|mount| {
-        mount.name == SANDBOX_RUNTIME_VOLUME_NAME
-            && mount.mount_path == SANDBOX_RUNTIME_MOUNT_PATH
-            && mount.read_only == Some(true)
-            && mount.sub_path.is_none()
-    });
-    if mounts.len() != 2 || !workspace || !runtime {
+    if mounts.len() != 1 || !workspace {
         return Err("mounts");
     }
     if container
@@ -6475,6 +6476,9 @@ const SANDBOX_POD_IDENTITY_VOLUME_NAME: &str = "openshell-pod-identity";
 // Reserve the entire control tree, including future runtime/bootstrap paths.
 const SANDBOX_CONTROL_ROOT: &str = "/.openshell";
 const SANDBOX_RUNTIME_MOUNT_PATH: &str = "/.openshell/runtime";
+/// The sandbox runtime binary inside the sandbox runtime image, root-owned and mode
+/// `0555`. The bootstrap stages a copy owned by the sandbox user for the workload.
+const SANDBOX_RUNTIME_IMAGE_BINARY: &str = "/openshell-sandbox";
 const SANDBOX_STATE_MOUNT_PATH: &str = "/.openshell/state";
 const SANDBOX_POD_IDENTITY_MOUNT_PATH: &str = "/.openshell/pod-identity";
 const SANDBOX_POD_UID_PATH: &str = "/.openshell/pod-identity/uid";
@@ -6501,7 +6505,7 @@ fn sandbox_bootstrap_init_container(
     let mut bootstrap = serde_json::json!({
         "name": SANDBOX_BOOTSTRAP_CONTAINER_NAME,
         "image": image,
-        "command": ["/openshell-sandbox", "bootstrap"],
+        "command": [SANDBOX_RUNTIME_IMAGE_BINARY, "bootstrap"],
         "securityContext": {
             "runAsUser": uid,
             "runAsGroup": gid,
@@ -6733,8 +6737,10 @@ fn apply_supervisor_sandbox_runtime_boundary(
 
 /// Render the init container that sets the workspace PVC root, alone, to the sandbox
 /// user and group with mode `2770`. It runs as root in the sandbox group with only
-/// `CHOWN` and `FOWNER`, from the staged runtime binary, before the non-root seed;
-/// once the root is owned it changes nothing.
+/// `CHOWN` and `FOWNER`, before the non-root seed; once the root is owned it changes
+/// nothing. It runs the sandbox runtime image's own binary, which root owns, rather
+/// than the bootstrap's staged copy: that copy belongs to the sandbox user with no
+/// group or other access, and without `DAC_OVERRIDE` root may not execute it.
 fn workspace_owner_init_container(
     image: &serde_json::Value,
     image_pull_policy: Option<&serde_json::Value>,
@@ -6745,7 +6751,7 @@ fn workspace_owner_init_container(
         "name": WORKSPACE_OWNER_CONTAINER_NAME,
         "image": image,
         "command": [
-            format!("{SANDBOX_RUNTIME_MOUNT_PATH}/openshell-sandbox"),
+            SANDBOX_RUNTIME_IMAGE_BINARY,
             "own-workspace",
             uid.to_string(),
             gid.to_string()
@@ -6759,8 +6765,7 @@ fn workspace_owner_init_container(
             "capabilities": {"drop": ["ALL"], "add": WORKSPACE_OWNER_CAPABILITIES}
         },
         "volumeMounts": [
-            {"name": WORKSPACE_VOLUME_NAME, "mountPath": WORKSPACE_INIT_MOUNT_PATH},
-            {"name": SANDBOX_RUNTIME_VOLUME_NAME, "mountPath": SANDBOX_RUNTIME_MOUNT_PATH, "readOnly": true}
+            {"name": WORKSPACE_VOLUME_NAME, "mountPath": WORKSPACE_INIT_MOUNT_PATH}
         ]
     });
     if let Some(policy) = image_pull_policy {
@@ -6769,9 +6774,12 @@ fn workspace_owner_init_container(
     owner
 }
 
-/// Render the workspace owner step into stored init containers, just before the
-/// workspace seed, from the seed's image. A new runtime generation of a sandbox
-/// created before the step existed gets it, and a stale one is replaced.
+/// Render the workspace owner step into init containers, just before the workspace
+/// seed, from the bootstrap's sandbox runtime image and pull policy. A new pod, and a
+/// new runtime generation of a sandbox stored before the step existed or before its
+/// runtime image changed, get it; a stale one is replaced. Without a seed, or without
+/// the bootstrap whose image it runs, there is no step, and the workload pod
+/// validation refuses a seed without one.
 fn ensure_workspace_owner_init_container(
     init_containers: &mut Vec<serde_json::Value>,
     uid: u32,
@@ -6784,9 +6792,15 @@ fn ensure_workspace_owner_init_container(
     else {
         return;
     };
+    let Some(bootstrap) = init_containers
+        .iter()
+        .find(|container| container["name"] == SANDBOX_BOOTSTRAP_CONTAINER_NAME)
+    else {
+        return;
+    };
     let owner = workspace_owner_init_container(
-        &init_containers[seed]["image"],
-        init_containers[seed].get("imagePullPolicy"),
+        &bootstrap["image"],
+        bootstrap.get("imagePullPolicy"),
         uid,
         gid,
     );
@@ -6895,16 +6909,6 @@ fn apply_workspace_persistence(
              fi"
         );
 
-        if let Some((uid, gid)) = workspace_owner {
-            let pull_policy =
-                image_pull_policy.map(|policy| serde_json::json!(policy.as_kubernetes_str()));
-            init_containers.push(workspace_owner_init_container(
-                &serde_json::json!(image),
-                pull_policy.as_ref(),
-                uid,
-                gid,
-            ));
-        }
         let mut init_spec = if let Some((uid, gid)) = workspace_owner {
             serde_json::json!({
                 "name": WORKSPACE_INIT_CONTAINER_NAME,
@@ -6939,6 +6943,9 @@ fn apply_workspace_persistence(
             init_spec["imagePullPolicy"] = serde_json::json!(policy.as_kubernetes_str());
         }
         init_containers.push(init_spec);
+        if let Some((uid, gid)) = workspace_owner {
+            ensure_workspace_owner_init_container(init_containers, uid, gid);
+        }
     }
 }
 
@@ -11350,15 +11357,24 @@ mod tests {
                 WORKSPACE_OWNER_CONTAINER_NAME,
                 WORKSPACE_INIT_CONTAINER_NAME
             ],
-            "the owner step runs after the runtime is staged and before the seed"
+            "the owner step runs before the seed"
         );
-        let owner: k8s_openapi::api::core::v1::Container =
-            serde_json::from_value(pod_template["spec"]["initContainers"][1].clone()).unwrap();
-        check_workspace_owner(&owner, 1500, 1500).unwrap();
+        // The owner step execs the runtime image's own root-owned binary, not the
+        // workload image or the staged copy, which root may not execute.
+        let owner = &pod_template["spec"]["initContainers"][1];
+        assert_eq!(owner["image"], "sandbox-runtime-image:latest");
+        assert_eq!(owner["imagePullPolicy"], "Never");
         assert_eq!(
-            pod_template["spec"]["initContainers"][1]["imagePullPolicy"],
-            "Always"
+            owner["command"],
+            serde_json::json!(["/openshell-sandbox", "own-workspace", "1500", "1500"])
         );
+        check_workspace_owner(
+            &container(owner.clone()),
+            &container(sandbox_bootstrap.clone()),
+            1500,
+            1500,
+        )
+        .unwrap();
         assert_eq!(
             workspace_init["securityContext"]["capabilities"],
             serde_json::json!({"drop": ["ALL"]})
@@ -13327,9 +13343,20 @@ mod tests {
     /// One change to a rendered container.
     type ContainerEdit = fn(&mut serde_json::Value);
 
+    const RUNTIME_IMAGE: &str = "sandbox-runtime:0.1.3";
+
+    fn runtime_bootstrap(image: &str) -> serde_json::Value {
+        sandbox_bootstrap_init_container(
+            image,
+            Some(crate::KubernetesImagePullPolicy::IfNotPresent),
+            1500,
+            1600,
+        )
+    }
+
     fn workspace_owner(uid: u32, gid: u32) -> serde_json::Value {
         workspace_owner_init_container(
-            &serde_json::json!("sandbox:latest"),
+            &serde_json::json!(RUNTIME_IMAGE),
             Some(&serde_json::json!("IfNotPresent")),
             uid,
             gid,
@@ -13341,8 +13368,9 @@ mod tests {
     }
 
     #[test]
-    fn workspace_owner_runs_as_root_with_only_chown_and_fowner() {
+    fn workspace_owner_runs_the_runtime_images_binary_as_root_with_only_chown_and_fowner() {
         let owner = workspace_owner(1500, 1600);
+        let bootstrap = runtime_bootstrap(RUNTIME_IMAGE);
         assert_eq!(
             owner["securityContext"],
             serde_json::json!({
@@ -13354,27 +13382,40 @@ mod tests {
                 "capabilities": {"drop": ["ALL"], "add": ["CHOWN", "FOWNER"]}
             })
         );
+        // The runtime image's binary, the one the bootstrap itself runs, not the
+        // staged copy under the runtime mount.
+        assert_eq!(owner["image"], bootstrap["image"]);
+        assert_eq!(owner["imagePullPolicy"], bootstrap["imagePullPolicy"]);
+        assert_eq!(owner["command"][0], bootstrap["command"][0]);
         assert_eq!(
             owner["command"],
+            serde_json::json!(["/openshell-sandbox", "own-workspace", "1500", "1600"])
+        );
+        assert_eq!(
+            owner["volumeMounts"],
             serde_json::json!([
-                format!("{SANDBOX_RUNTIME_MOUNT_PATH}/openshell-sandbox"),
-                "own-workspace",
-                "1500",
-                "1600"
+                {"name": WORKSPACE_VOLUME_NAME, "mountPath": WORKSPACE_INIT_MOUNT_PATH}
             ])
         );
-        check_workspace_owner(&container(owner.clone()), 1500, 1600).unwrap();
+        let bootstrap = container(bootstrap);
+        check_workspace_owner(&container(owner.clone()), &bootstrap, 1500, 1600).unwrap();
         assert!(
-            check_workspace_owner(&container(owner.clone()), 1501, 1600).is_err(),
+            check_workspace_owner(&container(owner.clone()), &bootstrap, 1501, 1600).is_err(),
             "another sandbox user's owner step is refused"
         );
 
         let changed = |edit: fn(&mut serde_json::Value)| {
             let mut changed = owner.clone();
             edit(&mut changed);
-            check_workspace_owner(&container(changed), 1500, 1600)
+            check_workspace_owner(&container(changed), &bootstrap, 1500, 1600)
         };
-        let edits: [(&str, ContainerEdit); 12] = [
+        let edits: [(&str, ContainerEdit); 15] = [
+            ("image", |c| {
+                c["image"] = serde_json::json!("workload:latest");
+            }),
+            ("image", |c| {
+                c["imagePullPolicy"] = serde_json::json!("Always");
+            }),
             ("security context", |c| {
                 c["securityContext"]["capabilities"]["add"] =
                     serde_json::json!(["CHOWN", "FOWNER", "DAC_OVERRIDE"]);
@@ -13401,10 +13442,21 @@ mod tests {
                 c["command"] = serde_json::json!(["/bin/sh", "-c", "chown -R 0 /mnt"]);
             }),
             ("command", |c| {
+                c["command"][0] =
+                    serde_json::json!(format!("{SANDBOX_RUNTIME_MOUNT_PATH}/openshell-sandbox"));
+            }),
+            ("command", |c| {
                 c["args"] = serde_json::json!(["--recursive"]);
             }),
             ("mounts", |c| {
-                c["volumeMounts"][1]["readOnly"] = serde_json::json!(false);
+                c["volumeMounts"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!({
+                        "name": SANDBOX_RUNTIME_VOLUME_NAME,
+                        "mountPath": SANDBOX_RUNTIME_MOUNT_PATH,
+                        "readOnly": true
+                    }));
             }),
             ("mounts", |c| {
                 c["volumeMounts"][0]["subPath"] = serde_json::json!("home");
@@ -13423,13 +13475,14 @@ mod tests {
 
     #[test]
     fn a_new_generation_runs_the_workspace_owner_before_the_seed() {
-        let bootstrap = serde_json::json!({"name": SANDBOX_BOOTSTRAP_CONTAINER_NAME});
+        let bootstrap = runtime_bootstrap(RUNTIME_IMAGE);
         let seed = serde_json::json!({
             "name": WORKSPACE_INIT_CONTAINER_NAME,
-            "image": "sandbox:latest",
-            "imagePullPolicy": "IfNotPresent"
+            "image": "workload:latest",
+            "imagePullPolicy": "Always"
         });
-        // A sandbox stored before the owner step existed gets it.
+        // A sandbox stored before the owner step existed gets it, from the runtime
+        // image rather than the seed's workload image.
         let mut stored = vec![bootstrap.clone(), seed.clone()];
         ensure_workspace_owner_init_container(&mut stored, 1500, 1600);
         assert_eq!(
@@ -13441,8 +13494,22 @@ mod tests {
         ensure_workspace_owner_init_container(&mut stale, 1500, 1600);
         assert_eq!(
             stale,
-            vec![bootstrap.clone(), workspace_owner(1500, 1600), seed]
+            vec![bootstrap.clone(), workspace_owner(1500, 1600), seed.clone()]
         );
+        // A restart onto a new runtime image runs the owner step from that image.
+        let mut upgraded = stale;
+        replace_sandbox_bootstrap_init_container(
+            &mut upgraded,
+            runtime_bootstrap("sandbox-runtime:0.1.4"),
+        )
+        .unwrap();
+        ensure_workspace_owner_init_container(&mut upgraded, 1500, 1600);
+        assert_eq!(upgraded[1]["image"], "sandbox-runtime:0.1.4");
+        // Without the bootstrap there is no runtime image to run, and no step; the
+        // workload validation refuses the seed without it.
+        let mut unbooted = vec![seed.clone()];
+        ensure_workspace_owner_init_container(&mut unbooted, 1500, 1600);
+        assert_eq!(unbooted, vec![seed]);
         // Without a workspace seed there is nothing to own.
         let mut custom = vec![bootstrap.clone(), workspace_owner(1500, 1600)];
         ensure_workspace_owner_init_container(&mut custom, 1500, 1600);
