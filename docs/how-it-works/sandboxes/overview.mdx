@@ -1097,6 +1097,14 @@ show the attempt number and next deadline. Inspect them with
 an explicit later start resets the restart count. Compute runtimes do not
 apply their own restart policy.
 
+`status.last_activity_time` is the latest time the sandbox made allowed
+outbound network traffic: a proxied connection opening or an inspected request.
+Denied attempts do not count, a long-lived connection counts once when it opens,
+and traffic into the sandbox through forwards or services does not count. The
+gateway records it at most once a minute and keeps it across gateway restarts;
+it is absent until the first recorded activity. Use it to tell how long a
+sandbox has been idle, for example to delete idle sandboxes.
+
 ## Sandbox Runtimes
 
 The gateway's configured compute driver determines how OpenShell creates each sandbox. The CLI workflow stays the same across drivers: you create, connect to, inspect, and delete sandboxes through the gateway API.

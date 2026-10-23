@@ -159,10 +159,13 @@ mod tests {
     // DeleteSandboxRequest.keep_workspace is public only; the durable
     // SandboxStatus.delete_keeps_workspace decodes false from older rows, which
     // is the ordinary delete.
+    // SandboxStatus.last_activity_time is a gateway-owned durable timestamp.
+    // Older rows decode it absent, which reads as no recorded activity, and
+    // the next activity report records it without a rewrite.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "225dcc03232d76f9f0dedaf97c293ff969324bafd6a3338aee6cea222994a9c8";
+        "c9c612695b454a8980cd8c66e5b47adacebe4d0c6a1efd6fa69bc696dc3aafc3";
     const DURABLE_SCHEMA_SHA256: &str =
-        "937ff3aef6244627d6485bf101b68d8a04db3c0a8a02c3ea761aa7a1dd30ff80";
+        "93e162ecd86f97f06bfad878c843eaa3e353ded3ecddbb9e6bc6ac45dabcb9f1";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "ac1ffc4b5b81467de27270a4e33f6db1e31eeb2c52f79750dbaaf19515eadbb2";
     // Encoded with the schema that omitted stable_placeholder. Keep these

@@ -1228,6 +1228,13 @@ message SandboxStatus {
   // Set with the Deleting phase when the delete keeps the workspace volume, so
   // that a reasserted delete of this sandbox keeps it too.
   bool delete_keeps_workspace = 18;
+  // Latest time the gateway recorded allowed network traffic from the
+  // sandbox: a proxied connection opening or an L7 request, as reported by the
+  // supervisor's periodic activity summaries. Denied attempts do not count. A
+  // long-lived connection counts once, when it opens. The gateway records it
+  // at most once a minute and keeps it across restarts; absent until the
+  // first recorded activity.
+  google.protobuf.Timestamp last_activity_time = 19;
 }
 
 // User-facing sandbox condition derived from platform or gateway observations.

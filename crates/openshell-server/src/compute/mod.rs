@@ -7185,6 +7185,7 @@ fn public_status_from_driver(
         main_process_started_time: None,
         last_token_grant_failure: None,
         delete_keeps_workspace: false,
+        last_activity_time: None,
     }
 }
 
@@ -7348,6 +7349,8 @@ fn apply_driver_snapshot(
             .clone_from(&current_status.configuration_admission);
         status.configuration_activated = current_status.configuration_activated;
         status.provisioning.clone_from(&current_status.provisioning);
+        // Activity is recorded from supervisor reports, never from a driver.
+        status.last_activity_time = current_status.last_activity_time;
     }
     if old_phase != phase {
         info!(
@@ -8243,6 +8246,38 @@ mod tests {
                 .iter()
                 .any(|condition| condition.reason == "ConfigurationAccepted"
                     && condition.status == "True")
+        );
+    }
+
+    #[test]
+    fn driver_snapshots_keep_recorded_activity() {
+        let recorded = prost_types::Timestamp {
+            seconds: 1_800_000_000,
+            nanos: 0,
+        };
+        let mut sandbox = Sandbox::default();
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        sandbox.status.as_mut().unwrap().last_activity_time = Some(recorded);
+
+        // A snapshot with driver status rebuilds the public status from it.
+        apply_driver_snapshot(
+            &mut sandbox,
+            &ready_driver_sandbox("sandbox", "sandbox"),
+            true,
+            true,
+        );
+        assert_eq!(
+            sandbox.status.as_ref().unwrap().last_activity_time,
+            Some(recorded)
+        );
+
+        // A snapshot without driver status keeps the stored status.
+        let mut without_status = ready_driver_sandbox("sandbox", "sandbox");
+        without_status.status = None;
+        apply_driver_snapshot(&mut sandbox, &without_status, true, true);
+        assert_eq!(
+            sandbox.status.as_ref().unwrap().last_activity_time,
+            Some(recorded)
         );
     }
 

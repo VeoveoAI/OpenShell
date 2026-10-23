@@ -17,3 +17,13 @@ the kernel then tracks the lifetime through workload-owned descriptors. Native
 the last workload reference to a listener removes it without waiting for registry
 collection. Broker source descriptors always use close-on-exec independently of
 the workload's requested descriptor flags.
+
+On SIGTERM, the boundary ends the workload as the loss of the supervisor's
+recovery window does: SIGCONT, SIGTERM, and SIGKILL after the stop grace. It
+then waits on its process runtime until the workload's exit is recorded, so the
+supervisor's pending `Wait` answers and the runtime stops before the boundary
+exits. Killing the workload outright and dropping the runtime at once left the
+`Wait` thread blocked: a Kubernetes workload Pod then outlived its 30-second
+termination grace and was killed, about 38 seconds per stop, and the workload
+never received SIGTERM. With the fix, OpenCode exits about 0.1 seconds after
+SIGTERM.

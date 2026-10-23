@@ -131,6 +131,24 @@ A crash or lost database-lock session can leave a parked marker. Reconfigure or
 reauthorize the refresh grant after investigating its issuer state. Changing a
 marker directly is not a supported recovery workflow.
 
+## Sandbox activity
+
+`SandboxStatus.last_activity_time` is the latest time the supervisor reported
+allowed network traffic from the sandbox. The supervisor's activity aggregator
+counts every proxied connection and L7 request, allowed or denied, and sends a
+`NetworkActivitySummary` every 10 seconds when the count is not zero. A report
+whose count exceeds its denials is activity; denied attempts alone are not, so a
+workload retrying a blocked destination still reads as idle. A long-lived
+connection counts once, when it opens, and inbound traffic through forwards or
+services does not count.
+
+The record is gateway-owned durable state, like the restart fields: driver
+snapshots carry it over, and it survives gateway restarts. A record younger than
+one minute is kept, so a busy sandbox writes at most once a minute. The write
+takes the sandbox's mutation guard and is best effort: a lock timeout, a
+concurrent change or a deleted sandbox skips it, and the report still succeeds.
+Clients use it with their own traffic to decide how long a sandbox has been idle.
+
 ## Focused verification
 
 ```shell

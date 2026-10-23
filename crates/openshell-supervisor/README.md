@@ -41,6 +41,21 @@ the read endpoint to the child's stdin. The supervisor uses the standard stdin
 reader and does not adopt a numeric raw descriptor. This mode reserves stdin for
 liveness; sandbox workload input travels over the boundary protocol.
 
+## Credential refresh and policy generations
+
+Relays pin the policy generation they opened under and close, even when idle,
+once a newer generation is published. No policy input depends on a credential
+value: the OPA engine is built from the policy alone, endpoint credential guards
+read the policy's bindings, middleware authenticates with extension
+credentials, and each inspected request resolves its credential from the live
+installation. A provider environment whose bindings are unchanged therefore
+installs in place under the current generation, and open relays, such as an MCP
+client's long-lived stream or a streaming model response, keep running. The
+bindings are everything except credential values and expiry times. A binding,
+policy or middleware change, a removed credential, or the first install after a
+revocation publishes a generation and closes the pinned relays. Before this, a
+Lore token refresh every 4 to 5 minutes closed every L7 tunnel in a Computer.
+
 ## Portable supervisor access
 
 The supervisor consumes the shared isolation backend contract. Its gateway

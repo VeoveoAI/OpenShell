@@ -10,6 +10,7 @@
 #![allow(clippy::cast_precision_loss)] // f64->f32 for confidence scores
 #![allow(clippy::items_after_statements)] // DB_PORTS const inside function
 
+mod activity;
 mod config_inputs;
 mod endpoint_status;
 mod provisioning_clock;
@@ -5497,6 +5498,9 @@ pub(super) async fn handle_submit_policy_analysis(
             .telemetry
             .record_network_activity(&sandbox_id, summary);
     }
+    if activity::reports_activity(&req.network_activity_summaries) {
+        activity::record_activity(state, &sandbox, std::time::SystemTime::now()).await;
+    }
     if req.proposed_chunks.is_empty()
         && req.summaries.is_empty()
         && !req.network_activity_summaries.is_empty()
@@ -10644,6 +10648,112 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!messages.contains(&"pre-epoch"));
         assert!(messages.contains(&"epoch"));
+    }
+
+    #[tokio::test]
+    async fn activity_summaries_record_the_sandbox_last_activity() {
+        use openshell_core::proto::{GetSandboxRequest, NetworkActivitySummary};
+
+        let state = test_server_state().await;
+        let sandbox_id = "sb-last-activity";
+        let sandbox_name = "last-activity";
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                sandbox_name,
+                ProtoSandboxPolicy::default(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+        let report = |allowed: u32, denied: u32| {
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                name: sandbox_name.to_string(),
+                analysis_mode: "activity".to_string(),
+                network_activity_summaries: vec![NetworkActivitySummary {
+                    network_activity_count: allowed + denied,
+                    denied_action_count: denied,
+                    denials_by_group: Vec::new(),
+                }],
+                ..Default::default()
+            }))
+        };
+        let stored = || async {
+            state
+                .store
+                .get_message::<Sandbox>(sandbox_id)
+                .await
+                .unwrap()
+                .unwrap()
+        };
+        let recorded = |sandbox: &Sandbox| {
+            sandbox
+                .status
+                .as_ref()
+                .and_then(|status| status.last_activity_time)
+        };
+
+        // Denied attempts alone are not activity.
+        handle_submit_policy_analysis(&state, report(0, 3))
+            .await
+            .unwrap();
+        assert_eq!(recorded(&stored().await), None);
+
+        let before = std::time::SystemTime::now();
+        handle_submit_policy_analysis(&state, report(2, 1))
+            .await
+            .unwrap();
+        let after = std::time::SystemTime::now();
+        let first = stored().await;
+        let time = openshell_core::time::system_time_from_timestamp(
+            &recorded(&first).expect("allowed traffic is recorded"),
+        )
+        .unwrap();
+        assert!(before <= time && time <= after);
+
+        // A report inside the record interval keeps the record and the row.
+        handle_submit_policy_analysis(&state, report(5, 0))
+            .await
+            .unwrap();
+        let second = stored().await;
+        assert_eq!(recorded(&second), recorded(&first));
+        let version = |sandbox: &Sandbox| sandbox.metadata.as_ref().unwrap().resource_version;
+        assert_eq!(version(&second), version(&first));
+
+        // A record older than the interval is replaced by the next report.
+        let old = openshell_core::time::timestamp_from_system_time(
+            before - std::time::Duration::from_mins(2),
+        )
+        .unwrap();
+        state
+            .store
+            .update_message_cas::<Sandbox, _>(sandbox_id, 0, |sandbox| {
+                sandbox.status.as_mut().unwrap().last_activity_time = Some(old);
+            })
+            .await
+            .unwrap();
+        handle_submit_policy_analysis(&state, report(1, 0))
+            .await
+            .unwrap();
+        let refreshed = recorded(&stored().await).unwrap();
+        assert!(refreshed.seconds >= recorded(&first).unwrap().seconds);
+
+        // GetSandbox exposes the record.
+        let fetched = super::super::sandbox::handle_get_sandbox(
+            &state,
+            with_user(Request::new(GetSandboxRequest {
+                name: sandbox_name.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .sandbox
+        .unwrap();
+        assert_eq!(recorded(&fetched), Some(refreshed));
     }
 
     #[tokio::test]
