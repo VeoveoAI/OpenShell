@@ -1747,6 +1747,24 @@ mod tests {
     use super::*;
     use crate::linux::socket_confinement;
 
+    /// Rerun `test` alone in a child process of the test binary and return
+    /// true there. Every child another test forks holds all of this process's
+    /// descriptors until it execs, so while other tests run a closed
+    /// listener can still be listening in one of their children.
+    fn run_alone(test: &str) -> bool {
+        const CHILD_MARKER: &str = "OPENSHELL_TEST_BROKER_ALONE";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            return true;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env(CHILD_MARKER, "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "{test} failed alone");
+        false
+    }
+
     fn assert_listener_closed(address: SocketAddr, inode: u64) {
         let table = if address.is_ipv4() {
             "/proc/net/tcp"
@@ -1773,6 +1791,11 @@ mod tests {
 
     #[test]
     fn listening_socket_lives_only_as_long_as_workload_aliases() {
+        if !run_alone(
+            "network_broker::tests::listening_socket_lives_only_as_long_as_workload_aliases",
+        ) {
+            return;
+        }
         for address in ["127.0.0.1:0", "[::1]:0"] {
             let address: SocketAddr = address.parse().unwrap();
             let (launcher, listener) = crate::linux::workload_launcher::start().unwrap();
@@ -1820,6 +1843,11 @@ mod tests {
 
     #[test]
     fn implicit_listen_releases_source_and_failed_listen_retains_it() {
+        if !run_alone(
+            "network_broker::tests::implicit_listen_releases_source_and_failed_listen_retains_it",
+        ) {
+            return;
+        }
         let (launcher, listener) = crate::linux::workload_launcher::start().unwrap();
         let broker = NetworkBroker::start_for_test(listener).unwrap();
         let (address, inode, udp) = launcher
@@ -2184,8 +2212,14 @@ mod tests {
                 let socket =
                     socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)
                         .unwrap();
-                let fd = socket.as_raw_fd();
+                // Other tests in this process open descriptors concurrently and
+                // the kernel gives each the lowest free number, so the socket's
+                // own number could belong to another file before the probe. A
+                // new descriptor gets 512 only while 512 lower ones are open.
+                let alias = rustix::io::fcntl_dupfd_cloexec(&socket, 512).unwrap();
+                let fd = alias.as_raw_fd();
                 drop(socket);
+                drop(alias);
                 // SAFETY: listen on a closed descriptor is a valid error probe.
                 assert_eq!(unsafe { libc::listen(fd, 1) }, -1);
                 io::Error::last_os_error().raw_os_error()
