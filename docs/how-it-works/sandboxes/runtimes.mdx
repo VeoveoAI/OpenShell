@@ -331,7 +331,7 @@ After upgrading Agent Sandbox, restart the gateway.
 Workspace storage settings cannot change after a sandbox is created. Delete and recreate the sandbox to change them.
 </Note>
 
-Volume provisioners such as K3s's `local-path` create a workspace PVC root owned by root and writable by everyone, and kubelet's `fsGroup` handling only adds group bits. Before the non-root seed, the `workspace-owner` init container gives the root alone to the sandbox UID and GID with mode `2770`. It runs as root in the sandbox group with only the `CHOWN` and `FOWNER` capabilities, without privilege escalation and with a read-only root filesystem, and changes nothing once the root is owned. Mode `2770` keeps the fsGroup, group `rwx` and setgid that kubelet's `OnRootMismatch` policy checks, so kubelet never walks the workspace again. Pod admission must allow this one root container.
+Volume provisioners such as K3s's `local-path` create a workspace PVC root owned by root and writable by everyone, and kubelet's `fsGroup` handling only adds group bits. Before the non-root seed, the `workspace-owner` init container gives the root alone to the sandbox UID and GID with mode `2770`. It runs the sandbox runtime image's own root-owned `/openshell-sandbox`, the image the bootstrap runs, rather than the copy the bootstrap stages for the sandbox user. It runs as root in the sandbox group with only the `CHOWN` and `FOWNER` capabilities, without privilege escalation and with a read-only root filesystem, and changes nothing once the root is owned. Mode `2770` keeps the fsGroup, group `rwx` and setgid that kubelet's `OnRootMismatch` policy checks, so kubelet never walks the workspace again. Pod admission must allow this one root container.
 
 ### Kubernetes PVC Mounts
 
