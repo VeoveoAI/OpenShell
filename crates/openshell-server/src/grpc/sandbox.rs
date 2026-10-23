@@ -9405,7 +9405,14 @@ mod tests {
 
     // ---- CAS (Client-driven optimistic concurrency) tests ----
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+    // Every writer reads the same version before any of them writes, so all but
+    // one must retry. Each writer waits for the others on its own blocking-pool
+    // thread, never on a runtime worker: a worker blocked in the barrier strands
+    // the tasks in its LIFO slot, which other workers cannot steal, such as the
+    // task sqlx spawns to return the single in-memory connection to its pool,
+    // and the remaining writers would wait for that connection forever. One
+    // worker suffices because none ever blocks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn server_managed_sandbox_cas_retries_concurrent_updates() {
         use std::sync::Barrier;
 
@@ -9417,14 +9424,19 @@ mod tests {
         state.store.put_message(&sandbox).await.unwrap();
 
         let barrier = Arc::new(Barrier::new(WRITERS));
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runtime = tokio::runtime::Handle::current();
         let mut handles = Vec::with_capacity(WRITERS);
         for _ in 0..WRITERS {
             let state = Arc::clone(&state);
             let barrier = Arc::clone(&barrier);
+            let attempts = Arc::clone(&attempts);
             let sandbox_id = sandbox_id.clone();
-            handles.push(tokio::spawn(async move {
+            let runtime = runtime.clone();
+            handles.push(tokio::task::spawn_blocking(move || {
                 let mut first_attempt = true;
-                update_sandbox_cas(&state, &sandbox_id, 0, |sandbox| {
+                runtime.block_on(update_sandbox_cas(&state, &sandbox_id, 0, |sandbox| {
+                    attempts.fetch_add(1, Ordering::Relaxed);
                     if first_attempt {
                         first_attempt = false;
                         barrier.wait();
@@ -9436,8 +9448,7 @@ mod tests {
                         .unwrap_or_default();
                     annotations
                         .insert("internal-update-count".to_string(), (count + 1).to_string());
-                })
-                .await
+                }))
             }));
         }
 
@@ -9456,6 +9467,8 @@ mod tests {
             WRITERS.to_string()
         );
         assert_eq!(updated.get_resource_version(), WRITERS as u64 + 1);
+        // All read one version, so each writer but the first conflicted and retried.
+        assert!(attempts.load(Ordering::Relaxed) >= 2 * WRITERS - 1);
     }
 
     #[tokio::test]
