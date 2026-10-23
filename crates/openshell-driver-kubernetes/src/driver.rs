@@ -730,6 +730,16 @@ const WORKSPACE_INIT_MOUNT_PATH: &str = "/mnt/openshell-workspace";
 /// Name of the init container that seeds the workspace PVC.
 const WORKSPACE_INIT_CONTAINER_NAME: &str = "workspace-init";
 
+/// Name of the init container that gives the workspace PVC's root to the sandbox
+/// user before the seed. The volume provisioner and kubelet's `fsGroup` handling
+/// leave the root owned by root and writable by everyone, which the non-root seed
+/// cannot change.
+const WORKSPACE_OWNER_CONTAINER_NAME: &str = "workspace-owner";
+
+/// The only capabilities the workspace owner step holds: changing the root's owner
+/// and, as a process that does not own it, its mode.
+const WORKSPACE_OWNER_CAPABILITIES: [&str; 2] = ["CHOWN", "FOWNER"];
+
 /// Sentinel file written by the init container after copying the image's
 /// `/sandbox` contents.  Subsequent pod starts skip the copy.
 const WORKSPACE_SENTINEL: &str = ".workspace-initialized";
@@ -2517,6 +2527,24 @@ impl KubernetesComputeDriver {
                 .iter()
                 .any(|mount| mount.name == volume_name)
         };
+        let init_containers = spec.init_containers.as_deref().unwrap_or_default();
+        let position = |name: &str| {
+            init_containers
+                .iter()
+                .position(|container| container.name == name)
+        };
+        if let Some(seed) = position(WORKSPACE_INIT_CONTAINER_NAME) {
+            let owner = position(WORKSPACE_OWNER_CONTAINER_NAME)
+                .filter(|owner| *owner < seed)
+                .ok_or_else(|| fail("workspace owner init container must run before the seed"))?;
+            check_workspace_owner(&init_containers[owner], uid, gid).map_err(|reason| {
+                fail(&format!("workspace owner init container changed: {reason}"))
+            })?;
+        } else if position(WORKSPACE_OWNER_CONTAINER_NAME).is_some() {
+            return Err(fail(
+                "workspace owner init container without a workspace seed",
+            ));
+        }
         if mounts_volume(agent, SANDBOX_BOOTSTRAP_VOLUME_NAME)
             || !mounts_volume(bootstrap, SANDBOX_BOOTSTRAP_VOLUME_NAME)
         {
@@ -3455,6 +3483,7 @@ impl KubernetesComputeDriver {
                 agent_gid,
             ),
         )?;
+        ensure_workspace_owner_init_container(&mut init_containers, agent_uid, agent_gid);
         let supervisor = pods
             .create(
                 &PostParams::default(),
@@ -5357,6 +5386,79 @@ fn runtime_pod_owner(name: &str, uid: &str) -> OwnerReference {
     }
 }
 
+/// Whether `container` is exactly the workspace owner step for `uid:gid`: root in the
+/// sandbox group with only `CHOWN` and `FOWNER`, no privilege escalation, a read-only
+/// root filesystem, the staged runtime's `own-workspace` and only the workspace and
+/// the read-only runtime mounted.
+fn check_workspace_owner(
+    container: &k8s_openapi::api::core::v1::Container,
+    uid: u32,
+    gid: u32,
+) -> Result<(), &'static str> {
+    let context = container
+        .security_context
+        .as_ref()
+        .ok_or("no security context")?;
+    let capabilities = context.capabilities.as_ref();
+    let drops_all = capabilities
+        .and_then(|capabilities| capabilities.drop.as_deref())
+        .is_some_and(|drops| drops.iter().any(|capability| capability == "ALL"));
+    let mut adds = capabilities
+        .and_then(|capabilities| capabilities.add.clone())
+        .unwrap_or_default();
+    adds.sort();
+    if context.run_as_user != Some(0)
+        || context.run_as_group != Some(i64::from(gid))
+        || context.run_as_non_root != Some(false)
+        || context.allow_privilege_escalation != Some(false)
+        || context.read_only_root_filesystem != Some(true)
+        || context.privileged == Some(true)
+        || !drops_all
+        || adds != WORKSPACE_OWNER_CAPABILITIES
+    {
+        return Err("security context");
+    }
+    let command = [
+        format!("{SANDBOX_RUNTIME_MOUNT_PATH}/openshell-sandbox"),
+        "own-workspace".to_string(),
+        uid.to_string(),
+        gid.to_string(),
+    ];
+    if container.command.as_deref() != Some(&command[..])
+        || container
+            .args
+            .as_deref()
+            .is_some_and(|args| !args.is_empty())
+    {
+        return Err("command");
+    }
+    let mounts = container.volume_mounts.as_deref().unwrap_or_default();
+    let workspace = mounts.iter().any(|mount| {
+        mount.name == WORKSPACE_VOLUME_NAME
+            && mount.mount_path == WORKSPACE_INIT_MOUNT_PATH
+            && mount.read_only != Some(true)
+            && mount.sub_path.is_none()
+            && mount.sub_path_expr.is_none()
+    });
+    let runtime = mounts.iter().any(|mount| {
+        mount.name == SANDBOX_RUNTIME_VOLUME_NAME
+            && mount.mount_path == SANDBOX_RUNTIME_MOUNT_PATH
+            && mount.read_only == Some(true)
+            && mount.sub_path.is_none()
+    });
+    if mounts.len() != 2 || !workspace || !runtime {
+        return Err("mounts");
+    }
+    if container
+        .volume_devices
+        .as_deref()
+        .is_some_and(|devices| !devices.is_empty())
+    {
+        return Err("devices");
+    }
+    Ok(())
+}
+
 /// Pod template fields replaced when a stopped sandbox starts a new runtime
 /// generation.
 fn restart_pod_template_spec(
@@ -6629,11 +6731,75 @@ fn apply_supervisor_sandbox_runtime_boundary(
     apply_resolved_identity_env(env, params.sandbox_uid, params.sandbox_gid);
 }
 
+/// Render the init container that sets the workspace PVC root, alone, to the sandbox
+/// user and group with mode `2770`. It runs as root in the sandbox group with only
+/// `CHOWN` and `FOWNER`, from the staged runtime binary, before the non-root seed;
+/// once the root is owned it changes nothing.
+fn workspace_owner_init_container(
+    image: &serde_json::Value,
+    image_pull_policy: Option<&serde_json::Value>,
+    uid: u32,
+    gid: u32,
+) -> serde_json::Value {
+    let mut owner = serde_json::json!({
+        "name": WORKSPACE_OWNER_CONTAINER_NAME,
+        "image": image,
+        "command": [
+            format!("{SANDBOX_RUNTIME_MOUNT_PATH}/openshell-sandbox"),
+            "own-workspace",
+            uid.to_string(),
+            gid.to_string()
+        ],
+        "securityContext": {
+            "runAsUser": 0,
+            "runAsGroup": gid,
+            "runAsNonRoot": false,
+            "readOnlyRootFilesystem": true,
+            "allowPrivilegeEscalation": false,
+            "capabilities": {"drop": ["ALL"], "add": WORKSPACE_OWNER_CAPABILITIES}
+        },
+        "volumeMounts": [
+            {"name": WORKSPACE_VOLUME_NAME, "mountPath": WORKSPACE_INIT_MOUNT_PATH},
+            {"name": SANDBOX_RUNTIME_VOLUME_NAME, "mountPath": SANDBOX_RUNTIME_MOUNT_PATH, "readOnly": true}
+        ]
+    });
+    if let Some(policy) = image_pull_policy {
+        owner["imagePullPolicy"] = policy.clone();
+    }
+    owner
+}
+
+/// Render the workspace owner step into stored init containers, just before the
+/// workspace seed, from the seed's image. A new runtime generation of a sandbox
+/// created before the step existed gets it, and a stale one is replaced.
+fn ensure_workspace_owner_init_container(
+    init_containers: &mut Vec<serde_json::Value>,
+    uid: u32,
+    gid: u32,
+) {
+    init_containers.retain(|container| container["name"] != WORKSPACE_OWNER_CONTAINER_NAME);
+    let Some(seed) = init_containers
+        .iter()
+        .position(|container| container["name"] == WORKSPACE_INIT_CONTAINER_NAME)
+    else {
+        return;
+    };
+    let owner = workspace_owner_init_container(
+        &init_containers[seed]["image"],
+        init_containers[seed].get("imagePullPolicy"),
+        uid,
+        gid,
+    );
+    init_containers.insert(seed, owner);
+}
+
 /// Apply workspace persistence transforms to an already-built pod template.
 ///
 /// This injects:
 ///   1. A volume mount on the agent container at `/sandbox`.
-///   2. An init container (same image) that seeds the PVC with the image's
+///   2. With a sandbox identity, the `workspace-owner` init container, which
+///      gives the PVC root to the sandbox user with mode `2770`.
+///   3. An init container (same image) that seeds the PVC with the image's
 ///      original `/sandbox` contents on first use.
 ///
 /// The PVC volume itself is **not** added here — the Sandbox CRD controller
@@ -6729,6 +6895,16 @@ fn apply_workspace_persistence(
              fi"
         );
 
+        if let Some((uid, gid)) = workspace_owner {
+            let pull_policy =
+                image_pull_policy.map(|policy| serde_json::json!(policy.as_kubernetes_str()));
+            init_containers.push(workspace_owner_init_container(
+                &serde_json::json!(image),
+                pull_policy.as_ref(),
+                uid,
+                gid,
+            ));
+        }
         let mut init_spec = if let Some((uid, gid)) = workspace_owner {
             serde_json::json!({
                 "name": WORKSPACE_INIT_CONTAINER_NAME,
@@ -11161,6 +11337,28 @@ mod tests {
         );
         assert_eq!(workspace_init["securityContext"]["runAsUser"], 1500);
         assert_eq!(workspace_init["imagePullPolicy"], "Always");
+        let names: Vec<_> = pod_template["spec"]["initContainers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|container| container["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                SANDBOX_BOOTSTRAP_CONTAINER_NAME,
+                WORKSPACE_OWNER_CONTAINER_NAME,
+                WORKSPACE_INIT_CONTAINER_NAME
+            ],
+            "the owner step runs after the runtime is staged and before the seed"
+        );
+        let owner: k8s_openapi::api::core::v1::Container =
+            serde_json::from_value(pod_template["spec"]["initContainers"][1].clone()).unwrap();
+        check_workspace_owner(&owner, 1500, 1500).unwrap();
+        assert_eq!(
+            pod_template["spec"]["initContainers"][1]["imagePullPolicy"],
+            "Always"
+        );
         assert_eq!(
             workspace_init["securityContext"]["capabilities"],
             serde_json::json!({"drop": ["ALL"]})
@@ -13124,6 +13322,131 @@ mod tests {
             spec["imagePullSecrets"],
             serde_json::json!([{"name": "os-pull-sandbox-1-gen7-0"}])
         );
+    }
+
+    /// One change to a rendered container.
+    type ContainerEdit = fn(&mut serde_json::Value);
+
+    fn workspace_owner(uid: u32, gid: u32) -> serde_json::Value {
+        workspace_owner_init_container(
+            &serde_json::json!("sandbox:latest"),
+            Some(&serde_json::json!("IfNotPresent")),
+            uid,
+            gid,
+        )
+    }
+
+    fn container(value: serde_json::Value) -> k8s_openapi::api::core::v1::Container {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn workspace_owner_runs_as_root_with_only_chown_and_fowner() {
+        let owner = workspace_owner(1500, 1600);
+        assert_eq!(
+            owner["securityContext"],
+            serde_json::json!({
+                "runAsUser": 0,
+                "runAsGroup": 1600,
+                "runAsNonRoot": false,
+                "readOnlyRootFilesystem": true,
+                "allowPrivilegeEscalation": false,
+                "capabilities": {"drop": ["ALL"], "add": ["CHOWN", "FOWNER"]}
+            })
+        );
+        assert_eq!(
+            owner["command"],
+            serde_json::json!([
+                format!("{SANDBOX_RUNTIME_MOUNT_PATH}/openshell-sandbox"),
+                "own-workspace",
+                "1500",
+                "1600"
+            ])
+        );
+        check_workspace_owner(&container(owner.clone()), 1500, 1600).unwrap();
+        assert!(
+            check_workspace_owner(&container(owner.clone()), 1501, 1600).is_err(),
+            "another sandbox user's owner step is refused"
+        );
+
+        let changed = |edit: fn(&mut serde_json::Value)| {
+            let mut changed = owner.clone();
+            edit(&mut changed);
+            check_workspace_owner(&container(changed), 1500, 1600)
+        };
+        let edits: [(&str, ContainerEdit); 12] = [
+            ("security context", |c| {
+                c["securityContext"]["capabilities"]["add"] =
+                    serde_json::json!(["CHOWN", "FOWNER", "DAC_OVERRIDE"]);
+            }),
+            ("security context", |c| {
+                c["securityContext"]["capabilities"]["add"] = serde_json::json!(["CHOWN"]);
+            }),
+            ("security context", |c| {
+                c["securityContext"]["capabilities"]["drop"] = serde_json::json!([]);
+            }),
+            ("security context", |c| {
+                c["securityContext"]["allowPrivilegeEscalation"] = serde_json::json!(true);
+            }),
+            ("security context", |c| {
+                c["securityContext"]["readOnlyRootFilesystem"] = serde_json::json!(false);
+            }),
+            ("security context", |c| {
+                c["securityContext"]["privileged"] = serde_json::json!(true);
+            }),
+            ("security context", |c| {
+                c["securityContext"]["runAsGroup"] = serde_json::json!(0);
+            }),
+            ("command", |c| {
+                c["command"] = serde_json::json!(["/bin/sh", "-c", "chown -R 0 /mnt"]);
+            }),
+            ("command", |c| {
+                c["args"] = serde_json::json!(["--recursive"]);
+            }),
+            ("mounts", |c| {
+                c["volumeMounts"][1]["readOnly"] = serde_json::json!(false);
+            }),
+            ("mounts", |c| {
+                c["volumeMounts"][0]["subPath"] = serde_json::json!("home");
+            }),
+            ("mounts", |c| {
+                c["volumeMounts"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!({"name": "state", "mountPath": "/state"}));
+            }),
+        ];
+        for (reason, edit) in edits {
+            assert_eq!(changed(edit), Err(reason));
+        }
+    }
+
+    #[test]
+    fn a_new_generation_runs_the_workspace_owner_before_the_seed() {
+        let bootstrap = serde_json::json!({"name": SANDBOX_BOOTSTRAP_CONTAINER_NAME});
+        let seed = serde_json::json!({
+            "name": WORKSPACE_INIT_CONTAINER_NAME,
+            "image": "sandbox:latest",
+            "imagePullPolicy": "IfNotPresent"
+        });
+        // A sandbox stored before the owner step existed gets it.
+        let mut stored = vec![bootstrap.clone(), seed.clone()];
+        ensure_workspace_owner_init_container(&mut stored, 1500, 1600);
+        assert_eq!(
+            stored,
+            vec![bootstrap.clone(), workspace_owner(1500, 1600), seed.clone()]
+        );
+        // A stale or misplaced one is replaced in place.
+        let mut stale = vec![bootstrap.clone(), seed.clone(), workspace_owner(1, 1)];
+        ensure_workspace_owner_init_container(&mut stale, 1500, 1600);
+        assert_eq!(
+            stale,
+            vec![bootstrap.clone(), workspace_owner(1500, 1600), seed]
+        );
+        // Without a workspace seed there is nothing to own.
+        let mut custom = vec![bootstrap.clone(), workspace_owner(1500, 1600)];
+        ensure_workspace_owner_init_container(&mut custom, 1500, 1600);
+        assert_eq!(custom, vec![bootstrap]);
     }
 
     #[test]

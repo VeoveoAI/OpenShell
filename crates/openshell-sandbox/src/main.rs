@@ -24,6 +24,13 @@ use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 const COPY_SELF_SUBCOMMAND: &str = "copy-self";
 const BOOTSTRAP_SUBCOMMAND: &str = "bootstrap";
 const SEED_WORKSPACE_SUBCOMMAND: &str = "seed-workspace";
+const OWN_WORKSPACE_SUBCOMMAND: &str = "own-workspace";
+/// Mode of a persistent workspace root: the sandbox user and its own group, setgid,
+/// nothing for others. Kubelet skips its recursive `fsGroup` ownership walk under
+/// `OnRootMismatch` only while the root keeps the fsGroup, group `rwx` and setgid, so
+/// a narrower mode would make every mount walk and widen every file.
+#[cfg(target_os = "linux")]
+const WORKSPACE_ROOT_MODE: u32 = 0o2770;
 #[cfg(target_os = "linux")]
 const KUBERNETES_BOOTSTRAP_SECRET_FILES: [&str; 3] = ["boundary.json", "tls.crt", "tls.key"];
 #[cfg(target_os = "linux")]
@@ -1757,6 +1764,76 @@ fn seed_kubernetes_workspace() -> Result<()> {
     ))
 }
 
+/// Give the persistent workspace root to the sandbox user. The volume provisioner
+/// and kubelet's `fsGroup` handling leave it owned by root and writable by everyone;
+/// the non-root seed cannot change that. Runs as root with only `CHOWN` and `FOWNER`,
+/// before the seed, and changes the root inode alone.
+#[cfg(target_os = "linux")]
+fn own_kubernetes_workspace(args: &[String]) -> Result<()> {
+    let [uid, gid] = args else {
+        return Err(miette::miette!(
+            "usage: openshell-sandbox {OWN_WORKSPACE_SUBCOMMAND} <uid> <gid>"
+        ));
+    };
+    let uid = uid
+        .parse::<u32>()
+        .map_err(|_| miette::miette!("workspace owner uid must be a number: {uid}"))?;
+    let gid = gid
+        .parse::<u32>()
+        .map_err(|_| miette::miette!("workspace owner gid must be a number: {gid}"))?;
+    own_kubernetes_workspace_at(Path::new("/mnt/openshell-workspace"), uid, gid).map(|_| ())
+}
+
+/// Set `root`, opened without following a symlink, to `uid:gid` and
+/// [`WORKSPACE_ROOT_MODE`] when it differs. Nothing below the root is touched.
+/// Returns whether it changed anything.
+#[cfg(target_os = "linux")]
+fn own_kubernetes_workspace_at(root: &Path, uid: u32, gid: u32) -> Result<bool> {
+    use std::fs::{OpenOptions, Permissions};
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(root)
+        .map_err(|error| {
+            miette::miette!(
+                "workspace root must be a real directory: {}: {error}",
+                root.display()
+            )
+        })?;
+    let current = directory.metadata().into_diagnostic()?;
+    if current.uid() == uid
+        && current.gid() == gid
+        && current.mode() & 0o7777 == WORKSPACE_ROOT_MODE
+    {
+        return Ok(false);
+    }
+    std::os::unix::fs::fchown(&directory, Some(uid), Some(gid)).into_diagnostic()?;
+    // The caller runs with the workspace group, so the kernel keeps setgid without
+    // CAP_FSETID.
+    directory
+        .set_permissions(Permissions::from_mode(WORKSPACE_ROOT_MODE))
+        .into_diagnostic()?;
+    let owned = directory.metadata().into_diagnostic()?;
+    if owned.uid() != uid || owned.gid() != gid || owned.mode() & 0o7777 != WORKSPACE_ROOT_MODE {
+        return Err(miette::miette!(
+            "workspace root is {}:{} {:o} after ownership, not {uid}:{gid} {WORKSPACE_ROOT_MODE:o}",
+            owned.uid(),
+            owned.gid(),
+            owned.mode() & 0o7777
+        ));
+    }
+    Ok(true)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn own_kubernetes_workspace(_args: &[String]) -> Result<()> {
+    Err(miette::miette!(
+        "Kubernetes workspace ownership is supported only on Linux"
+    ))
+}
+
 #[cfg(target_os = "linux")]
 fn run_boundary(bootstrap: &Path, log_level: &str) -> Result<()> {
     let console_filter =
@@ -1802,6 +1879,9 @@ fn main() -> Result<()> {
             ));
         }
         return seed_kubernetes_workspace();
+    }
+    if raw_args.get(1).map(String::as_str) == Some(OWN_WORKSPACE_SUBCOMMAND) {
+        return own_kubernetes_workspace(&raw_args[2..]);
     }
     if raw_args.get(1).map(String::as_str) == Some(CAPABILITY_PROBE_SUBCOMMAND) {
         return run_capability_probe();
@@ -1868,6 +1948,79 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn workspace_ownership_sets_only_the_root_and_then_changes_nothing() {
+        use std::os::unix::fs::MetadataExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::fs::create_dir(workspace.join(".ssh")).unwrap();
+        std::fs::set_permissions(
+            workspace.join(".ssh"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        std::fs::write(workspace.join(".ssh/id_ed25519"), b"synthetic").unwrap();
+        std::fs::set_permissions(
+            workspace.join(".ssh/id_ed25519"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        // The test's own identity stands in for the sandbox user: an owner may give
+        // its directory to its own uid and group without privilege.
+        let created = std::fs::metadata(&workspace).unwrap();
+        let (uid, gid) = (created.uid(), created.gid());
+
+        assert!(own_kubernetes_workspace_at(&workspace, uid, gid).unwrap());
+        let owned = std::fs::metadata(&workspace).unwrap();
+        assert_eq!(
+            (owned.uid(), owned.gid(), owned.mode() & 0o7777),
+            (uid, gid, 0o2770)
+        );
+        assert!(
+            !own_kubernetes_workspace_at(&workspace, uid, gid).unwrap(),
+            "an owned root changes nothing"
+        );
+        assert_eq!(
+            std::fs::metadata(workspace.join(".ssh")).unwrap().mode() & 0o7777,
+            0o700,
+            "nothing below the root changes"
+        );
+        assert_eq!(
+            std::fs::metadata(workspace.join(".ssh/id_ed25519"))
+                .unwrap()
+                .mode()
+                & 0o7777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn workspace_ownership_refuses_a_symlink_or_a_file() {
+        use std::os::unix::fs::MetadataExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let file = root.path().join("file");
+        std::fs::write(&file, b"synthetic").unwrap();
+        let created = std::fs::metadata(&target).unwrap();
+
+        for path in [&link, &file] {
+            assert!(own_kubernetes_workspace_at(path, created.uid(), created.gid()).is_err());
+        }
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().mode() & 0o7777,
+            0o755,
+            "a symlinked root's target is never changed"
+        );
+        assert!(own_kubernetes_workspace(&["10001".into()]).is_err());
+        assert!(own_kubernetes_workspace(&["sandbox".into(), "10001".into()]).is_err());
     }
 
     #[test]
