@@ -5,6 +5,7 @@
 //! configuration and provider environments after startup, and reports apply
 //! results back to the gateway.
 
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
@@ -183,6 +184,10 @@ struct ConfigRuntime {
     rejected_policy_generation: Option<RejectedPolicyGeneration>,
     has_last_valid_policy: bool,
     stream: StreamConfigurationState,
+    /// The bindings of the last provider environment installed. None when none is
+    /// in force, before the first install and after a revocation, so the next
+    /// install publishes a new policy generation.
+    provider_bindings: std::sync::Mutex<Option<Arc<crate::ProviderBindings>>>,
 }
 
 impl ConfigRuntime {
@@ -206,7 +211,16 @@ impl ConfigRuntime {
             rejected_policy_generation: None,
             has_last_valid_policy: ctx.loaded_policy_origin.has_last_valid_policy(),
             stream: StreamConfigurationState::default(),
+            provider_bindings: std::sync::Mutex::new(ctx.startup_provider_bindings.clone()),
         }
+    }
+
+    fn installed_bindings(
+        &self,
+    ) -> std::sync::MutexGuard<'_, Option<Arc<crate::ProviderBindings>>> {
+        self.provider_bindings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Bring the runtime to one sandbox configuration snapshot.
@@ -297,12 +311,13 @@ impl ConfigRuntime {
         let recovering_rejected_policy = reloads_gateway_policy
             && self.rejected_policy_generation.is_some()
             && result.configuration_admitted;
-        let policy_runtime_changed = (reloads_gateway_policy
-            && (provider_env_changed
-                || self
-                    .policy_generation
-                    .as_ref()
-                    .is_some_and(PolicyGenerationGuard::is_stale)))
+        // Whether a provider environment publishes a generation is decided once
+        // it is prepared, from its bindings.
+        let policy_runtime_needs_reload = (reloads_gateway_policy
+            && self
+                .policy_generation
+                .as_ref()
+                .is_some_and(PolicyGenerationGuard::is_stale))
             || recovering_rejected_policy
             || extension_authentication_changed
             || gateway_policy_runtime_needs_reconciliation(
@@ -353,7 +368,7 @@ impl ConfigRuntime {
 
         if !config_changed
             && !provider_env_changed
-            && !policy_runtime_changed
+            && !policy_runtime_needs_reload
             && unchanged_policy_revision.is_none()
         {
             return Ok(Reconciled {
@@ -426,6 +441,15 @@ impl ConfigRuntime {
             }
             ProviderSource::Delivered(provider) => provider,
         };
+        // A refresh that changes only credential values and expiry times is
+        // installed in place under the current generation, so relays pinned to
+        // it stay open and their next request resolves the new values. Any other
+        // provider environment change publishes a new generation with it.
+        let provider_bindings_changed = prepared_provider.as_ref().is_some_and(|prepared| {
+            self.installed_bindings().as_deref() != Some(&*prepared.bindings)
+        });
+        let policy_runtime_changed =
+            policy_runtime_needs_reload || (reloads_gateway_policy && provider_bindings_changed);
 
         let mut runtime_error = String::new();
         if policy_runtime_changed {
@@ -636,7 +660,9 @@ impl ConfigRuntime {
                 policy_status,
             });
         }
-        if !reloads_gateway_policy && let Some(prepared) = prepared_provider.as_ref() {
+        if (!reloads_gateway_policy || !policy_runtime_changed)
+            && let Some(prepared) = prepared_provider.as_ref()
+        {
             ctx.provider_credentials
                 .install_prepared(&prepared.credentials);
             ctx.provider_readiness.credentials_installed(
@@ -644,6 +670,15 @@ impl ConfigRuntime {
                 &ctx.provider_credentials,
                 prepared.expires_at_ms,
             );
+            if reloads_gateway_policy {
+                info!(
+                    provider_env_revision = result.provider_env_revision,
+                    "Provider credential values refreshed in place; the policy generation is retained"
+                );
+            }
+        }
+        if let Some(prepared) = prepared_provider.as_ref() {
+            *self.installed_bindings() = Some(prepared.bindings.clone());
         }
         if provider_env_changed || policy_runtime_reconciled {
             self.provider_env_revision = result.provider_env_revision;
@@ -798,6 +833,7 @@ impl ConfigRuntime {
         revision: u64,
     ) {
         ctx.provider_readiness.credentials_failed(identity, reason);
+        *self.installed_bindings() = None;
         ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
             .severity(SeverityId::High)
             .status(StatusId::Failure)
@@ -829,6 +865,7 @@ impl ConfigRuntime {
             .state(StateId::Disabled, "fail_closed")
             .message("Provider environment bindings failed validation; static credentials were revoked and fetched dynamic grants remain active")
             .build());
+        *self.installed_bindings() = None;
         ctx.provider_readiness
             .credentials_failed(identity, ProviderReadinessReason::CredentialInstallFailed);
         let revision = provider.provider_env_revision;
@@ -2093,6 +2130,234 @@ mod tests {
         }
     }
 
+    // ---- Provider credential refresh and policy generations ----
+
+    /// A gateway-policy sandbox reconciling session-delivered snapshots, as
+    /// session delivery does.
+    struct Delivery {
+        engine: Arc<OpaEngine>,
+        ctx: PolicyPollLoopContext,
+        runtime: ConfigRuntime,
+        client: ScriptedPolicyGateway,
+        settings: openshell_core::grpc_client::SettingsPollResult,
+    }
+
+    impl Delivery {
+        /// The sandbox before its first poll; with `startup`, as startup leaves it
+        /// with that provider environment installed.
+        fn build(startup: Option<&openshell_core::grpc_client::ProviderEnvironmentResult>) -> Self {
+            let policy = proto_policy_fixture();
+            let mut settings = settings_poll_result(
+                Some(policy.clone()),
+                1,
+                openshell_core::proto::PolicySource::Sandbox,
+            );
+            let engine = Arc::new(OpaEngine::from_proto(&policy).unwrap());
+            let connector: MiddlewareConnector = Arc::new(|_services, _authentication| {
+                Box::pin(async {
+                    connect_middleware_registry(&[], &MiddlewareAuthentication::default()).await
+                })
+            });
+            let mut ctx = policy_poll_test_context(
+                engine.clone(),
+                LoadedPolicyOrigin::Gateway {
+                    revision: Some(LoadedPolicyRevision::from_snapshot(&settings)),
+                    has_last_valid_policy: true,
+                },
+                connector,
+            );
+            if let Some(environment) = startup {
+                let captured = CapturedProviderEnvironment::prepare(environment).unwrap();
+                ctx.startup_provider_bindings = Some(captured.bindings.clone());
+                ctx.provider_credentials = captured.install(&ctx.provider_readiness);
+                settings.provider_env_revision = environment.provider_env_revision;
+            }
+            let runtime = ConfigRuntime::new(&ctx);
+            let (client, _polls, _reports) = scripted_policy_gateway();
+            Self {
+                engine,
+                ctx,
+                runtime,
+                client,
+                settings,
+            }
+        }
+
+        /// The sandbox with `environment` installed as its first provider environment.
+        async fn start(
+            environment: openshell_core::grpc_client::ProviderEnvironmentResult,
+        ) -> Self {
+            let mut delivery = Self::build(None);
+            delivery.deliver(Some(environment)).await;
+            delivery
+        }
+
+        /// The sandbox that started with `environment`, after its first poll.
+        async fn started_with(
+            environment: &openshell_core::grpc_client::ProviderEnvironmentResult,
+        ) -> Self {
+            let mut delivery = Self::build(Some(environment));
+            delivery.deliver(None).await;
+            delivery
+        }
+
+        /// Reconcile the current settings with `environment`, or with the installed
+        /// environment when `None`.
+        async fn deliver(
+            &mut self,
+            environment: Option<openshell_core::grpc_client::ProviderEnvironmentResult>,
+        ) {
+            if let Some(environment) = &environment {
+                self.settings.provider_env_revision = environment.provider_env_revision;
+            }
+            self.settings.config_revision += 1;
+            let prepared = environment
+                .map(|environment| CapturedProviderEnvironment::prepare(&environment).unwrap());
+            let reconciled = self
+                .runtime
+                .reconcile(
+                    &self.ctx,
+                    &self.client,
+                    &self.settings,
+                    ProviderSource::Delivered(prepared),
+                )
+                .await
+                .unwrap();
+            assert!(matches!(reconciled.outcome, ReconcileOutcome::Applied));
+            self.runtime.commit(self.settings.clone());
+        }
+
+        /// A relay pinned to the current generation, as an open tunnel or an
+        /// in-flight response stream holds; relays close once it is stale.
+        fn pin(&self) -> PolicyGenerationGuard {
+            self.engine
+                .generation_guard(self.engine.current_generation())
+                .unwrap()
+        }
+
+        /// The value the workload's current placeholder resolves to for the bound
+        /// endpoint, as the next inspected request resolves it.
+        fn resolved(&self) -> Option<String> {
+            let (_, child_env) = self
+                .ctx
+                .provider_credentials
+                .child_env_snapshot_with_gcp_resolved()
+                .unwrap();
+            self.ctx
+                .provider_credentials
+                .resolver_for_endpoint("tools.example.com", 443, "/v1/chat")?
+                .resolve_placeholder(child_env.get("EXTERNAL_TOKEN")?)
+                .map(str::to_owned)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_credential_value_refresh_keeps_open_relays_and_serves_the_new_value() {
+        let mut delivery = Delivery::start(stable_provider_environment(1, Some("first"))).await;
+        let generation = delivery.engine.current_generation();
+        let idle_tunnel = delivery.pin();
+        let stream = delivery.pin();
+        assert_eq!(delivery.resolved().as_deref(), Some("first"));
+
+        // Only the value and its revision change, as a provider credential refresh does.
+        delivery
+            .deliver(Some(stable_provider_environment(2, Some("second"))))
+            .await;
+        assert_eq!(delivery.engine.current_generation(), generation);
+        assert!(!idle_tunnel.is_stale(), "an idle tunnel stays open");
+        assert!(
+            timeout(Duration::from_millis(50), stream.wait_until_stale())
+                .await
+                .is_err(),
+            "an in-flight stream keeps its relay"
+        );
+        assert_eq!(
+            delivery.resolved().as_deref(),
+            Some("second"),
+            "the next request resolves the refreshed value"
+        );
+
+        // A revision-scoped placeholder refreshes in place as well.
+        let mut delivery = Delivery::start(static_provider_environment(1, Some("first"))).await;
+        let tunnel = delivery.pin();
+        delivery
+            .deliver(Some(static_provider_environment(2, Some("second"))))
+            .await;
+        assert!(!tunnel.is_stale());
+        assert_eq!(delivery.resolved().as_deref(), Some("second"));
+    }
+
+    #[tokio::test]
+    async fn the_first_refresh_after_startup_keeps_the_startup_generation() {
+        let mut delivery =
+            Delivery::started_with(&stable_provider_environment(1, Some("first"))).await;
+        let tunnel = delivery.pin();
+        delivery
+            .deliver(Some(stable_provider_environment(2, Some("second"))))
+            .await;
+        assert!(!tunnel.is_stale());
+        assert_eq!(delivery.resolved().as_deref(), Some("second"));
+    }
+
+    #[tokio::test]
+    async fn a_binding_change_a_revocation_and_a_policy_change_each_close_open_relays() {
+        // The credential may reach another endpoint.
+        let mut delivery = Delivery::start(stable_provider_environment(1, Some("first"))).await;
+        let tunnel = delivery.pin();
+        let mut moved = stable_provider_environment(2, Some("first"));
+        moved
+            .static_credential_bindings
+            .get_mut("EXTERNAL_TOKEN")
+            .unwrap()
+            .endpoints[0]
+            .host = "other.example.com".into();
+        delivery.deliver(Some(moved)).await;
+        assert!(tunnel.is_stale(), "a binding change closes open relays");
+
+        // The gateway revokes the credential: the environment no longer holds it.
+        let tunnel = delivery.pin();
+        delivery
+            .deliver(Some(stable_provider_environment(3, None)))
+            .await;
+        assert!(tunnel.is_stale(), "a revoked credential closes open relays");
+        assert_eq!(delivery.resolved(), None);
+
+        // A failed refresh revokes the credential in place; the environment that
+        // replaces it publishes a generation even with its earlier bindings.
+        let mut delivery = Delivery::start(stable_provider_environment(1, Some("first"))).await;
+        delivery
+            .runtime
+            .revoke_provider_environment(
+                &delivery.ctx,
+                EnvironmentIdentity::from_settings(&delivery.settings),
+                ProviderReadinessReason::CredentialInstallFailed,
+                1,
+            )
+            .await;
+        let tunnel = delivery.pin();
+        delivery
+            .deliver(Some(stable_provider_environment(2, Some("second"))))
+            .await;
+        assert!(
+            tunnel.is_stale(),
+            "the install after a revocation closes open relays"
+        );
+
+        // The policy changes.
+        let tunnel = delivery.pin();
+        delivery.settings = openshell_core::grpc_client::SettingsPollResult {
+            config_revision: delivery.settings.config_revision,
+            provider_env_revision: delivery.settings.provider_env_revision,
+            ..settings_poll_result(
+                Some(proto_tcp_policy_fixture()),
+                2,
+                openshell_core::proto::PolicySource::Sandbox,
+            )
+        };
+        delivery.deliver(None).await;
+        assert!(tunnel.is_stale(), "a policy change closes open relays");
+    }
+
     #[tokio::test]
     async fn provider_readiness_initial_poll_waits_for_middleware_reconciliation() {
         let policy = proto_policy_fixture();
@@ -2720,6 +2985,7 @@ mod tests {
             ocsf_enabled: Arc::new(AtomicBool::new(false)),
             ocsf_schema_version: Arc::new(std::sync::Mutex::new(String::new())),
             provider_credentials,
+            startup_provider_bindings: None,
             provider_readiness,
             policy_local_ctx: None,
             agent_proposals: AgentProposals::default(),

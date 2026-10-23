@@ -909,8 +909,13 @@ pub async fn run_sandbox_with_backend(
     let workspace = workdir;
 
     let provider_readiness = ProviderReadinessTracker::new();
-    let provider_credentials = if let Some(environment) = captured_provider_environment {
-        environment.install(&provider_readiness)
+    // The bindings installed at startup, so the first refresh with the same
+    // bindings keeps the startup policy generation.
+    let (provider_credentials, startup_provider_bindings) = if let Some(environment) =
+        captured_provider_environment
+    {
+        let bindings = environment.bindings.clone();
+        (environment.install(&provider_readiness), Some(bindings))
     } else {
         // Fetch provider environment variables from the server.
         // This is done after loading the policy so the sandbox can still start
@@ -954,14 +959,25 @@ pub async fn run_sandbox_with_backend(
 
         environment.map_or_else(
             || {
-                ProviderCredentialState::from_environment(
-                    0,
-                    std::collections::HashMap::default(),
-                    std::collections::HashMap::default(),
-                    std::collections::HashMap::default(),
+                (
+                    ProviderCredentialState::from_environment(
+                        0,
+                        std::collections::HashMap::default(),
+                        std::collections::HashMap::default(),
+                        std::collections::HashMap::default(),
+                    ),
+                    None,
                 )
             },
-            |result| initial_provider_credentials(result, &provider_readiness),
+            |result| {
+                let bindings = Arc::new(ProviderBindings::of(&result));
+                let credentials = initial_provider_credentials(result, &provider_readiness);
+                // A rejected environment installed nothing, so no bindings are in force.
+                let installed = provider_readiness
+                    .observation(&credentials)
+                    .credentials_installed;
+                (credentials, installed.then_some(bindings))
+            },
         )
     };
 
@@ -1266,6 +1282,7 @@ pub async fn run_sandbox_with_backend(
             ocsf_enabled: poll_ocsf_enabled,
             ocsf_schema_version: poll_ocsf_schema_version,
             provider_credentials: poll_provider_credentials,
+            startup_provider_bindings,
             provider_readiness: provider_readiness.clone(),
             policy_local_ctx: poll_policy_local,
             agent_proposals: agent_proposals.clone(),
@@ -2258,6 +2275,67 @@ struct CapturedProviderEnvironment {
     credentials: ProviderCredentialState,
     expires_at_ms: Option<i64>,
     identity: EnvironmentIdentity,
+    bindings: Arc<ProviderBindings>,
+}
+
+/// Everything a provider environment binds except its credential values and expiry
+/// times: the attachment and policy it was derived for, which variables and files it
+/// provides, its non-secret values, the endpoints and identities of its static
+/// credentials, its dynamic credential profiles and its stable placeholders. A
+/// refresh changes only values and expiry times. No policy input reads a credential
+/// value: the OPA engine is built from the policy alone and evaluates connection
+/// identity, and every inspected request resolves its credential from the live
+/// installation. So an environment with unchanged bindings is installed in place,
+/// and only a change here publishes a new policy generation and closes the relays
+/// pinned to the previous one.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ProviderBindings {
+    attachment_epoch: String,
+    policy_hash: String,
+    environment_keys: std::collections::BTreeSet<String>,
+    non_secret_environment: std::collections::BTreeMap<String, String>,
+    file_paths: std::collections::BTreeSet<String>,
+    dynamic_credentials:
+        std::collections::BTreeMap<String, openshell_core::proto::ProviderProfileCredential>,
+    static_credential_bindings:
+        std::collections::BTreeMap<String, openshell_core::proto::StaticCredentialBinding>,
+    stable_placeholder_environment_keys: std::collections::BTreeSet<String>,
+}
+
+impl ProviderBindings {
+    fn of(provider: &openshell_core::grpc_client::ProviderEnvironmentResult) -> Self {
+        Self {
+            attachment_epoch: provider.provider_attachment_epoch.clone(),
+            policy_hash: provider.policy_hash.clone(),
+            environment_keys: provider.environment.keys().cloned().collect(),
+            non_secret_environment: provider
+                .non_secret_environment_keys
+                .iter()
+                .map(|key| {
+                    (
+                        key.clone(),
+                        provider.environment.get(key).cloned().unwrap_or_default(),
+                    )
+                })
+                .collect(),
+            file_paths: provider.files.keys().cloned().collect(),
+            dynamic_credentials: provider
+                .dynamic_credentials
+                .iter()
+                .map(|(key, credential)| (key.clone(), credential.clone()))
+                .collect(),
+            static_credential_bindings: provider
+                .static_credential_bindings
+                .iter()
+                .map(|(key, binding)| (key.clone(), binding.clone()))
+                .collect(),
+            stable_placeholder_environment_keys: provider
+                .stable_placeholder_environment_keys
+                .iter()
+                .cloned()
+                .collect(),
+        }
+    }
 }
 
 impl CapturedProviderEnvironment {
@@ -2284,6 +2362,7 @@ impl CapturedProviderEnvironment {
                 .filter(|expiry| *expiry > 0)
                 .min(),
             identity: EnvironmentIdentity::from_environment(provider),
+            bindings: Arc::new(ProviderBindings::of(provider)),
         }
     }
 }
@@ -3765,6 +3844,8 @@ struct PolicyPollLoopContext {
     ocsf_enabled: Arc<AtomicBool>,
     ocsf_schema_version: Arc<std::sync::Mutex<String>>,
     provider_credentials: ProviderCredentialState,
+    /// The bindings of the provider environment installed at startup, if any.
+    startup_provider_bindings: Option<Arc<ProviderBindings>>,
     provider_readiness: ProviderReadinessTracker,
     policy_local_ctx: Option<Arc<openshell_supervisor_network::policy_local::PolicyLocalContext>>,
     agent_proposals: AgentProposals,
