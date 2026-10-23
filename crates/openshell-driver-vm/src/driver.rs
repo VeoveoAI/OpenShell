@@ -12027,7 +12027,9 @@ mod tests {
             nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
         )
         .unwrap();
-        let mut child = Command::new("sh")
+        // bash, not sh: dash gives an asynchronous list /dev/null as stdin even
+        // with an explicit `<&0`, so the stand-in would see EOF at once.
+        let mut child = Command::new("bash")
             .arg("-c")
             .arg(
                 r#"(cat >/dev/null; touch "$0.eof") <&0 &
