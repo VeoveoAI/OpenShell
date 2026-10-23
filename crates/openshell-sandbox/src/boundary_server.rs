@@ -496,11 +496,13 @@ mod linux {
         loop {
             if BOUNDARY_TERMINATION_REQUESTED.load(Ordering::Acquire) {
                 let signal = BOUNDARY_TERMINATION_SIGNAL.load(Ordering::Acquire);
-                let before_supervisor_confirmation = !matches!(
-                    *lock(&runtime.supervisor_connection),
-                    SupervisorConnectionState::Connected(_)
-                );
-                runtime.shutdown();
+                let connection = *lock(&runtime.supervisor_connection);
+                let before_supervisor_confirmation =
+                    !matches!(connection, SupervisorConnectionState::Connected(_));
+                runtime.shutdown(matches!(
+                    connection,
+                    SupervisorConnectionState::Frozen { .. }
+                ));
                 if before_supervisor_confirmation {
                     return Err(format!(
                         "sandbox boundary received {} before supervisor confirmation",
@@ -2065,7 +2067,14 @@ mod linux {
             !process.boundary_runtime.has_owned_processes()
         }
 
-        fn shutdown(&self) {
+        /// End the workload for a termination signal: SIGCONT and SIGTERM, then
+        /// SIGKILL after the stop grace, as recovery loss does. It waits on the
+        /// process runtime, which must outlive the wait, until the workload's
+        /// exit is recorded. The supervisor's pending `Wait` answers from that
+        /// record, which an async task makes; dropping the runtime first
+        /// cancels the task and leaves the `Wait` blocked on its pool thread,
+        /// and the runtime's drop waits for that thread until the pod is killed.
+        fn shutdown(&self, enforcement_lost: bool) {
             let process = {
                 let state = lock(&self.state);
                 match &*state {
@@ -2075,9 +2084,24 @@ mod linux {
                     | RuntimeState::Ready(_) => None,
                 }
             };
-            if let Some(process) = process {
-                process.boundary_runtime.deactivate();
-            }
+            let Some(process) = process else {
+                return;
+            };
+            self.process_runtime.block_on(async {
+                if let Err(error) = Self::terminate_process_tree(&process, enforcement_lost).await {
+                    tracing::error!(%error, "sandbox workload did not terminate");
+                }
+                let recorded = tokio::time::timeout(FORCE_KILL_REAP_TIMEOUT, async {
+                    while !process.has_exited() {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                })
+                .await;
+                if recorded.is_err() {
+                    tracing::error!("sandbox workload exit was not recorded");
+                }
+            });
+            process.boundary_runtime.deactivate();
         }
 
         fn dispatch(&self, envelope: RequestEnvelope) -> Response {
@@ -5724,6 +5748,127 @@ mod linux {
                 assert_eq!(&second_ack, b"ack2");
             });
             server.join().expect("TLS boundary server thread");
+        }
+
+        /// A pod deletion sends the boundary SIGTERM while the supervisor's
+        /// `Wait` for the main process is still blocked on a pool thread. The
+        /// boundary then shuts its process runtime down, and the process must
+        /// still exit: the pending wait has to see the workload end.
+        #[test]
+        fn terminating_the_boundary_ends_a_pending_main_process_wait() {
+            const CHILD_MARKER: &str = "OPENSHELL_TEST_BOUNDARY_TERMINATION_WAIT_CHILD";
+            if std::env::var_os(CHILD_MARKER).is_none() {
+                let mut child = std::process::Command::new(
+                    std::env::current_exe().expect("current test executable"),
+                )
+                .args([
+                    "--exact",
+                    "boundary_server::linux::tests::terminating_the_boundary_ends_a_pending_main_process_wait",
+                    "--nocapture",
+                ])
+                .env(CHILD_MARKER, "1")
+                .spawn()
+                .expect("run isolated termination test");
+                let deadline = std::time::Instant::now() + Duration::from_secs(20);
+                let status = loop {
+                    if let Some(status) = child.try_wait().expect("poll isolated test") {
+                        break status;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        panic!("the boundary's process runtime did not shut down within 20 s");
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                };
+                assert!(status.success(), "isolated termination test failed");
+                return;
+            }
+
+            let process_runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("test process runtime");
+            let (network_broker, workload_launcher) = test_network_broker();
+            let boundary = Arc::new(
+                BoundaryRuntime::new(
+                    BoundaryConfig {
+                        boundary_id: "sandbox-termination".to_string(),
+                        generation: "generation-termination".to_string(),
+                        session_id: test_session_id(),
+                        session_rotation: openshell_core::jwt::SessionRotation::new(1)
+                            .expect("session rotation"),
+                        auth_epoch: CredentialEpoch::new(1).expect("auth epoch"),
+                        gateway_id: "test-gateway".to_string(),
+                        verification_keys: vec![test_verification_key()],
+                        listener: BoundaryListenerConfig::TlsTcp {
+                            address: "127.0.0.1:5500".parse().expect("control address"),
+                            tls: placeholder_server_tls(),
+                        },
+                        resource_claims: std::collections::BTreeMap::new(),
+                        resource_claim_files: std::collections::BTreeMap::new(),
+                        workload_identity: test_workload_identity(),
+                        provisioning_evidence: test_provisioning_evidence(),
+                        child_env: std::collections::HashMap::new(),
+                    },
+                    process_runtime.handle().clone(),
+                    network_broker,
+                    workload_launcher,
+                    test_runtime_qualification(),
+                )
+                .expect("test boundary runtime"),
+            );
+            let policy = SandboxPolicyWire::from(openshell_core::policy::SandboxPolicy {
+                version: 1,
+                filesystem: openshell_core::policy::FilesystemPolicy::default(),
+                network: openshell_core::policy::NetworkPolicy::default(),
+                landlock: openshell_core::policy::LandlockPolicy::default(),
+                process: openshell_core::policy::ProcessPolicy::default(),
+            });
+            assert!(matches!(boundary.attach(policy), Response::Attached { .. }));
+            assert!(matches!(boundary.confirm(), Response::Confirmed { .. }));
+            let Response::Started { process_id, .. } = boundary.start_agent(
+                "sandbox-termination".to_string(),
+                AgentSpecWire {
+                    program: "/bin/sleep".to_string(),
+                    args: vec!["60".to_string()],
+                    workdir: None,
+                    timeout_secs: 120,
+                    interactive: false,
+                },
+                None,
+                None,
+                0,
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            ) else {
+                panic!("the agent did not start");
+            };
+            // As the supervisor's `Wait` exchange does, on a pool thread.
+            let waiting = boundary.clone();
+            let pending_wait = process_runtime.spawn_blocking(move || {
+                waiting.dispatch(
+                    RequestEnvelope::new(Request::Wait { process_id }).expect("build wait request"),
+                )
+            });
+            std::thread::sleep(Duration::from_millis(200));
+            assert!(!pending_wait.is_finished(), "the wait answers only at exit");
+
+            // What `serve` does once SIGTERM arrives, then what returning from
+            // `run_boundary` does with the process runtime.
+            let started = std::time::Instant::now();
+            boundary.shutdown(false);
+            assert!(matches!(
+                process_runtime.block_on(pending_wait).expect("wait task"),
+                Response::Exited { .. }
+            ));
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "a workload that exits on SIGTERM ends at once, took {:?}",
+                started.elapsed()
+            );
+            drop(boundary);
+            drop(process_runtime);
         }
 
         #[test]
