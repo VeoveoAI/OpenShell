@@ -1084,6 +1084,9 @@ fn connect_local_tcp(
         }
         return match started {
             Ok(()) => listener.respond_value(notification.id, 0),
+            // The workload's native result while the kernel completes the
+            // handshake on the shared socket, not a denial.
+            Err(_) if in_progress => listener.respond_errno(notification.id, libc::EINPROGRESS),
             Err(error) => Err(error),
         };
     }
@@ -2843,6 +2846,55 @@ mod tests {
         );
         broker.set_workload_frozen(false);
         assert_eq!(run_workload(&launcher), "kill=0 tgkill=0");
+    }
+
+    #[test]
+    fn a_nonblocking_loopback_connect_in_progress_is_not_logged_as_a_denial() {
+        const CHILD: &str = "OPENSHELL_TEST_NONBLOCKING_CONNECT_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            tracing_subscriber::fmt()
+                .with_writer(io::stderr)
+                .with_ansi(false)
+                .init();
+            let target = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = target.local_addr().unwrap();
+            let (launcher, listener) = crate::linux::workload_launcher::start().unwrap();
+            let _broker = NetworkBroker::start_for_test(listener).unwrap();
+            let result = launcher
+                .execute(move || {
+                    let socket = socket2::Socket::new(
+                        socket2::Domain::IPV4,
+                        socket2::Type::STREAM.nonblocking(),
+                        None,
+                    )
+                    .unwrap();
+                    socket
+                        .connect(&address.into())
+                        .err()
+                        .and_then(|error| error.raw_os_error())
+                })
+                .unwrap();
+            println!("connect={result:?}");
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "network_broker::tests::a_nonblocking_loopback_connect_in_progress_is_not_logged_as_a_denial",
+                "--nocapture",
+                "--quiet",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}{stderr}");
+        assert!(
+            stdout.contains(&format!("connect={:?}", Some(libc::EINPROGRESS))),
+            "{stdout}"
+        );
+        assert!(!stderr.contains("notification denied"), "{stderr}");
     }
 
     #[test]
