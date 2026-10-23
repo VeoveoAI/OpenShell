@@ -16,6 +16,11 @@ rules:
     resources: ["persistentvolumeclaims"]
     verbs: ["get"]
   {{- end }}
+  # A delete with keep_workspace detaches the sandbox's workspace claim; the
+  # next sandbox of the same name restores it for adoption.
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "patch"]
   - apiGroups:
       - agents.x-k8s.io
     resources:

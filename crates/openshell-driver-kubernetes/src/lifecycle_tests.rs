@@ -281,7 +281,7 @@ mod lifecycle_reconciliation {
         };
         let mut create = Box::pin(driver.create_sandbox(&sandbox));
         let mut stop = Box::pin(driver.stop_sandbox("sandbox-1"));
-        let mut delete = Box::pin(driver.delete_sandbox("sandbox-1"));
+        let mut delete = Box::pin(driver.delete_sandbox("sandbox-1", false));
         let mut start = Box::pin(driver.start_sandbox("sandbox-1", "", &[], ""));
         assert!(futures::poll!(&mut create).is_pending());
         assert!(futures::poll!(&mut stop).is_pending());

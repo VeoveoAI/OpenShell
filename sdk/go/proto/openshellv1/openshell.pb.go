@@ -1055,9 +1055,13 @@ func (ProviderCredentialRefreshRecoveryAction) EnumDescriptor() ([]byte, []int) 
 	return file_openshell_proto_rawDescGZIP(), []int{16}
 }
 
-// Policy applied when the canonical main process exits outside an intentional
-// stop or delete operation. Kept after existing enums so generated enum
-// descriptors remain stable.
+// Runtime replacement policy for canonical main-process exits outside explicit
+// Stop/Delete, and narrowly driver-reported termination of an admitted runtime
+// without a canonical result. Always/OnFailure may recover that infrastructure
+// loss; no command exit code is inferred. Never, explicit Stop/Delete and a
+// recorded terminal result are not revived by infrastructure-loss recovery.
+// This does not authorize automatic recovery of a generic missing runtime.
+// Kept after existing enums so generated enum descriptors remain stable.
 type SandboxRestartPolicy int32
 
 const (
@@ -2473,8 +2477,11 @@ type SandboxSpec struct {
 	// Gateway-owned attachment identity, changed atomically with the provider set.
 	// Equality only: detach and reattach must not revive an older receipt.
 	ProviderAttachmentEpoch string `protobuf:"bytes,14,opt,name=provider_attachment_epoch,json=providerAttachmentEpoch,proto3" json:"provider_attachment_epoch,omitempty"`
-	// Gateway-owned policy for replacing the sandbox runtime after the canonical
-	// main process exits. Unspecified is normalized to Never before persistence.
+	// Gateway-owned runtime replacement policy after canonical main-process exit
+	// or a driver's narrowly reported termination of an admitted runtime without
+	// a canonical result. Always/OnFailure may recover the latter without inferring
+	// a command exit code. Never and explicit Stop/Delete do not trigger revival.
+	// Unspecified is normalized to Never before persistence.
 	RestartPolicy SandboxRestartPolicy `protobuf:"varint,15,opt,name=restart_policy,json=restartPolicy,proto3,enum=openshell.v1.SandboxRestartPolicy" json:"restart_policy,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -3244,8 +3251,11 @@ type SandboxStatus struct {
 	// failures before a configured endpoint or credential could be selected.
 	// Matching grant success or a policy, provider, or supervisor reset clears it.
 	LastTokenGrantFailure *TokenGrantFailureObservation `protobuf:"bytes,17,opt,name=last_token_grant_failure,json=lastTokenGrantFailure,proto3" json:"last_token_grant_failure,omitempty"`
-	unknownFields         protoimpl.UnknownFields
-	sizeCache             protoimpl.SizeCache
+	// Set with the Deleting phase when the delete keeps the workspace volume, so
+	// that a reasserted delete of this sandbox keeps it too.
+	DeleteKeepsWorkspace bool `protobuf:"varint,18,opt,name=delete_keeps_workspace,json=deleteKeepsWorkspace,proto3" json:"delete_keeps_workspace,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *SandboxStatus) Reset() {
@@ -3388,6 +3398,13 @@ func (x *SandboxStatus) GetLastTokenGrantFailure() *TokenGrantFailureObservation
 		return x.LastTokenGrantFailure
 	}
 	return nil
+}
+
+func (x *SandboxStatus) GetDeleteKeepsWorkspace() bool {
+	if x != nil {
+		return x.DeleteKeepsWorkspace
+	}
+	return false
 }
 
 // User-facing sandbox condition derived from platform or gateway observations.
@@ -4612,6 +4629,11 @@ type DeleteSandboxRequest struct {
 	// Succeed with ALREADY_ABSENT if the target is missing. Does not wait for
 	// asynchronous cleanup and does not suppress authorization or parent errors.
 	AllowMissing bool `protobuf:"varint,3,opt,name=allow_missing,json=allowMissing,proto3" json:"allow_missing,omitempty"`
+	// Keep the sandbox's workspace volume. The next sandbox of the same name in
+	// the same workspace adopts it unchanged, and an ordinary delete still
+	// removes it. A compute driver that cannot keep it refuses the request with
+	// FAILED_PRECONDITION before the sandbox changes.
+	KeepWorkspace bool `protobuf:"varint,5,opt,name=keep_workspace,json=keepWorkspace,proto3" json:"keep_workspace,omitempty"`
 	// Optional nonzero UUID for durable at-most-once admission. Successful results
 	// can be replayed for 24 hours; see the API errors and retries reference.
 	RequestId     string `protobuf:"bytes,4,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
@@ -4666,6 +4688,13 @@ func (x *DeleteSandboxRequest) GetName() string {
 func (x *DeleteSandboxRequest) GetAllowMissing() bool {
 	if x != nil {
 		return x.AllowMissing
+	}
+	return false
+}
+
+func (x *DeleteSandboxRequest) GetKeepWorkspace() bool {
+	if x != nil {
+		return x.KeepWorkspace
 	}
 	return false
 }
@@ -19542,7 +19571,7 @@ const file_openshell_proto_rawDesc = "" +
 	"\tmax_burst\x18\x02 \x01(\rR\bmaxBurst\"b\n" +
 	"!SandboxWorkloadTemplateProvenance\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12)\n" +
-	"\x10resource_version\x18\x02 \x01(\tR\x0fresourceVersion\"\xf2\a\n" +
+	"\x10resource_version\x18\x02 \x01(\tR\x0fresourceVersion\"\xa8\b\n" +
 	"\rSandboxStatus\x12\x1b\n" +
 	"\tagent_pod\x18\x02 \x01(\tR\bagentPod\x12\x19\n" +
 	"\bagent_fd\x18\x03 \x01(\tR\aagentFd\x12\x1d\n" +
@@ -19563,7 +19592,8 @@ const file_openshell_proto_rawDesc = "" +
 	"\rrestart_count\x18\x0e \x01(\rR\frestartCount\x12F\n" +
 	"\x11next_restart_time\x18\x0f \x01(\v2\x1a.google.protobuf.TimestampR\x0fnextRestartTime\x12U\n" +
 	"\x19main_process_started_time\x18\x10 \x01(\v2\x1a.google.protobuf.TimestampR\x16mainProcessStartedTime\x12c\n" +
-	"\x18last_token_grant_failure\x18\x11 \x01(\v2*.openshell.v1.TokenGrantFailureObservationR\x15lastTokenGrantFailureB\f\n" +
+	"\x18last_token_grant_failure\x18\x11 \x01(\v2*.openshell.v1.TokenGrantFailureObservationR\x15lastTokenGrantFailure\x124\n" +
+	"\x16delete_keeps_workspace\x18\x12 \x01(\bR\x14deleteKeepsWorkspaceB\f\n" +
 	"\n" +
 	"_exit_codeB\x1a\n" +
 	"\x18_configuration_activated\"\xd1\x01\n" +
@@ -19667,11 +19697,12 @@ const file_openshell_proto_rawDesc = "" +
 	"\bprovider\x18\x02 \x01(\tR\bprovider\x12:\n" +
 	"\x19expected_resource_version\x18\x03 \x01(\x04R\x17expectedResourceVersion\x12\x1d\n" +
 	"\n" +
-	"request_id\x18\x05 \x01(\tR\trequestId\"\xc2\x01\n" +
+	"request_id\x18\x05 \x01(\tR\trequestId\"\xe9\x01\n" +
 	"\x14DeleteSandboxRequest\x12R\n" +
 	"\x0fworkspace_scope\x18\x02 \x01(\v2).openshell.datamodel.v1.WorkspaceSelectorR\x0eworkspaceScope\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12#\n" +
-	"\rallow_missing\x18\x03 \x01(\bR\fallowMissing\x12\x1d\n" +
+	"\rallow_missing\x18\x03 \x01(\bR\fallowMissing\x12%\n" +
+	"\x0ekeep_workspace\x18\x05 \x01(\bR\rkeepWorkspace\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x04 \x01(\tR\trequestId\"\x9b\x01\n" +
 	"\x12StopSandboxRequest\x12R\n" +

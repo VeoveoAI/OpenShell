@@ -93,6 +93,16 @@ tests:
             resources: ["configmaps"]
             verbs: ["get"]
 
+  - it: lets shared mode keep a deleted sandbox's workspace claim
+    template: templates/role.yaml
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["persistentvolumeclaims"]
+            verbs: ["get", "patch"]
+
   - it: grants PVC admission reads only when caller driver config is enabled
     template: templates/role.yaml
     set:

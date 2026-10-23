@@ -1225,6 +1225,9 @@ message SandboxStatus {
   // failures before a configured endpoint or credential could be selected.
   // Matching grant success or a policy, provider, or supervisor reset clears it.
   TokenGrantFailureObservation last_token_grant_failure = 17;
+  // Set with the Deleting phase when the delete keeps the workspace volume, so
+  // that a reasserted delete of this sandbox keeps it too.
+  bool delete_keeps_workspace = 18;
 }
 
 // User-facing sandbox condition derived from platform or gateway observations.
@@ -1467,6 +1470,11 @@ message DeleteSandboxRequest {
   // Succeed with ALREADY_ABSENT if the target is missing. Does not wait for
   // asynchronous cleanup and does not suppress authorization or parent errors.
   bool allow_missing = 3;
+  // Keep the sandbox's workspace volume. The next sandbox of the same name in
+  // the same workspace adopts it unchanged, and an ordinary delete still
+  // removes it. A compute driver that cannot keep it refuses the request with
+  // FAILED_PRECONDITION before the sandbox changes.
+  bool keep_workspace = 5;
   // Optional nonzero UUID for durable at-most-once admission. Successful results
   // can be replayed for 24 hours; see the API errors and retries reference.
   string request_id = 4;

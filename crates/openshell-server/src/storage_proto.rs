@@ -156,10 +156,13 @@ mod tests {
     // Sandbox-wide grant reporting adds TokenGrantFailureObservation to both
     // closures and TokenGrantStatus to public reports. Older rows have no grant
     // record; absent report extensions retain compatibility without a rewrite.
+    // DeleteSandboxRequest.keep_workspace is public only; the durable
+    // SandboxStatus.delete_keeps_workspace decodes false from older rows, which
+    // is the ordinary delete.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "a91e2244a2c1a8e369efe85bd0e4f2769f0f29f6263137280fe38e8a8da3cc6e";
+        "225dcc03232d76f9f0dedaf97c293ff969324bafd6a3338aee6cea222994a9c8";
     const DURABLE_SCHEMA_SHA256: &str =
-        "d4dc7abdb91b919db1f7be0d4652e30cbfda86f3b2ed9b59d5de1f76a2bf691d";
+        "937ff3aef6244627d6485bf101b68d8a04db3c0a8a02c3ea761aa7a1dd30ff80";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "ac1ffc4b5b81467de27270a4e33f6db1e31eeb2c52f79750dbaaf19515eadbb2";
     // Encoded with the schema that omitted stable_placeholder. Keep these

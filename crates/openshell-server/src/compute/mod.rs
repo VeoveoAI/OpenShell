@@ -309,6 +309,8 @@ pub struct SandboxLifecycleGuard {
 struct SandboxDeleteTarget {
     sandbox_id: String,
     sandbox_name: String,
+    /// Keep the sandbox's workspace volume for the next sandbox of its name.
+    keep_workspace: bool,
 }
 
 /// Optional caller-owned preconditions for an identity-safe sandbox delete.
@@ -381,6 +383,8 @@ pub struct ComputeDriverInfoSnapshot {
     pub supports_sandbox_authentication: bool,
     /// Whether the driver reports runtime readiness without a supervisor session.
     pub driver_reports_runtime_readiness: bool,
+    /// Whether the driver can keep a sandbox's workspace volume on delete.
+    pub supports_workspace_keep: bool,
     /// Static portable resource request forms from the startup capability snapshot.
     pub resource_capabilities: Option<DriverResourceCapabilities>,
     /// Directory where rootfs tar files must be staged.
@@ -848,6 +852,7 @@ impl ComputeRuntime {
             gateway_manages_lifecycle: capabilities.gateway_manages_lifecycle,
             supports_sandbox_authentication: capabilities.supports_sandbox_authentication,
             driver_reports_runtime_readiness: capabilities.driver_reports_runtime_readiness,
+            supports_workspace_keep: capabilities.supports_workspace_keep,
             resource_capabilities: capabilities.resource_capabilities,
             rootfs_tar_staging_dir: capabilities.rootfs_tar_staging_dir,
             rootfs_tar_max_bytes: capabilities.rootfs_tar_max_bytes,
@@ -1804,6 +1809,7 @@ impl ComputeRuntime {
                             .delete_sandbox(Request::new(DeleteSandboxRequest {
                                 sandbox_id,
                                 name: sandbox_name,
+                                keep_workspace: false,
                             }))
                             .await
                     }
@@ -2806,21 +2812,6 @@ impl ComputeRuntime {
         .await
     }
 
-    pub(crate) async fn delete_sandbox_allow_missing(
-        &self,
-        workspace: &str,
-        name: &str,
-        allow_missing: bool,
-    ) -> Result<DeleteSandboxResult, Status> {
-        self.delete_sandbox_with_options(
-            workspace,
-            name,
-            allow_missing,
-            SandboxDeletePreconditions::default(),
-        )
-        .await
-    }
-
     #[cfg(test)]
     pub(crate) async fn delete_sandbox_with_preconditions(
         &self,
@@ -2828,24 +2819,28 @@ impl ComputeRuntime {
         name: &str,
         preconditions: SandboxDeletePreconditions,
     ) -> Result<DeleteSandboxResult, Status> {
-        self.delete_sandbox_with_options(workspace, name, false, preconditions)
+        self.delete_sandbox_with_options(workspace, name, false, false, preconditions)
             .await
     }
 
+    /// The public delete: `keep_workspace` keeps the sandbox's workspace volume
+    /// for the next sandbox of the same name in the same workspace.
     pub(crate) async fn delete_sandbox_allow_missing_with_preconditions(
         &self,
         workspace: &str,
         name: &str,
         allow_missing: bool,
+        keep_workspace: bool,
         preconditions: SandboxDeletePreconditions,
     ) -> Result<DeleteSandboxResult, Status> {
-        if preconditions == SandboxDeletePreconditions::default() {
-            return self
-                .delete_sandbox_allow_missing(workspace, name, allow_missing)
-                .await;
-        }
-        self.delete_sandbox_with_options(workspace, name, allow_missing, preconditions)
-            .await
+        self.delete_sandbox_with_options(
+            workspace,
+            name,
+            allow_missing,
+            keep_workspace,
+            preconditions,
+        )
+        .await
     }
 
     async fn delete_sandbox_with_options(
@@ -2853,8 +2848,16 @@ impl ComputeRuntime {
         workspace: &str,
         name: &str,
         allow_missing: bool,
+        keep_workspace: bool,
         preconditions: SandboxDeletePreconditions,
     ) -> Result<DeleteSandboxResult, Status> {
+        // Refuse before any lookup or mutation: the sandbox stays as it is.
+        if keep_workspace && !self.driver_info.supports_workspace_keep {
+            return Err(Status::failed_precondition(format!(
+                "the {} compute driver cannot keep a sandbox's workspace on delete",
+                self.driver_info.name
+            )));
+        }
         if preconditions.expected_resource_version.is_some()
             && preconditions.expected_sandbox_id.is_none()
         {
@@ -2891,6 +2894,7 @@ impl ComputeRuntime {
         let target = SandboxDeleteTarget {
             sandbox_id: candidate.object_id().to_string(),
             sandbox_name: candidate.object_name().to_string(),
+            keep_workspace,
         };
         self.delete_sandbox_target(target, preconditions).await
     }
@@ -2904,6 +2908,7 @@ impl ComputeRuntime {
             SandboxDeleteTarget {
                 sandbox_id: sandbox_id.to_string(),
                 sandbox_name: sandbox_name.to_string(),
+                keep_workspace: false,
             },
             SandboxDeletePreconditions::default(),
         )
@@ -2990,11 +2995,27 @@ impl ComputeRuntime {
             ));
         }
 
+        // A delete in progress already decided what happens to the workspace.
+        if current.phase() == SandboxPhase::Deleting as i32
+            && delete_keeps_workspace(&current) != target.keep_workspace
+        {
+            return Err(Status::aborted(if target.keep_workspace {
+                "sandbox is already being deleted with its workspace"
+            } else {
+                "sandbox is already being deleted keeping its workspace"
+            }));
+        }
+
         // `Started` carries both sides of the CAS transition: the durable
         // `Deleting` row used to fence recovery, and the prior row used only
         // for exact-version rollback after an ambiguous driver failure.
         let transition = match self
-            .begin_sandbox_delete_with_initial_snapshot(&target.sandbox_id, Some(current), None)
+            .begin_sandbox_delete(
+                &target.sandbox_id,
+                Some(current),
+                None,
+                target.keep_workspace,
+            )
             .await?
         {
             BeginDelete::AlreadyDeleting => {
@@ -3018,11 +3039,13 @@ impl ComputeRuntime {
                 |driver| {
                     let sandbox_id = transition.deleting.object_id().to_string();
                     let sandbox_name = transition.deleting.object_name().to_string();
+                    let keep_workspace = delete_keeps_workspace(&transition.deleting);
                     async move {
                         driver
                             .delete_sandbox(Request::new(DeleteSandboxRequest {
                                 sandbox_id,
                                 name: sandbox_name,
+                                keep_workspace,
                             }))
                             .await
                     }
@@ -3072,8 +3095,21 @@ impl ComputeRuntime {
     async fn begin_sandbox_delete_with_initial_snapshot(
         &self,
         sandbox_id: &str,
+        initial_snapshot: Option<Sandbox>,
+        failed_create: Option<&Sandbox>,
+    ) -> Result<BeginDelete, Status> {
+        Box::pin(self.begin_sandbox_delete(sandbox_id, initial_snapshot, failed_create, false))
+            .await
+    }
+
+    /// Record the durable `Deleting` phase, with whether this delete keeps the
+    /// sandbox's workspace volume.
+    async fn begin_sandbox_delete(
+        &self,
+        sandbox_id: &str,
         mut initial_snapshot: Option<Sandbox>,
         failed_create: Option<&Sandbox>,
+        keep_workspace: bool,
     ) -> Result<BeginDelete, Status> {
         let operation = "set sandbox phase to Deleting";
 
@@ -3105,7 +3141,7 @@ impl ComputeRuntime {
             let previous = sandbox.clone();
 
             match self
-                .write_sandbox_phase_deleting_from_snapshot(sandbox)
+                .write_sandbox_phase_deleting_from_snapshot(sandbox, keep_workspace)
                 .await
             {
                 Ok(deleting) => {
@@ -3502,6 +3538,7 @@ impl ComputeRuntime {
     async fn write_sandbox_phase_deleting_from_snapshot(
         &self,
         mut sandbox: Sandbox,
+        keep_workspace: bool,
     ) -> crate::persistence::PersistenceResult<Sandbox> {
         let id = sandbox.object_id().to_string();
         let name = sandbox.object_name().to_string();
@@ -3511,6 +3548,10 @@ impl ComputeRuntime {
             .map_or(0, |metadata| metadata.resource_version);
 
         sandbox.set_phase(SandboxPhase::Deleting as i32);
+        sandbox
+            .status
+            .get_or_insert_with(Default::default)
+            .delete_keeps_workspace = keep_workspace;
 
         let labels_json = sandbox
             .metadata
@@ -4818,6 +4859,8 @@ impl ComputeRuntime {
                 }
             }
             None | Some(SandboxPhase::Deleting) => {
+                // A delete that keeps the workspace is reasserted as one.
+                let keep_workspace = latest.as_ref().is_some_and(delete_keeps_workspace);
                 let result = self
                     .driver
                     .call(
@@ -4831,6 +4874,7 @@ impl ComputeRuntime {
                                     .delete_sandbox(Request::new(DeleteSandboxRequest {
                                         sandbox_id,
                                         name: sandbox_name,
+                                        keep_workspace,
                                     }))
                                     .await
                             }
@@ -5914,6 +5958,7 @@ impl ComputeRuntime {
                             .delete_sandbox(Request::new(DeleteSandboxRequest {
                                 sandbox_id,
                                 name: sandbox_name,
+                                keep_workspace: false,
                             }))
                             .await
                     }
@@ -7056,6 +7101,14 @@ fn sandbox_provisioning_attempt_id(sandbox: &Sandbox) -> Option<&str> {
         .map(|record| record.attempt_id.as_str())
 }
 
+/// Whether the durable `Deleting` row keeps the sandbox's workspace volume.
+fn delete_keeps_workspace(sandbox: &Sandbox) -> bool {
+    sandbox
+        .status
+        .as_ref()
+        .is_some_and(|status| status.delete_keeps_workspace)
+}
+
 fn sandbox_resource_version(sandbox: &Sandbox) -> u64 {
     sandbox
         .metadata
@@ -7131,6 +7184,7 @@ fn public_status_from_driver(
         next_restart_time: None,
         main_process_started_time: None,
         last_token_grant_failure: None,
+        delete_keeps_workspace: false,
     }
 }
 
@@ -7210,6 +7264,7 @@ fn apply_driver_snapshot(
         new_status.restart_count = old_status.restart_count;
         new_status.next_restart_time = old_status.next_restart_time;
         new_status.main_process_started_time = old_status.main_process_started_time;
+        new_status.delete_keeps_workspace = old_status.delete_keeps_workspace;
         if is_automatic_restart_transition(sandbox) {
             new_status.conditions.extend(
                 old_status
@@ -7913,6 +7968,7 @@ impl ComputeDriver for NoopTestDriver {
                 gateway_manages_lifecycle: false,
                 supports_sandbox_authentication: self.sandbox_authentication.is_some(),
                 driver_reports_runtime_readiness: false,
+                supports_workspace_keep: false,
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
@@ -8097,6 +8153,7 @@ pub fn new_test_runtime_with_driver(
             gateway_manages_lifecycle: false,
             supports_sandbox_authentication,
             driver_reports_runtime_readiness: false,
+            supports_workspace_keep: false,
             resource_capabilities: None,
             rootfs_tar_staging_dir: String::new(),
             rootfs_tar_max_bytes: 0,
@@ -8527,6 +8584,7 @@ mod tests {
                 gateway_manages_lifecycle: false,
                 supports_sandbox_authentication: false,
                 driver_reports_runtime_readiness: false,
+                supports_workspace_keep: false,
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
@@ -8710,6 +8768,7 @@ mod tests {
         delete_blocked: AtomicBool,
         delete_calls: AtomicUsize,
         delete_requests: TestMutex<Vec<(String, String)>>,
+        delete_keep_workspace: TestMutex<Vec<bool>>,
         delete_outcome: TestMutex<ControlledDeleteOutcome>,
         create_started: Notify,
         create_finished: Notify,
@@ -8756,6 +8815,7 @@ mod tests {
                 delete_blocked: AtomicBool::new(false),
                 delete_calls: AtomicUsize::new(0),
                 delete_requests: TestMutex::new(Vec::new()),
+                delete_keep_workspace: TestMutex::new(Vec::new()),
                 delete_outcome: TestMutex::new(ControlledDeleteOutcome::Ok(true)),
                 create_started: Notify::new(),
                 create_finished: Notify::new(),
@@ -8947,6 +9007,7 @@ mod tests {
                 gateway_manages_lifecycle: false,
                 supports_sandbox_authentication: false,
                 driver_reports_runtime_readiness: false,
+                supports_workspace_keep: false,
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
@@ -9141,6 +9202,10 @@ mod tests {
             request: Request<DeleteSandboxRequest>,
         ) -> Result<tonic::Response<DeleteSandboxResponse>, Status> {
             let request = request.into_inner();
+            self.delete_keep_workspace
+                .lock()
+                .expect("delete requests lock poisoned")
+                .push(request.keep_workspace);
             self.delete_requests
                 .lock()
                 .expect("delete requests lock poisoned")
@@ -9223,6 +9288,7 @@ mod tests {
                 gateway_manages_lifecycle: false,
                 supports_sandbox_authentication: false,
                 driver_reports_runtime_readiness: false,
+                supports_workspace_keep: false,
                 resource_capabilities: None,
                 rootfs_tar_staging_dir: String::new(),
                 rootfs_tar_max_bytes: 0,
@@ -14530,6 +14596,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_keeping_the_workspace_is_refused_before_mutation_without_driver_support() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let error = runtime
+            .delete_sandbox_allow_missing_with_preconditions(
+                "default",
+                "sandbox-a",
+                false,
+                true,
+                SandboxDeletePreconditions::default(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(
+            error.message().contains("cannot keep"),
+            "{}",
+            error.message()
+        );
+        assert_eq!(driver.delete_calls(), 0);
+        let current = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(current.phase()).unwrap(),
+            SandboxPhase::Ready
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_keeping_the_workspace_reaches_the_driver_and_the_durable_row() {
+        let driver = ControlledDriver::new();
+        driver.delete_blocked.store(true, Ordering::SeqCst);
+        let mut runtime = test_runtime(driver.clone()).await;
+        runtime.driver_info.supports_workspace_keep = true;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let delete = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                runtime
+                    .delete_sandbox_allow_missing_with_preconditions(
+                        "default",
+                        "sandbox-a",
+                        false,
+                        true,
+                        SandboxDeletePreconditions::default(),
+                    )
+                    .await
+            }
+        });
+        driver.delete_started.notified().await;
+        let deleting = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(deleting.phase()).unwrap(),
+            SandboxPhase::Deleting
+        );
+        assert!(
+            delete_keeps_workspace(&deleting),
+            "a reasserted delete reads the decision from the durable row"
+        );
+
+        driver.delete_release.add_permits(1);
+        delete.await.unwrap().unwrap();
+        assert_eq!(*driver.delete_keep_workspace.lock().unwrap(), vec![true]);
+    }
+
+    #[tokio::test]
+    async fn a_delete_cannot_change_what_a_pending_delete_does_with_the_workspace() {
+        let driver = ControlledDriver::new();
+        let mut runtime = test_runtime(driver.clone()).await;
+        runtime.driver_info.supports_workspace_keep = true;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Deleting);
+        sandbox
+            .status
+            .get_or_insert_with(Default::default)
+            .delete_keeps_workspace = true;
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let error = runtime
+            .delete_sandbox_allow_missing_with_preconditions(
+                "default",
+                "sandbox-a",
+                false,
+                false,
+                SandboxDeletePreconditions::default(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), Code::Aborted);
+        assert_eq!(driver.delete_calls(), 0);
+    }
+
+    #[tokio::test]
     async fn identity_guarded_delete_rejects_a_different_sandbox_before_mutation() {
         let driver = ControlledDriver::new();
         let runtime = test_runtime(driver.clone()).await;
@@ -18057,6 +18231,7 @@ mod tests {
                 .delete_sandbox(Request::new(DeleteSandboxRequest {
                     sandbox_id: sandbox.id,
                     name: String::new(),
+                    keep_workspace: false,
                 }))
                 .await
                 .unwrap();

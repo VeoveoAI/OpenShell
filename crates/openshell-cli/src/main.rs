@@ -1692,6 +1692,11 @@ enum SandboxCommands {
         /// Delete all sandboxes.
         #[arg(long, conflicts_with = "names")]
         all: bool,
+
+        /// Keep each sandbox's workspace volume for the next sandbox of the same
+        /// name in the workspace (Kubernetes driver only).
+        #[arg(long)]
+        keep_workspace: bool,
     },
 
     /// Stop a sandbox while preserving its workspace.
@@ -3575,11 +3580,16 @@ async fn run_async() -> Result<()> {
                             )
                             .await?;
                         }
-                        SandboxCommands::Delete { names, all } => {
+                        SandboxCommands::Delete {
+                            names,
+                            all,
+                            keep_workspace,
+                        } => {
                             run::sandbox_delete(
                                 endpoint,
                                 &names,
                                 all,
+                                keep_workspace,
                                 &cli.workspace,
                                 &tls,
                                 &ctx.name,

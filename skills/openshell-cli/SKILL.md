@@ -503,6 +503,7 @@ openshell logs my-sandbox --since 5m
 openshell sandbox delete my-sandbox
 openshell sandbox delete sandbox-1 sandbox-2 sandbox-3   # Multiple at once
 openshell sandbox delete --all
+openshell sandbox delete my-sandbox --keep-workspace   # Kubernetes: keep /sandbox for the next same-name sandbox
 ```
 
 `deletion accepted` means cleanup is still pending. Inspect the sandbox until

@@ -52,6 +52,13 @@ ownership; no lease expiry or missing runtime establishes that an external reque
 has settled. Explicit `Deleting` remains authoritative and releases owned backing
 resources. A missing row by itself does not authorize persistent-data deletion.
 
+`DeleteSandbox` with `keep_workspace` keeps the workspace volume for the next
+sandbox of the same name in the same workspace. The gateway refuses it with
+`FAILED_PRECONDITION` before any change when the driver does not report
+`supports_workspace_keep`, records the choice with the durable `Deleting` phase
+so that a reasserted delete keeps the volume too, and refuses a second delete
+that would decide differently while the first is pending.
+
 Retention does not provide durable storage. For Docker, also enable the native
 `persistent_workspace` option; see the Docker driver README. Runtime labels prove
 backing-resource ownership, not desired lifecycle. Ordinary and ephemeral sandbox

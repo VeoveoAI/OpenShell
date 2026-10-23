@@ -1710,6 +1710,7 @@ async fn sandbox_delete_continues_after_entry_failure() {
         &server.endpoint,
         &["failing-sandbox".to_string(), "later-sandbox".to_string()],
         false,
+        false,
         "default",
         &tls,
         "openshell",

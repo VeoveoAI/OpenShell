@@ -107,6 +107,11 @@ rules:
     verbs: ["create", "get"]
   {{- end }}
   {{- if eq $workspaceMode "managed" }}
+  # A delete with keep_workspace detaches the sandbox's workspace claim; the
+  # next sandbox of the same name restores it for adoption.
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "patch"]
   # Operator-mode namespaces receive Secret permissions from the
   # openshell-workspace chart Role instead.
   - apiGroups: [""]

@@ -358,6 +358,7 @@ impl OpenShellClient {
                 let request = proto::DeleteSandboxRequest {
                     request_id: String::new(),
                     allow_missing: opts.allow_missing,
+                    keep_workspace: false,
                     name: name.to_string(),
                     workspace_scope: Some(proto::workspace_selector("default")),
                 };
@@ -1074,6 +1075,7 @@ impl WorkspaceScopedClient {
                 let request = proto::DeleteSandboxRequest {
                     request_id: String::new(),
                     allow_missing: opts.allow_missing,
+                    keep_workspace: false,
                     name: name.to_string(),
                     workspace_scope: Some(proto::workspace_selector(&self.workspace)),
                 };

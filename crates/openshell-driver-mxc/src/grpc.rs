@@ -145,6 +145,11 @@ impl ComputeDriver for ComputeDriverService {
         if req.name.is_empty() {
             return Err(Status::invalid_argument("name is required"));
         }
+        if req.keep_workspace {
+            return Err(openshell_core::driver_utils::workspace_keep_unsupported(
+                "mxc",
+            ));
+        }
         let deleted = self
             .backend
             .delete_sandbox(&req.sandbox_id, &req.name)

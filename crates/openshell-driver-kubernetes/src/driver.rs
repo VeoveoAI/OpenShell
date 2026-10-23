@@ -24,8 +24,8 @@ use k8s_openapi::api::authentication::v1::{
     TokenReview, TokenReviewSpec, TokenReviewStatus, UserInfo,
 };
 use k8s_openapi::api::core::v1::{
-    Event as KubeEventObj, Namespace, Node, PersistentVolumeClaimVolumeSource, Pod, Secret,
-    Service, ServiceAccount, Volume, VolumeMount,
+    Event as KubeEventObj, Namespace, Node, PersistentVolumeClaim,
+    PersistentVolumeClaimVolumeSource, Pod, Secret, Service, ServiceAccount, Volume, VolumeMount,
 };
 use k8s_openapi::api::networking::v1::{
     NetworkPolicy, NetworkPolicyIngressRule, NetworkPolicyPeer, NetworkPolicyPort,
@@ -734,6 +734,65 @@ const WORKSPACE_INIT_CONTAINER_NAME: &str = "workspace-init";
 /// `/sandbox` contents.  Subsequent pod starts skip the copy.
 const WORKSPACE_SENTINEL: &str = ".workspace-initialized";
 
+/// The Agent Sandbox controller's per-name tracking label. It creates each
+/// workspace claim with this label and adopts an unowned claim of the expected
+/// name only when the label carries the hash of the Sandbox's name.
+const AGENT_SANDBOX_NAME_HASH_LABEL: &str = "agents.x-k8s.io/sandbox-name-hash";
+
+/// Marks a workspace claim that a delete kept. It holds the tracking label's
+/// value until the next sandbox of the same name restores that label, so no
+/// controller adopts the claim in between.
+const LABEL_KEPT_WORKSPACE: &str = "openshell.ai/kept-workspace";
+
+/// Whether a rendered Sandbox resource asks the controller for a workspace claim.
+fn obj_has_workspace_claim(data: &serde_json::Value) -> bool {
+    data["spec"]["volumeClaimTemplates"]
+        .as_array()
+        .is_some_and(|templates| {
+            templates
+                .iter()
+                .any(|template| template["metadata"]["name"] == WORKSPACE_VOLUME_NAME)
+        })
+}
+
+/// The claim the Agent Sandbox controller creates from the workspace
+/// `volumeClaimTemplates` entry of the Sandbox resource `kube_name`.
+fn workspace_claim_name(kube_name: &str) -> String {
+    format!("{WORKSPACE_VOLUME_NAME}-{kube_name}")
+}
+
+/// Detach a workspace claim from the Sandbox resource that owns it, so that
+/// deleting the resource keeps the claim, and mark it kept.
+fn kept_workspace_claim_patch(
+    resource_version: &str,
+    name_hash: &str,
+    other_owners: &[OwnerReference],
+) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": {
+            "resourceVersion": resource_version,
+            "ownerReferences": other_owners,
+            "labels": {
+                AGENT_SANDBOX_NAME_HASH_LABEL: serde_json::Value::Null,
+                LABEL_KEPT_WORKSPACE: name_hash,
+            }
+        }
+    })
+}
+
+/// Let the controller of the next Sandbox of the same name adopt a kept claim.
+fn restored_workspace_claim_patch(resource_version: &str, name_hash: &str) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": {
+            "resourceVersion": resource_version,
+            "labels": {
+                AGENT_SANDBOX_NAME_HASH_LABEL: name_hash,
+                LABEL_KEPT_WORKSPACE: serde_json::Value::Null,
+            }
+        }
+    })
+}
+
 /// Build a Kubernetes client whose requests time out after `request_timeout`.
 ///
 /// kube's `read_timeout` counts the time a pooled connection spent idle, so a
@@ -922,6 +981,7 @@ impl KubernetesComputeDriver {
             gateway_manages_lifecycle: false,
             supports_sandbox_authentication: true,
             driver_reports_runtime_readiness: false,
+            supports_workspace_keep: true,
             resource_capabilities: Some(ResourceCapabilities {
                 cpu: Some(CpuResourceCapabilities {
                     limit_supported: true,
@@ -2143,6 +2203,10 @@ impl KubernetesComputeDriver {
             ..Default::default()
         };
 
+        if obj_has_workspace_claim(&data) {
+            self.restore_kept_workspace_claim(&target_namespace, &kube_name)
+                .await?;
+        }
         obj.data = data;
         let created = match tokio::time::timeout(
             KUBE_API_TIMEOUT,
@@ -3715,17 +3779,136 @@ impl KubernetesComputeDriver {
             sandbox.id = %sandbox_id,
         )
     )]
-    pub async fn delete_sandbox(&self, sandbox_id: &str) -> Result<bool, String> {
+    pub async fn delete_sandbox(
+        &self,
+        sandbox_id: &str,
+        keep_workspace: bool,
+    ) -> Result<bool, String> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
         let _guard = self.lifecycle_gates.gate_for(sandbox_id).lock_owned().await;
-        let result = self.delete_sandbox_inner(sandbox_id).await;
+        let result = self.delete_sandbox_inner(sandbox_id, keep_workspace).await;
         span_status.finish(result)
     }
 
-    async fn delete_sandbox_inner(&self, sandbox_id: &str) -> Result<bool, String> {
+    /// Detach the workspace claim of the Sandbox resource `kube_name` (UID
+    /// `sandbox_uid`) so that deleting the resource keeps it. A claim this
+    /// delete already kept is left as it is; a sandbox without a claim has
+    /// nothing to keep.
+    async fn keep_workspace_claim(
+        &self,
+        namespace: &str,
+        kube_name: &str,
+        sandbox_uid: &str,
+    ) -> Result<(), String> {
+        let claims = Api::<PersistentVolumeClaim>::namespaced(self.client.clone(), namespace);
+        let name = workspace_claim_name(kube_name);
+        let claim = tokio::time::timeout(KUBE_API_TIMEOUT, claims.get_opt(&name))
+            .await
+            .map_err(|_| format!("timed out reading workspace claim {name}"))?
+            .map_err(|error| format!("read workspace claim {name}: {error}"))?;
+        let Some(claim) = claim else {
+            info!(namespace, claim = %name, "Sandbox has no workspace claim to keep");
+            return Ok(());
+        };
+        let labels = claim.metadata.labels.unwrap_or_default();
+        let owners = claim.metadata.owner_references.unwrap_or_default();
+        match owners.iter().find(|owner| owner.controller == Some(true)) {
+            None if labels.contains_key(LABEL_KEPT_WORKSPACE) => return Ok(()),
+            Some(owner) if owner.uid == sandbox_uid => {}
+            _ => {
+                return Err(format!(
+                    "workspace claim {name} is not controlled by this sandbox; refusing to keep it"
+                ));
+            }
+        }
+        let name_hash = labels.get(AGENT_SANDBOX_NAME_HASH_LABEL).ok_or_else(|| {
+            format!("workspace claim {name} lacks the {AGENT_SANDBOX_NAME_HASH_LABEL} label")
+        })?;
+        let resource_version = claim
+            .metadata
+            .resource_version
+            .ok_or_else(|| format!("workspace claim {name} has no resource version"))?;
+        let other_owners: Vec<_> = owners
+            .into_iter()
+            .filter(|owner| owner.uid != sandbox_uid)
+            .collect();
+        let patch = kept_workspace_claim_patch(&resource_version, name_hash, &other_owners);
+        tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            claims.patch(&name, &PatchParams::default(), &Patch::Merge(&patch)),
+        )
+        .await
+        .map_err(|_| format!("timed out keeping workspace claim {name}"))?
+        .map_err(|error| format!("keep workspace claim {name}: {error}"))?;
+        info!(namespace, claim = %name, "Kept the sandbox's workspace claim");
+        Ok(())
+    }
+
+    /// Let the Sandbox resource `kube_name` adopt the workspace claim a delete
+    /// kept for that name: restoring the Agent Sandbox tracking label lets its
+    /// controller adopt the unowned claim unchanged, and the seed init
+    /// container then skips it by its marker file. Any other claim is left to
+    /// the controller.
+    async fn restore_kept_workspace_claim(
+        &self,
+        namespace: &str,
+        kube_name: &str,
+    ) -> Result<(), KubernetesDriverError> {
+        let claims = Api::<PersistentVolumeClaim>::namespaced(self.client.clone(), namespace);
+        let name = workspace_claim_name(kube_name);
+        let claim = tokio::time::timeout(KUBE_API_TIMEOUT, claims.get_opt(&name))
+            .await
+            .map_err(|_| {
+                KubernetesDriverError::Message(format!("timed out reading workspace claim {name}"))
+            })?
+            .map_err(KubernetesDriverError::from_kube)?;
+        let Some(claim) = claim else {
+            return Ok(());
+        };
+        let controlled = claim
+            .metadata
+            .owner_references
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|owner| owner.controller == Some(true));
+        let Some(name_hash) = claim
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(LABEL_KEPT_WORKSPACE))
+            .filter(|_| !controlled)
+        else {
+            return Ok(());
+        };
+        let resource_version = claim.metadata.resource_version.clone().ok_or_else(|| {
+            KubernetesDriverError::Message(format!(
+                "workspace claim {name} has no resource version"
+            ))
+        })?;
+        let patch = restored_workspace_claim_patch(&resource_version, name_hash);
+        tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            claims.patch(&name, &PatchParams::default(), &Patch::Merge(&patch)),
+        )
+        .await
+        .map_err(|_| {
+            KubernetesDriverError::Message(format!("timed out restoring workspace claim {name}"))
+        })?
+        .map_err(KubernetesDriverError::from_kube)?;
+        info!(namespace, claim = %name, "Restored a kept workspace claim for adoption");
+        Ok(())
+    }
+
+    async fn delete_sandbox_inner(
+        &self,
+        sandbox_id: &str,
+        keep_workspace: bool,
+    ) -> Result<bool, String> {
         info!(
             sandbox_id = %sandbox_id,
             workspace_mode = %self.config.workspace_mode,
+            keep_workspace,
             "Deleting sandbox from Kubernetes"
         );
 
@@ -3794,6 +3977,14 @@ impl KubernetesComputeDriver {
                 }
             };
 
+        if keep_workspace {
+            let resource_uid = preconditions
+                .uid
+                .as_deref()
+                .ok_or_else(|| "sandbox resource has no UID".to_string())?;
+            self.keep_workspace_claim(&obj_namespace, &kube_name, resource_uid)
+                .await?;
+        }
         let delete_api = self
             .supported_agent_sandbox_api(self.client.clone(), &obj_namespace)
             .await?;
@@ -9123,6 +9314,310 @@ mod tests {
         assert!(alpha_start["metadata"].get("annotations").is_none());
         assert_eq!(alpha_start["spec"]["replicas"], 1);
         assert!(alpha_start["spec"].get("operatingMode").is_none());
+    }
+
+    const KEPT_SANDBOX_PATH: &str =
+        "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes/sandbox-cr";
+    const KEPT_CLAIM_PATH: &str =
+        "/api/v1/namespaces/openshell/persistentvolumeclaims/workspace-sandbox-cr";
+
+    fn kept_test_sandbox() -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "agents.x-k8s.io/v1beta1",
+            "kind": "Sandbox",
+            "metadata": {
+                "name": "sandbox-cr",
+                "namespace": "openshell",
+                "uid": "cr-uid",
+                "resourceVersion": "7",
+                "annotations": {SANDBOX_POD_NAME_ANNOTATION: "workload-pod"}
+            }
+        })
+    }
+
+    fn kept_test_claim(
+        owners: serde_json::Value,
+        labels: serde_json::Value,
+    ) -> http::Response<kube::client::Body> {
+        kube_test_response(
+            http::StatusCode::OK,
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "PersistentVolumeClaim",
+                "metadata": {
+                    "name": "workspace-sandbox-cr",
+                    "namespace": "openshell",
+                    "resourceVersion": "11",
+                    "ownerReferences": owners,
+                    "labels": labels
+                },
+                "spec": {}
+            }),
+        )
+    }
+
+    fn kept_test_sandbox_owner(uid: &str) -> serde_json::Value {
+        serde_json::json!([{
+            "apiVersion": "agents.x-k8s.io/v1beta1",
+            "kind": "Sandbox",
+            "name": "sandbox-cr",
+            "uid": uid,
+            "controller": true,
+            "blockOwnerDeletion": true
+        }])
+    }
+
+    /// The delete steps after any claim work: the Sandbox resource, then the
+    /// confirmations that its workload Pod and the resource are gone.
+    fn kept_test_delete_steps() -> Vec<KubeTestStep> {
+        vec![
+            (
+                http::Method::DELETE,
+                KEPT_SANDBOX_PATH,
+                kube_test_response(
+                    http::StatusCode::OK,
+                    serde_json::json!({"kind": "Status", "status": "Success", "code": 200}),
+                ),
+            ),
+            (
+                http::Method::GET,
+                "/api/v1/namespaces/openshell/pods/workload-pod",
+                kube_test_not_found("pods", "workload-pod"),
+            ),
+            (
+                http::Method::GET,
+                KEPT_SANDBOX_PATH,
+                kube_test_not_found("sandboxes", "sandbox-cr"),
+            ),
+        ]
+    }
+
+    fn kept_test_driver(steps: Vec<KubeTestStep>) -> ScriptedDriver {
+        let scripted = scripted_driver(KubernetesComputeConfig::default(), steps);
+        scripted
+            .0
+            .sandbox_api_version
+            .set(SANDBOX_VERSION_V1BETA1)
+            .expect("set test Sandbox API version");
+        scripted
+    }
+
+    fn kept_test_list() -> KubeTestStep {
+        (
+            http::Method::GET,
+            "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes",
+            kube_test_response(
+                http::StatusCode::OK,
+                serde_json::json!({
+                    "apiVersion": "agents.x-k8s.io/v1beta1",
+                    "kind": "SandboxList",
+                    "items": [kept_test_sandbox()]
+                }),
+            ),
+        )
+    }
+
+    #[tokio::test]
+    async fn delete_keeping_the_workspace_detaches_the_claim_before_the_sandbox() {
+        let mut steps = vec![
+            kept_test_list(),
+            (
+                http::Method::GET,
+                KEPT_CLAIM_PATH,
+                kept_test_claim(
+                    kept_test_sandbox_owner("cr-uid"),
+                    serde_json::json!({AGENT_SANDBOX_NAME_HASH_LABEL: "2e329b2a"}),
+                ),
+            ),
+            (
+                http::Method::PATCH,
+                KEPT_CLAIM_PATH,
+                kept_test_claim(
+                    serde_json::json!([]),
+                    serde_json::json!({LABEL_KEPT_WORKSPACE: "2e329b2a"}),
+                ),
+            ),
+        ];
+        steps.extend(kept_test_delete_steps());
+        let (driver, steps, bodies) = kept_test_driver(steps);
+
+        assert!(
+            driver
+                .delete_sandbox("sandbox-1", true)
+                .await
+                .expect("delete keeping the workspace")
+        );
+        assert!(steps.lock().unwrap().is_empty());
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(
+            bodies[0],
+            serde_json::json!({
+                "metadata": {
+                    "resourceVersion": "11",
+                    "ownerReferences": [],
+                    "labels": {
+                        AGENT_SANDBOX_NAME_HASH_LABEL: null,
+                        LABEL_KEPT_WORKSPACE: "2e329b2a"
+                    }
+                }
+            }),
+            "the claim is detached from the Sandbox before the Sandbox is deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_delete_leaves_the_claim_to_its_owner() {
+        let mut steps = vec![kept_test_list()];
+        steps.extend(kept_test_delete_steps());
+        let (driver, steps, _) = kept_test_driver(steps);
+
+        assert!(driver.delete_sandbox("sandbox-1", false).await.unwrap());
+        assert!(
+            steps.lock().unwrap().is_empty(),
+            "an ordinary delete reads and changes no claim; garbage collection removes it"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_keeping_the_workspace_never_takes_another_controllers_claim() {
+        let (driver, steps, bodies) = kept_test_driver(vec![
+            kept_test_list(),
+            (
+                http::Method::GET,
+                KEPT_CLAIM_PATH,
+                kept_test_claim(
+                    kept_test_sandbox_owner("other-uid"),
+                    serde_json::json!({AGENT_SANDBOX_NAME_HASH_LABEL: "2e329b2a"}),
+                ),
+            ),
+        ]);
+
+        let error = driver.delete_sandbox("sandbox-1", true).await.unwrap_err();
+        assert!(error.contains("not controlled by this sandbox"), "{error}");
+        assert!(steps.lock().unwrap().is_empty());
+        assert!(
+            bodies.lock().unwrap().is_empty(),
+            "neither the claim nor the Sandbox is changed"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_keeping_the_workspace_resumes_after_the_claim_was_kept() {
+        let mut steps = vec![
+            kept_test_list(),
+            (
+                http::Method::GET,
+                KEPT_CLAIM_PATH,
+                kept_test_claim(
+                    serde_json::json!([]),
+                    serde_json::json!({LABEL_KEPT_WORKSPACE: "2e329b2a"}),
+                ),
+            ),
+        ];
+        steps.extend(kept_test_delete_steps());
+        let (driver, steps, _) = kept_test_driver(steps);
+
+        assert!(driver.delete_sandbox("sandbox-1", true).await.unwrap());
+        assert!(steps.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_keeping_the_workspace_of_a_sandbox_without_one_deletes_it() {
+        let mut steps = vec![
+            kept_test_list(),
+            (
+                http::Method::GET,
+                KEPT_CLAIM_PATH,
+                kube_test_not_found("persistentvolumeclaims", "workspace-sandbox-cr"),
+            ),
+        ];
+        steps.extend(kept_test_delete_steps());
+        let (driver, steps, _) = kept_test_driver(steps);
+
+        assert!(driver.delete_sandbox("sandbox-1", true).await.unwrap());
+        assert!(steps.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_next_sandbox_of_the_name_restores_a_kept_claim_for_adoption() {
+        let (driver, steps, bodies) = kept_test_driver(vec![
+            (
+                http::Method::GET,
+                KEPT_CLAIM_PATH,
+                kept_test_claim(
+                    serde_json::json!([]),
+                    serde_json::json!({LABEL_KEPT_WORKSPACE: "2e329b2a"}),
+                ),
+            ),
+            (
+                http::Method::PATCH,
+                KEPT_CLAIM_PATH,
+                kept_test_claim(
+                    serde_json::json!([]),
+                    serde_json::json!({AGENT_SANDBOX_NAME_HASH_LABEL: "2e329b2a"}),
+                ),
+            ),
+        ]);
+
+        driver
+            .restore_kept_workspace_claim("openshell", "sandbox-cr")
+            .await
+            .expect("restore the kept claim");
+        assert!(steps.lock().unwrap().is_empty());
+        assert_eq!(
+            bodies.lock().unwrap()[0],
+            serde_json::json!({
+                "metadata": {
+                    "resourceVersion": "11",
+                    "labels": {
+                        AGENT_SANDBOX_NAME_HASH_LABEL: "2e329b2a",
+                        LABEL_KEPT_WORKSPACE: null
+                    }
+                }
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn creation_changes_no_claim_that_was_not_kept() {
+        for claim in [
+            kube_test_not_found("persistentvolumeclaims", "workspace-sandbox-cr"),
+            // Owned claims belong to their controller.
+            kept_test_claim(
+                kept_test_sandbox_owner("cr-uid"),
+                serde_json::json!({AGENT_SANDBOX_NAME_HASH_LABEL: "2e329b2a"}),
+            ),
+            kept_test_claim(
+                kept_test_sandbox_owner("cr-uid"),
+                serde_json::json!({LABEL_KEPT_WORKSPACE: "2e329b2a"}),
+            ),
+            // An unowned claim that no delete kept is left to the controller.
+            kept_test_claim(
+                serde_json::json!([]),
+                serde_json::json!({AGENT_SANDBOX_NAME_HASH_LABEL: "2e329b2a"}),
+            ),
+        ] {
+            let (driver, steps, bodies) =
+                kept_test_driver(vec![(http::Method::GET, KEPT_CLAIM_PATH, claim)]);
+            driver
+                .restore_kept_workspace_claim("openshell", "sandbox-cr")
+                .await
+                .unwrap();
+            assert!(steps.lock().unwrap().is_empty());
+            assert!(bodies.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn only_a_resource_with_the_workspace_claim_template_restores_a_claim() {
+        let data = sandbox_to_k8s_spec(None, &SandboxPodParams::default()).unwrap();
+        assert!(obj_has_workspace_claim(&data));
+        let mut without = data;
+        without["spec"]
+            .as_object_mut()
+            .unwrap()
+            .remove("volumeClaimTemplates");
+        assert!(!obj_has_workspace_claim(&without));
     }
 
     #[tokio::test]

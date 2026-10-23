@@ -227,7 +227,7 @@ impl ComputeDriver for ComputeDriverService {
                 }
                 let deleted = self
                     .driver
-                    .delete_sandbox(&request.sandbox_id)
+                    .delete_sandbox(&request.sandbox_id, request.keep_workspace)
                     .await
                     .map_err(Status::internal)?;
                 Ok(Response::new(DeleteSandboxResponse { deleted }))

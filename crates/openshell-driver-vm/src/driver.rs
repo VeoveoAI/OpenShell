@@ -1123,6 +1123,7 @@ impl VmDriver {
             gateway_manages_lifecycle: true,
             supports_sandbox_authentication: false,
             driver_reports_runtime_readiness: false,
+            supports_workspace_keep: false,
             resource_capabilities: Some(ResourceCapabilities {
                 cpu: Some(CpuResourceCapabilities {
                     limit_supported: false,
@@ -4930,6 +4931,11 @@ impl ComputeDriver for VmDriver {
         request: Request<DeleteSandboxRequest>,
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
         let request = request.into_inner();
+        if request.keep_workspace {
+            return Err(openshell_core::driver_utils::workspace_keep_unsupported(
+                "vm",
+            ));
+        }
         let response = self
             .delete_sandbox(&request.sandbox_id, &request.name)
             .await?;
@@ -8084,6 +8090,7 @@ mod tests {
             .delete_sandbox(request_with_traceparent(DeleteSandboxRequest {
                 sandbox_id: String::new(),
                 name: String::new(),
+                keep_workspace: false,
             }))
             .await
             .unwrap();

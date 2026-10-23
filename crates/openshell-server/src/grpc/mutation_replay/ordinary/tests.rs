@@ -46,6 +46,7 @@ pub(in crate::grpc::mutation_replay) async fn exercise_protected_backend(url: &s
     configure_key(&mut second, &directory);
     let req = DeleteSandboxRequest {
         name: "keyed-restart".into(),
+        keep_workspace: false,
         workspace_scope: Some(openshell_core::proto::workspace_selector(
             "default".to_string(),
         )),
@@ -220,6 +221,7 @@ async fn durable_sandbox_mutations_hide_unauthorized_workspaces() {
             &state,
             non_member_request(DeleteSandboxRequest {
                 name: "hidden".into(),
+                keep_workspace: false,
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 allow_missing: false,
                 request_id,
@@ -327,6 +329,7 @@ async fn keyed_fingerprints_fail_closed_on_missing_or_rotated_keys() {
     let missing = test_server_state().await;
     let req = DeleteSandboxRequest {
         name: "missing".into(),
+        keep_workspace: false,
         workspace_scope: Some(openshell_core::proto::workspace_selector(
             "default".to_string(),
         )),
@@ -376,6 +379,7 @@ async fn original_payload_is_identity_and_current_transformation_is_a_replay_gua
     let (_directory, state) = protected_state().await;
     let original = DeleteSandboxRequest {
         name: "original".into(),
+        keep_workspace: false,
         workspace_scope: Some(openshell_core::proto::workspace_selector(
             "default".to_string(),
         )),

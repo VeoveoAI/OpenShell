@@ -614,6 +614,7 @@ impl PodmanComputeDriver {
             gateway_manages_lifecycle: true,
             supports_sandbox_authentication: false,
             driver_reports_runtime_readiness: false,
+            supports_workspace_keep: false,
             resource_capabilities: Some(ResourceCapabilities {
                 cpu: Some(CpuResourceCapabilities {
                     limit_supported: true,

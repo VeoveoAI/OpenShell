@@ -50,6 +50,28 @@ tests:
             resources: ["configmaps"]
             verbs: ["get"]
 
+  - it: lets managed mode keep a deleted sandbox's workspace claim
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["persistentvolumeclaims"]
+            verbs: ["get", "patch"]
+
+  - it: omits the workspace claim keep outside managed mode
+    set:
+      server.drivers.kubernetes.workspaceMode: operator
+    asserts:
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["persistentvolumeclaims"]
+            verbs: ["get", "patch"]
+
   - it: omits PVC admission reads when caller driver config is disabled
     set:
       server.drivers.kubernetes.workspaceMode: managed

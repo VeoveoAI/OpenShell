@@ -108,6 +108,9 @@ message GetCapabilitiesResponse {
   // Gateways require an exact policy match before activating the driver.
   // Empty denotes a legacy driver and requires explicit admission opt-out.
   string resource_admission_policy = 13;
+  // Whether DeleteSandbox can keep the sandbox's workspace volume for the next
+  // sandbox of the same name in the same workspace.
+  bool supports_workspace_keep = 14;
 }
 
 message AuthenticateSandboxRequest {
@@ -475,6 +478,10 @@ message DeleteSandboxRequest {
   string sandbox_id = 1;
   // Compute-runtime name used by the driver.
   string name = 2;
+  // Keep the sandbox's workspace volume: the next sandbox of the same name in
+  // the same workspace adopts it unchanged. Requires supports_workspace_keep;
+  // other drivers refuse it with FAILED_PRECONDITION.
+  bool keep_workspace = 3;
 }
 
 message DeleteSandboxResponse {

@@ -40,6 +40,13 @@ pub fn openshell_sandbox_label_selector() -> String {
     format!("{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE},{LABEL_SANDBOX_ID}")
 }
 
+/// The refusal of a driver that cannot keep a sandbox's workspace on delete.
+pub fn workspace_keep_unsupported(driver: &str) -> tonic::Status {
+    tonic::Status::failed_precondition(format!(
+        "the {driver} compute driver cannot keep a sandbox's workspace on delete"
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Sandbox condition reason strings set by compute drivers.
 // ---------------------------------------------------------------------------

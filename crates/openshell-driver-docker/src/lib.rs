@@ -1073,6 +1073,7 @@ impl DockerComputeDriver {
             gateway_manages_lifecycle: true,
             supports_sandbox_authentication: false,
             driver_reports_runtime_readiness: false,
+            supports_workspace_keep: false,
             resource_capabilities: Some(ResourceCapabilities {
                 cpu: Some(CpuResourceCapabilities {
                     limit_supported: true,
@@ -3541,6 +3542,11 @@ impl ComputeDriver for DockerComputeDriver {
         let span_status = openshell_otel::ErrorStatusGuard::current();
         let request = request.into_inner();
         require_sandbox_identifier(&request.sandbox_id, &request.name)?;
+        if request.keep_workspace {
+            return span_status.finish(Err(
+                openshell_core::driver_utils::workspace_keep_unsupported("docker"),
+            ));
+        }
 
         let event_sandbox_id = request.sandbox_id.clone();
         let deleted = self

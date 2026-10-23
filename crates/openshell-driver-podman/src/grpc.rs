@@ -207,6 +207,11 @@ impl ComputeDriver for ComputeDriverService {
                 if request.sandbox_id.is_empty() {
                     return Err(Status::invalid_argument("sandbox_id is required"));
                 }
+                if request.keep_workspace {
+                    return Err(openshell_core::driver_utils::workspace_keep_unsupported(
+                        "podman",
+                    ));
+                }
                 let deleted = self
                     .driver
                     .delete_sandbox(&request.sandbox_id)
@@ -663,6 +668,7 @@ mod tests {
             Request::new(DeleteSandboxRequest {
                 sandbox_id: String::new(),
                 name: "demo".to_string(),
+                keep_workspace: false,
             }),
         )
         .await
@@ -670,6 +676,25 @@ mod tests {
 
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert_eq!(err.message(), "sandbox_id is required");
+    }
+
+    #[tokio::test]
+    async fn delete_sandbox_refuses_to_keep_the_workspace() {
+        let service = test_service(unique_socket_path("keep-workspace"));
+
+        let err = ComputeDriver::delete_sandbox(
+            &service,
+            Request::new(DeleteSandboxRequest {
+                sandbox_id: "sandbox-abc".to_string(),
+                name: "demo".to_string(),
+                keep_workspace: true,
+            }),
+        )
+        .await
+        .expect_err("podman cannot keep a workspace on delete");
+
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("podman"), "{}", err.message());
     }
 
     #[tokio::test]
@@ -694,6 +719,7 @@ mod tests {
             Request::new(DeleteSandboxRequest {
                 sandbox_id: sandbox_id.to_string(),
                 name: "demo".to_string(),
+                keep_workspace: false,
             }),
         )
         .await

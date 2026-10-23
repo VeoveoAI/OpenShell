@@ -182,6 +182,20 @@ storage. The driver confirms the stop from both the published `Suspended`
 condition and deletion of the backing pod. Legacy `v1alpha1` controllers omit
 a usable stopped condition, so pod deletion alone confirms their stop.
 
+A delete with `keep_workspace` keeps the workspace PVC instead. Before deleting
+the Sandbox resource, the driver removes the resource's controller reference
+from the claim `workspace-<resource name>` and moves the Agent Sandbox tracking
+label `agents.x-k8s.io/sandbox-name-hash` into `openshell.ai/kept-workspace`,
+so garbage collection leaves the claim and no controller adopts it meanwhile.
+Creating the next sandbox of the same name in the same workspace restores the
+label before creating its Sandbox resource; the Agent Sandbox controller then
+adopts the unowned claim, and the seed init container skips it by its sentinel,
+so the files are untouched. A claim controlled by another resource is never
+taken. An ordinary delete still removes the claim. In managed mode, deleting the
+workspace removes any kept claim with its namespace; in shared and operator
+modes a kept claim stays until an operator removes it. The gateway needs `get`
+and `patch` on `persistentvolumeclaims` in sandbox namespaces.
+
 The workspace PVC size defaults to `workspace_default_storage_size`. Set
 `workspace_storage_class` to pin the PVC to a specific `StorageClass`; an empty
 value omits `storageClassName` so the cluster's default `StorageClass` applies.

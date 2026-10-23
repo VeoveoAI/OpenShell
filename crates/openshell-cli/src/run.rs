@@ -412,7 +412,7 @@ async fn finalize_sandbox_create_session(
     }
 
     let names = [sandbox_name.to_string()];
-    if let Err(err) = sandbox_delete(server, &names, false, workspace, tls, gateway).await {
+    if let Err(err) = sandbox_delete(server, &names, false, false, workspace, tls, gateway).await {
         if let Ok(exit_code) = session_result.as_ref() {
             return Err(miette::miette!(
                 "sandbox command exited with status {exit_code}, but ephemeral cleanup failed: {err}"
@@ -3989,6 +3989,7 @@ pub async fn sandbox_delete(
     server: &str,
     names: &[String],
     all: bool,
+    keep_workspace: bool,
     workspace: &str,
     tls: &TlsOptions,
     gateway: &str,
@@ -4043,6 +4044,7 @@ pub async fn sandbox_delete(
             .delete_sandbox(DeleteSandboxRequest {
                 request_id: String::new(),
                 allow_missing: true,
+                keep_workspace,
                 name: name.clone(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     workspace.to_string(),

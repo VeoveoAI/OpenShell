@@ -1732,6 +1732,7 @@ async fn handle_delete_sandbox_inner(
             &workspace,
             &name,
             req.allow_missing,
+            req.keep_workspace,
             preconditions,
         )
         .await?;
@@ -6141,6 +6142,7 @@ mod tests {
                     request_id: String::new(),
                     allow_missing: false,
                     name: "reused-name".to_string(),
+                    keep_workspace: false,
                     workspace_scope: Some(openshell_core::proto::workspace_selector(
                         "default".to_string(),
                     )),
@@ -10144,6 +10146,7 @@ mod tests {
                 request_id: String::new(),
                 allow_missing: false,
                 name: ("any").to_string(),
+                keep_workspace: false,
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "no-such-ws".to_string(),
                 )),
