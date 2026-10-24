@@ -16,6 +16,21 @@ pub use tonic_types::{ErrorDetails, StatusExt};
 /// Domain of gateway-owned machine-readable error reasons.
 pub const ERROR_DOMAIN: &str = "openshell.nvidia.com";
 
+/// `FAILED_PRECONDITION` reason of a create refused while compute of the
+/// previous sandbox of its name still exists.
+///
+/// An example is a Kubernetes workload Pod still terminating. Nothing was
+/// created; the create is retryable once the previous sandbox is gone.
+pub const PREVIOUS_SANDBOX_TERMINATING: &str = "PREVIOUS_SANDBOX_TERMINATING";
+
+/// The gateway-domain reason a status carries, if any.
+pub fn reason(status: &Status) -> Option<String> {
+    decode_details(status)?
+        .error_info()
+        .filter(|info| info.domain == ERROR_DOMAIN)
+        .map(|info| info.reason.clone())
+}
+
 /// Decode supported details without trusting inconsistent envelopes or delays.
 /// Unknown and malformed details remain available on the original status.
 pub fn decode_details(status: &Status) -> Option<ErrorDetails> {

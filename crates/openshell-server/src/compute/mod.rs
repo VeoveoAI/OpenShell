@@ -1570,9 +1570,7 @@ impl ComputeRuntime {
             Err(ProvisioningOperationError::Driver { status, settled }) => {
                 let status = match status.code() {
                     Code::AlreadyExists => Status::already_exists("sandbox already exists"),
-                    Code::FailedPrecondition => {
-                        Status::failed_precondition(status.message().to_string())
-                    }
+                    Code::FailedPrecondition => create_precondition_failure(&status),
                     _ => Status::internal(format!("create sandbox failed: {}", status.message())),
                 };
                 return Err(self
@@ -7078,6 +7076,21 @@ impl ObjectType for SandboxWorkloadTemplate {
     }
 }
 
+/// A driver's refused create, as the gateway reports it. A previous sandbox of
+/// the name still terminating keeps its reason, so a client can tell that the
+/// create is retryable once that sandbox is gone.
+fn create_precondition_failure(status: &Status) -> Status {
+    let reason = openshell_core::rpc_error::reason(status);
+    if reason.as_deref() == Some(openshell_core::rpc_error::PREVIOUS_SANDBOX_TERMINATING) {
+        openshell_core::rpc_error::failed_precondition(
+            openshell_core::rpc_error::PREVIOUS_SANDBOX_TERMINATING,
+            status.message(),
+        )
+    } else {
+        Status::failed_precondition(status.message().to_string())
+    }
+}
+
 fn compute_error_from_status(status: Status) -> ComputeError {
     match status.code() {
         Code::AlreadyExists => ComputeError::AlreadyExists,
@@ -8246,6 +8259,28 @@ mod tests {
                 .iter()
                 .any(|condition| condition.reason == "ConfigurationAccepted"
                     && condition.status == "True")
+        );
+    }
+
+    #[test]
+    fn a_create_refused_for_a_terminating_previous_sandbox_keeps_its_reason() {
+        use openshell_core::rpc_error::{self, PREVIOUS_SANDBOX_TERMINATING};
+        let refused = rpc_error::failed_precondition(
+            PREVIOUS_SANDBOX_TERMINATING,
+            "workload Pod ns/name of the previous sandbox of this name is still terminating; retry the create once it is gone",
+        );
+        let reported = create_precondition_failure(&refused);
+        assert_eq!(reported.code(), Code::FailedPrecondition);
+        assert_eq!(reported.message(), refused.message());
+        assert_eq!(
+            rpc_error::reason(&reported).as_deref(),
+            Some(PREVIOUS_SANDBOX_TERMINATING)
+        );
+        // Other driver reasons are not passed on as the gateway's.
+        let other = rpc_error::failed_precondition("DRIVER_SPECIFIC", "refused");
+        assert_eq!(
+            rpc_error::reason(&create_precondition_failure(&other)),
+            None
         );
     }
 

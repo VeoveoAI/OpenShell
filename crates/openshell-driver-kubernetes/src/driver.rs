@@ -155,6 +155,10 @@ pub enum KubernetesDriverError {
     InvalidArgument(String),
     #[error("{0}")]
     Precondition(String),
+    /// A workload Pod of the sandbox's name still exists; see
+    /// [`openshell_core::rpc_error::PREVIOUS_SANDBOX_TERMINATING`].
+    #[error("{0}")]
+    PreviousSandboxTerminating(String),
     #[error("{0}")]
     Message(String),
 }
@@ -258,7 +262,8 @@ impl From<KubernetesDriverError> for openshell_core::ComputeDriverError {
             KubernetesDriverError::AlreadyExists => Self::AlreadyExists,
             KubernetesDriverError::NotFound => Self::NotFound,
             KubernetesDriverError::InvalidArgument(m) => Self::InvalidArgument(m),
-            KubernetesDriverError::Precondition(m) => Self::Precondition(m),
+            KubernetesDriverError::Precondition(m)
+            | KubernetesDriverError::PreviousSandboxTerminating(m) => Self::Precondition(m),
             KubernetesDriverError::Message(m) => Self::Message(m),
         }
     }
@@ -754,6 +759,13 @@ const AGENT_SANDBOX_NAME_HASH_LABEL: &str = "agents.x-k8s.io/sandbox-name-hash";
 /// controller adopts the claim in between.
 const LABEL_KEPT_WORKSPACE: &str = "openshell.ai/kept-workspace";
 
+/// Marks a workspace claim that a create restored from the kept state for its
+/// Sandbox resource to adopt. Until that create completes, the claim still
+/// holds the data a delete kept: a rollback, a reaped create or any delete of
+/// the adopting resource puts it back in the kept state instead of letting
+/// garbage collection remove it. The next keep clears the mark.
+const ANNOTATION_KEPT_WORKSPACE_ADOPTION: &str = "openshell.ai/kept-workspace-adoption";
+
 /// Whether a rendered Sandbox resource asks the controller for a workspace claim.
 fn obj_has_workspace_claim(data: &serde_json::Value) -> bool {
     data["spec"]["volumeClaimTemplates"]
@@ -785,12 +797,16 @@ fn kept_workspace_claim_patch(
             "labels": {
                 AGENT_SANDBOX_NAME_HASH_LABEL: serde_json::Value::Null,
                 LABEL_KEPT_WORKSPACE: name_hash,
+            },
+            "annotations": {
+                ANNOTATION_KEPT_WORKSPACE_ADOPTION: serde_json::Value::Null,
             }
         }
     })
 }
 
-/// Let the controller of the next Sandbox of the same name adopt a kept claim.
+/// Let the controller of the next Sandbox of the same name adopt a kept claim,
+/// marking it as kept data until that create completes.
 fn restored_workspace_claim_patch(resource_version: &str, name_hash: &str) -> serde_json::Value {
     serde_json::json!({
         "metadata": {
@@ -798,9 +814,29 @@ fn restored_workspace_claim_patch(resource_version: &str, name_hash: &str) -> se
             "labels": {
                 AGENT_SANDBOX_NAME_HASH_LABEL: name_hash,
                 LABEL_KEPT_WORKSPACE: serde_json::Value::Null,
+            },
+            "annotations": {
+                ANNOTATION_KEPT_WORKSPACE_ADOPTION: name_hash,
             }
         }
     })
+}
+
+/// Whether a Sandbox resource's create has not completed: deleting it then
+/// must keep a claim it adopted from the kept state.
+fn sandbox_create_in_progress(object: &DynamicObject) -> bool {
+    sandbox_runtime_bootstrap_in_progress(object)
+        && sandbox_runtime_bootstrap_operation(object) == Some("create")
+}
+
+/// Foreground propagation: the Sandbox resource remains, marked deleting,
+/// until garbage collection has removed its blocking dependents, its workload
+/// Pod and a workspace claim it still owns. Clients that wait for the sandbox
+/// to disappear therefore wait for its Pod, and a sandbox of the same name
+/// cannot meet a Pod of the previous one. A kept claim has no owner and does
+/// not block.
+fn sandbox_delete_params() -> DeleteParams {
+    DeleteParams::foreground()
 }
 
 /// Build a Kubernetes client whose requests time out after `request_timeout`.
@@ -2141,6 +2177,11 @@ impl KubernetesComputeDriver {
         let kube_name = self.config.kube_resource_name(workspace, name);
         let mut data = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params)
             .map_err(KubernetesDriverError::InvalidArgument)?;
+        // Before any change: the Sandbox resource's workload Pod takes the
+        // resource's name, so a Pod of the previous sandbox of this name, still
+        // terminating, would meet the new resource and fail its create.
+        self.refuse_previous_workload_pod(&target_namespace, &kube_name)
+            .await?;
         self.create_sandbox_runtime_fence(&target_namespace, &proxy_names)
             .await?;
         // A missing bootstrap Secret keeps both pods inert as defense in
@@ -2213,10 +2254,11 @@ impl KubernetesComputeDriver {
             ..Default::default()
         };
 
-        if obj_has_workspace_claim(&data) {
-            self.restore_kept_workspace_claim(&target_namespace, &kube_name)
+        let restored = obj_has_workspace_claim(&data)
+            && self
+                .restore_kept_workspace_claim(&target_namespace, &kube_name)
                 .await?;
-        }
+        let claimed = obj_has_workspace_claim(&data);
         obj.data = data;
         let created = match tokio::time::timeout(
             KUBE_API_TIMEOUT,
@@ -2239,6 +2281,14 @@ impl KubernetesComputeDriver {
                     error = %err,
                     "Failed to create sandbox in Kubernetes"
                 );
+                // No resource adopted the claim this create restored: keep it.
+                if restored
+                    && let Err(error) = self
+                        .keep_workspace_claim(&target_namespace, &kube_name, None)
+                        .await
+                {
+                    warn!(sandbox_id = %sandbox.id, %error, "restored workspace claim was not kept again");
+                }
                 return Err(KubernetesDriverError::from_kube(err));
             }
             Err(_elapsed) => {
@@ -2273,14 +2323,92 @@ impl KubernetesComputeDriver {
             Ok(runtime_identity) => runtime_identity,
             Err(error) => {
                 warn!(sandbox_id = %sandbox.id, %error, "sandbox-runtime provisioning failed; rolling back Sandbox CR");
-                let _ = agent_sandbox_api
-                    .api
-                    .delete(&kube_name, &DeleteParams::default())
-                    .await;
+                self.roll_back_created_sandbox(
+                    &agent_sandbox_api,
+                    &target_namespace,
+                    &kube_name,
+                    &created,
+                    claimed,
+                )
+                .await;
                 return Err(error);
             }
         };
         Ok(runtime_identity)
+    }
+
+    /// Refuse a create while a workload Pod of the sandbox's name exists, such
+    /// as the previous sandbox's Pod still terminating, before any change. The
+    /// create is retryable once that Pod is gone.
+    async fn refuse_previous_workload_pod(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+    ) -> Result<(), KubernetesDriverError> {
+        let pods = Api::<Pod>::namespaced(self.client.clone(), namespace);
+        let pod = tokio::time::timeout(KUBE_API_TIMEOUT, pods.get_opt(pod_name))
+            .await
+            .map_err(|_| {
+                KubernetesDriverError::Message(format!(
+                    "timed out reading workload Pod {namespace}/{pod_name}"
+                ))
+            })?
+            .map_err(KubernetesDriverError::from_kube)?;
+        let Some(pod) = pod else {
+            return Ok(());
+        };
+        let state = if pod.metadata.deletion_timestamp.is_some() {
+            "is still terminating"
+        } else {
+            "still exists"
+        };
+        Err(KubernetesDriverError::PreviousSandboxTerminating(format!(
+            "workload Pod {namespace}/{pod_name} of the previous sandbox of this name {state}; retry the create once it is gone"
+        )))
+    }
+
+    /// Delete the Sandbox resource `created` after its create failed. When it
+    /// has a workspace claim (`claimed`) that was restored from the kept state,
+    /// the claim goes back to the kept state first; if that fails, the
+    /// resource stays, and the stale-create reaper keeps the claim before
+    /// deleting it. A claim the create made new goes with the resource.
+    async fn roll_back_created_sandbox(
+        &self,
+        api: &AgentSandboxApi,
+        namespace: &str,
+        kube_name: &str,
+        created: &DynamicObject,
+        claimed: bool,
+    ) {
+        let uid = created.metadata.uid.as_deref();
+        if claimed {
+            let keep = match self
+                .workspace_claim_awaits_adoption(namespace, kube_name)
+                .await
+            {
+                Ok(false) => Ok(()),
+                Ok(true) => self.keep_workspace_claim(namespace, kube_name, uid).await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = keep {
+                warn!(sandbox = kube_name, %error, "leaving the failed Sandbox CR in place: its restored workspace claim was not kept again");
+                return;
+            }
+        }
+        let params = sandbox_delete_params().preconditions(Preconditions {
+            uid: uid.map(str::to_owned),
+            resource_version: None,
+        });
+        match tokio::time::timeout(KUBE_API_TIMEOUT, api.api.delete(kube_name, &params)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(KubeError::Api(error))) if error.code == 404 || error.code == 409 => {}
+            Ok(Err(error)) => {
+                warn!(sandbox = kube_name, %error, "failed to roll back the Sandbox CR");
+            }
+            Err(_) => {
+                warn!(sandbox = kube_name, "timed out rolling back the Sandbox CR");
+            }
+        }
     }
 
     async fn create_sandbox_runtime_fence(
@@ -3819,70 +3947,108 @@ impl KubernetesComputeDriver {
         span_status.finish(result)
     }
 
-    /// Detach the workspace claim of the Sandbox resource `kube_name` (UID
-    /// `sandbox_uid`) so that deleting the resource keeps it. A claim this
-    /// delete already kept is left as it is; a sandbox without a claim has
-    /// nothing to keep.
+    /// Put the workspace claim of the Sandbox resource `kube_name` (UID
+    /// `sandbox_uid`, none when no resource was created) in the kept state, so
+    /// that deleting the resource keeps it: detached from the resource, without
+    /// the controller's tracking label, and marked kept, exactly as a delete
+    /// keeping the workspace leaves it. A claim already kept is left as it is,
+    /// and a sandbox without a claim has nothing to keep. A claim restored for
+    /// adoption that the controller has not adopted yet is kept the same way.
+    /// The write is conditional on the claim's resource version and reads the
+    /// claim again after a conflict, such as the controller adopting it
+    /// meanwhile. A claim another resource controls is refused.
     async fn keep_workspace_claim(
         &self,
         namespace: &str,
         kube_name: &str,
-        sandbox_uid: &str,
+        sandbox_uid: Option<&str>,
     ) -> Result<(), String> {
+        const ATTEMPTS: u32 = 5;
+        let claims = Api::<PersistentVolumeClaim>::namespaced(self.client.clone(), namespace);
+        let name = workspace_claim_name(kube_name);
+        for attempt in 1..=ATTEMPTS {
+            let claim = tokio::time::timeout(KUBE_API_TIMEOUT, claims.get_opt(&name))
+                .await
+                .map_err(|_| format!("timed out reading workspace claim {name}"))?
+                .map_err(|error| format!("read workspace claim {name}: {error}"))?;
+            let Some(claim) = claim else {
+                info!(namespace, claim = %name, "Sandbox has no workspace claim to keep");
+                return Ok(());
+            };
+            let labels = claim.metadata.labels.unwrap_or_default();
+            let owners = claim.metadata.owner_references.unwrap_or_default();
+            match owners.iter().find(|owner| owner.controller == Some(true)) {
+                None if labels.contains_key(LABEL_KEPT_WORKSPACE) => return Ok(()),
+                None => {}
+                Some(owner) if Some(owner.uid.as_str()) == sandbox_uid => {}
+                Some(_) => {
+                    return Err(format!(
+                        "workspace claim {name} is not controlled by this sandbox; refusing to keep it"
+                    ));
+                }
+            }
+            let name_hash = labels.get(AGENT_SANDBOX_NAME_HASH_LABEL).ok_or_else(|| {
+                format!("workspace claim {name} lacks the {AGENT_SANDBOX_NAME_HASH_LABEL} label")
+            })?;
+            let resource_version = claim
+                .metadata
+                .resource_version
+                .ok_or_else(|| format!("workspace claim {name} has no resource version"))?;
+            let other_owners: Vec<_> = owners
+                .into_iter()
+                .filter(|owner| Some(owner.uid.as_str()) != sandbox_uid)
+                .collect();
+            let patch = kept_workspace_claim_patch(&resource_version, name_hash, &other_owners);
+            match tokio::time::timeout(
+                KUBE_API_TIMEOUT,
+                claims.patch(&name, &PatchParams::default(), &Patch::Merge(&patch)),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {
+                    info!(namespace, claim = %name, "Kept the sandbox's workspace claim");
+                    return Ok(());
+                }
+                Ok(Err(KubeError::Api(error))) if error.code == 409 && attempt < ATTEMPTS => {}
+                Ok(Err(error)) => return Err(format!("keep workspace claim {name}: {error}")),
+                Err(_) => return Err(format!("timed out keeping workspace claim {name}")),
+            }
+        }
+        Err(format!(
+            "workspace claim {name} kept changing; it was not kept"
+        ))
+    }
+
+    /// Whether the workspace claim of `kube_name` was restored from the kept
+    /// state for a create that has not completed.
+    async fn workspace_claim_awaits_adoption(
+        &self,
+        namespace: &str,
+        kube_name: &str,
+    ) -> Result<bool, String> {
         let claims = Api::<PersistentVolumeClaim>::namespaced(self.client.clone(), namespace);
         let name = workspace_claim_name(kube_name);
         let claim = tokio::time::timeout(KUBE_API_TIMEOUT, claims.get_opt(&name))
             .await
             .map_err(|_| format!("timed out reading workspace claim {name}"))?
             .map_err(|error| format!("read workspace claim {name}: {error}"))?;
-        let Some(claim) = claim else {
-            info!(namespace, claim = %name, "Sandbox has no workspace claim to keep");
-            return Ok(());
-        };
-        let labels = claim.metadata.labels.unwrap_or_default();
-        let owners = claim.metadata.owner_references.unwrap_or_default();
-        match owners.iter().find(|owner| owner.controller == Some(true)) {
-            None if labels.contains_key(LABEL_KEPT_WORKSPACE) => return Ok(()),
-            Some(owner) if owner.uid == sandbox_uid => {}
-            _ => {
-                return Err(format!(
-                    "workspace claim {name} is not controlled by this sandbox; refusing to keep it"
-                ));
-            }
-        }
-        let name_hash = labels.get(AGENT_SANDBOX_NAME_HASH_LABEL).ok_or_else(|| {
-            format!("workspace claim {name} lacks the {AGENT_SANDBOX_NAME_HASH_LABEL} label")
-        })?;
-        let resource_version = claim
-            .metadata
-            .resource_version
-            .ok_or_else(|| format!("workspace claim {name} has no resource version"))?;
-        let other_owners: Vec<_> = owners
-            .into_iter()
-            .filter(|owner| owner.uid != sandbox_uid)
-            .collect();
-        let patch = kept_workspace_claim_patch(&resource_version, name_hash, &other_owners);
-        tokio::time::timeout(
-            KUBE_API_TIMEOUT,
-            claims.patch(&name, &PatchParams::default(), &Patch::Merge(&patch)),
-        )
-        .await
-        .map_err(|_| format!("timed out keeping workspace claim {name}"))?
-        .map_err(|error| format!("keep workspace claim {name}: {error}"))?;
-        info!(namespace, claim = %name, "Kept the sandbox's workspace claim");
-        Ok(())
+        Ok(claim
+            .and_then(|claim| claim.metadata.annotations)
+            .is_some_and(|annotations| {
+                annotations.contains_key(ANNOTATION_KEPT_WORKSPACE_ADOPTION)
+            }))
     }
 
     /// Let the Sandbox resource `kube_name` adopt the workspace claim a delete
     /// kept for that name: restoring the Agent Sandbox tracking label lets its
     /// controller adopt the unowned claim unchanged, and the seed init
     /// container then skips it by its marker file. Any other claim is left to
-    /// the controller.
+    /// the controller. Returns whether a kept claim was restored.
     async fn restore_kept_workspace_claim(
         &self,
         namespace: &str,
         kube_name: &str,
-    ) -> Result<(), KubernetesDriverError> {
+    ) -> Result<bool, KubernetesDriverError> {
         let claims = Api::<PersistentVolumeClaim>::namespaced(self.client.clone(), namespace);
         let name = workspace_claim_name(kube_name);
         let claim = tokio::time::timeout(KUBE_API_TIMEOUT, claims.get_opt(&name))
@@ -3892,7 +4058,7 @@ impl KubernetesComputeDriver {
             })?
             .map_err(KubernetesDriverError::from_kube)?;
         let Some(claim) = claim else {
-            return Ok(());
+            return Ok(false);
         };
         let controlled = claim
             .metadata
@@ -3908,7 +4074,7 @@ impl KubernetesComputeDriver {
             .and_then(|labels| labels.get(LABEL_KEPT_WORKSPACE))
             .filter(|_| !controlled)
         else {
-            return Ok(());
+            return Ok(false);
         };
         let resource_version = claim.metadata.resource_version.clone().ok_or_else(|| {
             KubernetesDriverError::Message(format!(
@@ -3926,7 +4092,7 @@ impl KubernetesComputeDriver {
         })?
         .map_err(KubernetesDriverError::from_kube)?;
         info!(namespace, claim = %name, "Restored a kept workspace claim for adoption");
-        Ok(())
+        Ok(true)
     }
 
     async fn delete_sandbox_inner(
@@ -3946,7 +4112,7 @@ impl KubernetesComputeDriver {
             .await?;
         let selector = self.sandbox_lookup_selector(sandbox_id);
         let lp = ListParams::default().labels(&selector);
-        let (kube_name, obj_namespace, _workspace, preconditions, pod_name) =
+        let (kube_name, obj_namespace, _workspace, preconditions, pod_name, adopting) =
             match tokio::time::timeout(KUBE_API_TIMEOUT, lookup_api.api.list(&lp)).await {
                 Ok(Ok(list)) => {
                     if let Some(obj) = list.items.into_iter().next() {
@@ -3963,6 +4129,8 @@ impl KubernetesComputeDriver {
                                     .as_ref()
                                     .and_then(|l| l.get(LABEL_SANDBOX_WORKSPACE).cloned())
                                     .unwrap_or_default();
+                                let adopting = sandbox_create_in_progress(&obj)
+                                    && obj_has_workspace_claim(&obj.data);
                                 let pc = Preconditions {
                                     uid: obj.metadata.uid,
                                     resource_version: obj.metadata.resource_version,
@@ -3976,7 +4144,7 @@ impl KubernetesComputeDriver {
                                     })
                                     .cloned()
                                     .unwrap_or_else(|| name.clone());
-                                (name, ns, ws, pc, pod_name)
+                                (name, ns, ws, pc, pod_name, adopting)
                             }
                             None => return Ok(false),
                         }
@@ -4006,18 +4174,26 @@ impl KubernetesComputeDriver {
                 }
             };
 
+        // A resource whose create has not completed may hold a claim restored
+        // from the kept state; that data is the previous sandbox's, which its
+        // delete kept, so this delete keeps it too.
+        let keep_workspace = keep_workspace
+            || (adopting
+                && self
+                    .workspace_claim_awaits_adoption(&obj_namespace, &kube_name)
+                    .await?);
         if keep_workspace {
             let resource_uid = preconditions
                 .uid
                 .as_deref()
                 .ok_or_else(|| "sandbox resource has no UID".to_string())?;
-            self.keep_workspace_claim(&obj_namespace, &kube_name, resource_uid)
+            self.keep_workspace_claim(&obj_namespace, &kube_name, Some(resource_uid))
                 .await?;
         }
         let delete_api = self
             .supported_agent_sandbox_api(self.client.clone(), &obj_namespace)
             .await?;
-        let dp = DeleteParams::default().preconditions(preconditions);
+        let dp = sandbox_delete_params().preconditions(preconditions);
         match tokio::time::timeout(KUBE_API_TIMEOUT, delete_api.api.delete(&kube_name, &dp)).await {
             Ok(Ok(_response)) => {
                 info!(sandbox_id = %sandbox_id, namespace = %obj_namespace, "Sandbox deleted from Kubernetes");
@@ -4043,17 +4219,25 @@ impl KubernetesComputeDriver {
                     }
                     // API acceptance of DELETE does not mean the CR is gone.
                     // Keep the unowned fence while finalizers can still leave
-                    // the controller able to reconcile a workload Pod.
-                    if !matches!(
-                        tokio::time::timeout(KUBE_API_TIMEOUT, delete_api.api.get(&kube_name))
-                            .await,
-                        Ok(Err(KubeError::Api(kube::core::ErrorResponse {
-                            code: 404,
-                            ..
-                        })))
-                    ) {
-                        warn!(sandbox_id, "Sandbox CR deletion was not confirmed");
-                        return Ok(true);
+                    // the controller able to reconcile a workload Pod. Under
+                    // foreground propagation the resource goes just after its
+                    // blocking dependents.
+                    loop {
+                        match tokio::time::timeout(KUBE_API_TIMEOUT, delete_api.api.get(&kube_name))
+                            .await
+                        {
+                            Ok(Err(KubeError::Api(kube::core::ErrorResponse {
+                                code: 404,
+                                ..
+                            }))) => break,
+                            Ok(Ok(_)) if tokio::time::Instant::now() < deadline => {
+                                tokio::time::sleep(STOP_INITIAL_POLL_INTERVAL).await;
+                            }
+                            _ => {
+                                warn!(sandbox_id, "Sandbox CR deletion was not confirmed");
+                                return Ok(true);
+                            }
+                        }
                     }
                 }
                 Ok(true)
@@ -4608,9 +4792,23 @@ impl KubernetesComputeDriver {
             .namespace
             .as_deref()
             .unwrap_or(&self.config.namespace);
+        // The interrupted create may have adopted a claim restored from the
+        // kept state: keep it again first, or leave the resource for the next
+        // reconciliation.
+        if obj_has_workspace_claim(&object.data) {
+            let keep = match self.workspace_claim_awaits_adoption(namespace, name).await {
+                Ok(false) => Ok(()),
+                Ok(true) => self.keep_workspace_claim(namespace, name, Some(&uid)).await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = keep {
+                warn!(sandbox = name, %error, "leaving the stale sandbox-runtime bootstrap in place: its restored workspace claim was not kept again");
+                return;
+            }
+        }
         let api =
             Self::agent_sandbox_api(self.client.clone(), &lookup_api.resource.version, namespace);
-        let params = DeleteParams::default().preconditions(Preconditions {
+        let params = sandbox_delete_params().preconditions(Preconditions {
             uid: Some(uid),
             resource_version: Some(resource_version),
         });
@@ -9641,10 +9839,15 @@ mod tests {
                     "labels": {
                         AGENT_SANDBOX_NAME_HASH_LABEL: null,
                         LABEL_KEPT_WORKSPACE: "2e329b2a"
-                    }
+                    },
+                    "annotations": {ANNOTATION_KEPT_WORKSPACE_ADOPTION: null}
                 }
             }),
             "the claim is detached from the Sandbox before the Sandbox is deleted"
+        );
+        assert_eq!(
+            bodies[1]["propagationPolicy"], "Foreground",
+            "the Sandbox goes only after its workload Pod; the detached claim does not block it"
         );
     }
 
@@ -9755,7 +9958,8 @@ mod tests {
                     "labels": {
                         AGENT_SANDBOX_NAME_HASH_LABEL: "2e329b2a",
                         LABEL_KEPT_WORKSPACE: null
-                    }
+                    },
+                    "annotations": {ANNOTATION_KEPT_WORKSPACE_ADOPTION: "2e329b2a"}
                 }
             })
         );
@@ -9789,6 +9993,432 @@ mod tests {
             assert!(steps.lock().unwrap().is_empty());
             assert!(bodies.lock().unwrap().is_empty());
         }
+    }
+
+    /// A workspace claim with `annotations`, as a create restored it.
+    fn adopted_test_claim(
+        owners: serde_json::Value,
+        labels: serde_json::Value,
+        annotations: serde_json::Value,
+    ) -> http::Response<kube::client::Body> {
+        kube_test_response(
+            http::StatusCode::OK,
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "PersistentVolumeClaim",
+                "metadata": {
+                    "name": "workspace-sandbox-cr",
+                    "namespace": "openshell",
+                    "resourceVersion": "12",
+                    "ownerReferences": owners,
+                    "labels": labels,
+                    "annotations": annotations
+                },
+                "spec": {}
+            }),
+        )
+    }
+
+    /// The Sandbox resource a create made, with the workspace claim template.
+    fn created_test_sandbox(bootstrapping: bool) -> DynamicObject {
+        let mut sandbox = kept_test_sandbox();
+        sandbox["metadata"]["labels"] = serde_json::json!({LABEL_SANDBOX_ID: "sandbox-1"});
+        sandbox["spec"] = serde_json::json!({
+            "volumeClaimTemplates": [{"metadata": {"name": WORKSPACE_VOLUME_NAME}}]
+        });
+        if bootstrapping {
+            sandbox["metadata"]["annotations"][ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING] =
+                serde_json::json!("true");
+            sandbox["metadata"]["annotations"][ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION] =
+                serde_json::json!("create");
+        }
+        serde_json::from_value(sandbox).unwrap()
+    }
+
+    fn adopted_by(uid: &str) -> http::Response<kube::client::Body> {
+        adopted_test_claim(
+            kept_test_sandbox_owner(uid),
+            serde_json::json!({AGENT_SANDBOX_NAME_HASH_LABEL: "2e329b2a"}),
+            serde_json::json!({ANNOTATION_KEPT_WORKSPACE_ADOPTION: "2e329b2a"}),
+        )
+    }
+
+    fn kept_again() -> http::Response<kube::client::Body> {
+        kept_test_claim(
+            serde_json::json!([]),
+            serde_json::json!({LABEL_KEPT_WORKSPACE: "2e329b2a"}),
+        )
+    }
+
+    fn sandbox_deleted() -> http::Response<kube::client::Body> {
+        kube_test_response(
+            http::StatusCode::OK,
+            serde_json::json!({"kind": "Status", "status": "Success", "code": 200}),
+        )
+    }
+
+    /// The patch that puts a claim at `version` back in the kept state.
+    fn kept_again_body(version: &str) -> serde_json::Value {
+        serde_json::json!({
+            "metadata": {
+                "resourceVersion": version,
+                "ownerReferences": [],
+                "labels": {
+                    AGENT_SANDBOX_NAME_HASH_LABEL: null,
+                    LABEL_KEPT_WORKSPACE: "2e329b2a"
+                },
+                "annotations": {ANNOTATION_KEPT_WORKSPACE_ADOPTION: null}
+            }
+        })
+    }
+
+    /// The incident of 2026-10-23: a create adopted the kept home, then failed
+    /// because the previous sandbox's Pod was still terminating, and its
+    /// rollback deleted the resource that owned the claim. The rollback now
+    /// keeps the claim first; the next create restores it for adoption.
+    #[tokio::test]
+    async fn a_failed_create_keeps_the_claim_it_adopted_for_the_next_create() {
+        let (driver, steps, bodies) = kept_test_driver(vec![
+            // The rollback: the claim awaits adoption and the created resource
+            // controls it.
+            (http::Method::GET, KEPT_CLAIM_PATH, adopted_by("cr-uid")),
+            (http::Method::GET, KEPT_CLAIM_PATH, adopted_by("cr-uid")),
+            (http::Method::PATCH, KEPT_CLAIM_PATH, kept_again()),
+            (http::Method::DELETE, KEPT_SANDBOX_PATH, sandbox_deleted()),
+            // The next create of the name.
+            (http::Method::GET, KEPT_CLAIM_PATH, kept_again()),
+            (
+                http::Method::PATCH,
+                KEPT_CLAIM_PATH,
+                adopted_test_claim(
+                    serde_json::json!([]),
+                    serde_json::json!({AGENT_SANDBOX_NAME_HASH_LABEL: "2e329b2a"}),
+                    serde_json::json!({ANNOTATION_KEPT_WORKSPACE_ADOPTION: "2e329b2a"}),
+                ),
+            ),
+        ]);
+        let api = KubernetesComputeDriver::agent_sandbox_api(
+            driver.client.clone(),
+            SANDBOX_VERSION_V1BETA1,
+            "openshell",
+        );
+        driver
+            .roll_back_created_sandbox(
+                &api,
+                "openshell",
+                "sandbox-cr",
+                &created_test_sandbox(true),
+                true,
+            )
+            .await;
+        assert!(
+            driver
+                .restore_kept_workspace_claim("openshell", "sandbox-cr")
+                .await
+                .unwrap(),
+            "the next create adopts the kept claim"
+        );
+        assert!(
+            steps.lock().unwrap().is_empty(),
+            "every request ran, and none deleted the claim"
+        );
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(
+            bodies[0],
+            kept_again_body("12"),
+            "the claim is detached from the failed resource and kept before the resource goes"
+        );
+        assert_eq!(bodies[1]["propagationPolicy"], "Foreground");
+        assert_eq!(bodies[1]["preconditions"]["uid"], "cr-uid");
+        assert_eq!(
+            bodies[2]["metadata"]["labels"][AGENT_SANDBOX_NAME_HASH_LABEL],
+            "2e329b2a"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rollback_keeps_a_restored_claim_the_controller_has_not_adopted_yet() {
+        let (driver, steps, bodies) = kept_test_driver(vec![
+            (
+                http::Method::GET,
+                KEPT_CLAIM_PATH,
+                adopted_test_claim(
+                    serde_json::json!([]),
+                    serde_json::json!({AGENT_SANDBOX_NAME_HASH_LABEL: "2e329b2a"}),
+                    serde_json::json!({ANNOTATION_KEPT_WORKSPACE_ADOPTION: "2e329b2a"}),
+                ),
+            ),
+            // The controller adopts it between the read and the write.
+            (
+                http::Method::GET,
+                KEPT_CLAIM_PATH,
+                adopted_test_claim(
+                    serde_json::json!([]),
+                    serde_json::json!({AGENT_SANDBOX_NAME_HASH_LABEL: "2e329b2a"}),
+                    serde_json::json!({ANNOTATION_KEPT_WORKSPACE_ADOPTION: "2e329b2a"}),
+                ),
+            ),
+            (
+                http::Method::PATCH,
+                KEPT_CLAIM_PATH,
+                kube_test_response(
+                    http::StatusCode::CONFLICT,
+                    serde_json::json!({
+                        "kind": "Status", "status": "Failure", "reason": "Conflict",
+                        "message": "the object has been modified", "code": 409
+                    }),
+                ),
+            ),
+            (http::Method::GET, KEPT_CLAIM_PATH, adopted_by("cr-uid")),
+            (http::Method::PATCH, KEPT_CLAIM_PATH, kept_again()),
+            (http::Method::DELETE, KEPT_SANDBOX_PATH, sandbox_deleted()),
+        ]);
+        let api = KubernetesComputeDriver::agent_sandbox_api(
+            driver.client.clone(),
+            SANDBOX_VERSION_V1BETA1,
+            "openshell",
+        );
+        driver
+            .roll_back_created_sandbox(
+                &api,
+                "openshell",
+                "sandbox-cr",
+                &created_test_sandbox(true),
+                true,
+            )
+            .await;
+        assert!(steps.lock().unwrap().is_empty());
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies[0], kept_again_body("12"));
+        assert_eq!(
+            bodies[1],
+            kept_again_body("12"),
+            "the conflict is read again and the adopted claim detached"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rollback_that_cannot_keep_the_claim_leaves_the_resource() {
+        let (driver, steps, bodies) = kept_test_driver(vec![
+            (http::Method::GET, KEPT_CLAIM_PATH, adopted_by("cr-uid")),
+            (http::Method::GET, KEPT_CLAIM_PATH, adopted_by("cr-uid")),
+            (
+                http::Method::PATCH,
+                KEPT_CLAIM_PATH,
+                kube_test_response(
+                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                    serde_json::json!({
+                        "kind": "Status", "status": "Failure", "reason": "InternalError",
+                        "message": "fixture failure", "code": 500
+                    }),
+                ),
+            ),
+        ]);
+        let api = KubernetesComputeDriver::agent_sandbox_api(
+            driver.client.clone(),
+            SANDBOX_VERSION_V1BETA1,
+            "openshell",
+        );
+        driver
+            .roll_back_created_sandbox(
+                &api,
+                "openshell",
+                "sandbox-cr",
+                &created_test_sandbox(true),
+                true,
+            )
+            .await;
+        assert!(
+            steps.lock().unwrap().is_empty(),
+            "no DELETE: the resource, and the claim it owns, stay for the reaper"
+        );
+        assert_eq!(bodies.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_rollback_removes_a_claim_its_create_made_new() {
+        let (driver, steps, bodies) = kept_test_driver(vec![
+            (
+                http::Method::GET,
+                KEPT_CLAIM_PATH,
+                kept_test_claim(
+                    kept_test_sandbox_owner("cr-uid"),
+                    serde_json::json!({AGENT_SANDBOX_NAME_HASH_LABEL: "2e329b2a"}),
+                ),
+            ),
+            (http::Method::DELETE, KEPT_SANDBOX_PATH, sandbox_deleted()),
+        ]);
+        let api = KubernetesComputeDriver::agent_sandbox_api(
+            driver.client.clone(),
+            SANDBOX_VERSION_V1BETA1,
+            "openshell",
+        );
+        driver
+            .roll_back_created_sandbox(
+                &api,
+                "openshell",
+                "sandbox-cr",
+                &created_test_sandbox(true),
+                true,
+            )
+            .await;
+        assert!(steps.lock().unwrap().is_empty());
+        assert_eq!(bodies.lock().unwrap()[0]["propagationPolicy"], "Foreground");
+    }
+
+    #[tokio::test]
+    async fn the_stale_create_reaper_keeps_an_adopted_claim_before_deleting() {
+        let (driver, steps, bodies) = kept_test_driver(vec![
+            (http::Method::GET, KEPT_CLAIM_PATH, adopted_by("cr-uid")),
+            (http::Method::GET, KEPT_CLAIM_PATH, adopted_by("cr-uid")),
+            (http::Method::PATCH, KEPT_CLAIM_PATH, kept_again()),
+            (http::Method::DELETE, KEPT_SANDBOX_PATH, sandbox_deleted()),
+        ]);
+        let api = KubernetesComputeDriver::agent_sandbox_api(
+            driver.client.clone(),
+            SANDBOX_VERSION_V1BETA1,
+            "openshell",
+        );
+        driver
+            .reap_stale_sandbox_runtime_bootstrap(&api, &created_test_sandbox(true))
+            .await;
+        assert!(steps.lock().unwrap().is_empty());
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies[0], kept_again_body("12"));
+        assert_eq!(bodies[1]["propagationPolicy"], "Foreground");
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_delete_of_an_unfinished_create_keeps_the_adopted_claim() {
+        let mut sandbox = serde_json::to_value(created_test_sandbox(true)).unwrap();
+        sandbox["apiVersion"] = serde_json::json!("agents.x-k8s.io/v1beta1");
+        sandbox["kind"] = serde_json::json!("Sandbox");
+        let mut steps = vec![
+            (
+                http::Method::GET,
+                "/apis/agents.x-k8s.io/v1beta1/namespaces/openshell/sandboxes",
+                kube_test_response(
+                    http::StatusCode::OK,
+                    serde_json::json!({
+                        "apiVersion": "agents.x-k8s.io/v1beta1",
+                        "kind": "SandboxList",
+                        "items": [sandbox]
+                    }),
+                ),
+            ),
+            (http::Method::GET, KEPT_CLAIM_PATH, adopted_by("cr-uid")),
+            (http::Method::GET, KEPT_CLAIM_PATH, adopted_by("cr-uid")),
+            (http::Method::PATCH, KEPT_CLAIM_PATH, kept_again()),
+        ];
+        steps.extend(kept_test_delete_steps());
+        let (driver, steps, bodies) = kept_test_driver(steps);
+
+        assert!(driver.delete_sandbox("sandbox-1", false).await.unwrap());
+        assert!(steps.lock().unwrap().is_empty());
+        assert_eq!(bodies.lock().unwrap()[0], kept_again_body("12"));
+    }
+
+    /// A delete answers once the workload Pod and then the foreground-deleted
+    /// resource are gone, so a client waiting for the sandbox to disappear
+    /// cannot create the next sandbox of the name beside the old Pod.
+    #[tokio::test]
+    async fn a_delete_waits_for_a_slowly_terminating_pod_and_then_the_resource() {
+        let terminating_pod = || {
+            kube_test_response(
+                http::StatusCode::OK,
+                serde_json::json!({
+                    "apiVersion": "v1", "kind": "Pod",
+                    "metadata": {
+                        "name": "workload-pod", "namespace": "openshell",
+                        "deletionTimestamp": "2026-10-23T23:48:00Z"
+                    }
+                }),
+            )
+        };
+        let mut deleting = kept_test_sandbox();
+        deleting["metadata"]["deletionTimestamp"] = serde_json::json!("2026-10-23T23:48:00Z");
+        deleting["metadata"]["finalizers"] = serde_json::json!(["foregroundDeletion"]);
+        let mut steps = vec![
+            kept_test_list(),
+            (http::Method::GET, KEPT_CLAIM_PATH, kept_again()),
+            (http::Method::DELETE, KEPT_SANDBOX_PATH, sandbox_deleted()),
+        ];
+        for _ in 0..3 {
+            steps.push((
+                http::Method::GET,
+                "/api/v1/namespaces/openshell/pods/workload-pod",
+                terminating_pod(),
+            ));
+        }
+        steps.push((
+            http::Method::GET,
+            "/api/v1/namespaces/openshell/pods/workload-pod",
+            kube_test_not_found("pods", "workload-pod"),
+        ));
+        steps.push((
+            http::Method::GET,
+            KEPT_SANDBOX_PATH,
+            kube_test_response(http::StatusCode::OK, deleting),
+        ));
+        steps.push((
+            http::Method::GET,
+            KEPT_SANDBOX_PATH,
+            kube_test_not_found("sandboxes", "sandbox-cr"),
+        ));
+        let (driver, steps, bodies) = kept_test_driver(steps);
+
+        assert!(driver.delete_sandbox("sandbox-1", true).await.unwrap());
+        assert!(
+            steps.lock().unwrap().is_empty(),
+            "the delete polled the terminating Pod and the deleting resource until both were gone"
+        );
+        assert_eq!(bodies.lock().unwrap()[0]["propagationPolicy"], "Foreground");
+    }
+
+    #[tokio::test]
+    async fn a_create_is_refused_while_a_pod_of_its_name_exists() {
+        let (driver, steps, bodies) = kept_test_driver(vec![
+            (
+                http::Method::GET,
+                "/api/v1/namespaces/openshell/pods/sandbox-cr",
+                kube_test_response(
+                    http::StatusCode::OK,
+                    serde_json::json!({
+                        "apiVersion": "v1", "kind": "Pod",
+                        "metadata": {
+                            "name": "sandbox-cr", "namespace": "openshell",
+                            "deletionTimestamp": "2026-10-23T23:48:00Z"
+                        }
+                    }),
+                ),
+            ),
+            (
+                http::Method::GET,
+                "/api/v1/namespaces/openshell/pods/sandbox-cr",
+                kube_test_not_found("pods", "sandbox-cr"),
+            ),
+        ]);
+        let error = driver
+            .refuse_previous_workload_pod("openshell", "sandbox-cr")
+            .await
+            .unwrap_err();
+        let KubernetesDriverError::PreviousSandboxTerminating(message) = error else {
+            panic!("the refusal names its reason: {error}");
+        };
+        assert!(
+            message.contains("openshell/sandbox-cr") && message.contains("still terminating"),
+            "{message}"
+        );
+        assert!(message.contains("retry"), "{message}");
+        driver
+            .refuse_previous_workload_pod("openshell", "sandbox-cr")
+            .await
+            .expect("no Pod of the name: the create proceeds");
+        assert!(steps.lock().unwrap().is_empty());
+        assert!(
+            bodies.lock().unwrap().is_empty(),
+            "the refusal changes nothing"
+        );
     }
 
     #[test]

@@ -157,10 +157,17 @@ impl ComputeDriver for ComputeDriverService {
                         .into_inner()
                         .sandbox
                         .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
-                    let runtime_identity =
-                        self.driver.create_sandbox(&sandbox).await.map_err(|e| {
-                            Status::from(openshell_core::ComputeDriverError::from(e))
-                        })?;
+                    let runtime_identity = self.driver.create_sandbox(&sandbox).await.map_err(
+                        |error| match error {
+                            crate::KubernetesDriverError::PreviousSandboxTerminating(message) => {
+                                openshell_core::rpc_error::failed_precondition(
+                                    openshell_core::rpc_error::PREVIOUS_SANDBOX_TERMINATING,
+                                    message,
+                                )
+                            }
+                            error => Status::from(openshell_core::ComputeDriverError::from(error)),
+                        },
+                    )?;
                     Ok(Response::new(CreateSandboxResponse { runtime_identity }))
                 }),
         )

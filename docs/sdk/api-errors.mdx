@@ -35,6 +35,7 @@ Recognized gateway reasons include the following.
 | `REQUEST_ID_PAYLOAD_MISMATCH` | `FAILED_PRECONDITION` | Keep the original payload for that request ID. Inspect the original operation before submitting a different one. |
 | `REQUEST_OUTCOME_UNCERTAIN` | `FAILED_PRECONDITION` | An attempt is admitted but has no confirmed replayable success. Observe resource state and reconcile effects. Do not switch to a new ID to bypass the admission. |
 | `REQUEST_REPLAY_UNAVAILABLE` | `FAILED_PRECONDITION` | The original scope, resource, interceptor transformation, or fingerprint key is no longer replayable. Reconcile effects; the gateway does not execute the request again. Missing private-key material can also reject admission before work starts. |
+| `PREVIOUS_SANDBOX_TERMINATING` | `FAILED_PRECONDITION` | A create was refused before any change because compute of the previous sandbox of the same name, such as its Kubernetes workload Pod, still exists. Wait until it is gone, then create again. |
 | `REQUEST_STREAM_UNAVAILABLE` | `FAILED_PRECONDITION` | The exec attempt terminated, but its output was not stored. Reconcile command effects; the gateway does not launch it again or recreate its stream. |
 
 ## Status and retry guidance

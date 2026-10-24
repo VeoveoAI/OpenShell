@@ -1027,10 +1027,11 @@ When a multi-sandbox delete fails for one entry, the CLI reports that sandbox's
 failure and continues with the remaining names. The command exits with an error
 after it attempts every requested deletion if any entry failed.
 
-On the Kubernetes driver, `--keep-workspace` deletes the sandbox but keeps its
+On the Kubernetes driver, a deleted sandbox remains `Deleting` until its Pod is
+gone. `--keep-workspace` deletes the sandbox but keeps its
 `/sandbox` volume. The next sandbox you create with the same name in the same
 workspace adopts that volume unchanged, so a new image or policy starts with the
-old files. A delete without the flag removes the volume. With managed workspace
+old files. If that create fails, the volume stays kept for the next one. A delete without the flag removes the volume. With managed workspace
 namespaces, deleting the workspace also removes any volume a delete kept. Other
 drivers refuse the flag and leave the sandbox unchanged.
 

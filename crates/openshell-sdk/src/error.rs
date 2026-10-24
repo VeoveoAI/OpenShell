@@ -5,7 +5,9 @@
 //! TUI, language bindings) can decide how to render or remap each kind.
 
 use miette::Diagnostic;
-pub use openshell_core::rpc_error::ErrorDetails;
+pub use openshell_core::rpc_error::{
+    ERROR_DOMAIN, ErrorDetails, PREVIOUS_SANDBOX_TERMINATING, StatusExt,
+};
 use thiserror::Error;
 
 /// SDK result type alias.
@@ -217,6 +219,13 @@ impl SdkError {
             .and_then(openshell_core::rpc_error::decode_details)
     }
 
+    /// The gateway's machine-readable reason: its `google.rpc.ErrorInfo` in the
+    /// [`ERROR_DOMAIN`], such as [`PREVIOUS_SANDBOX_TERMINATING`].
+    pub fn reason(&self) -> Option<String> {
+        self.grpc_status()
+            .and_then(openshell_core::rpc_error::reason)
+    }
+
     /// Server-suggested minimum retry delay, if supplied.
     /// This does not establish that repeating a mutation is safe.
     pub fn retry_delay(&self) -> Option<std::time::Duration> {
@@ -305,6 +314,25 @@ mod tests {
                 "name"
             );
         }
+    }
+
+    #[test]
+    fn a_gateway_reason_is_read_from_its_domain_only() {
+        let refused = SdkError::from_status(rpc_error::failed_precondition(
+            PREVIOUS_SANDBOX_TERMINATING,
+            "the previous sandbox is still terminating",
+        ));
+        assert_eq!(
+            refused.reason().as_deref(),
+            Some(PREVIOUS_SANDBOX_TERMINATING)
+        );
+        let foreign = SdkError::from_status(tonic::Status::with_error_details(
+            tonic::Code::FailedPrecondition,
+            "refused",
+            ErrorDetails::with_error_info("OTHER", "example.com", std::collections::HashMap::new()),
+        ));
+        assert!(foreign.reason().is_none());
+        assert!(SdkError::invalid_config("local").reason().is_none());
     }
 
     #[test]

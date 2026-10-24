@@ -196,6 +196,32 @@ workspace removes any kept claim with its namespace; in shared and operator
 modes a kept claim stays until an operator removes it. The gateway needs `get`
 and `patch` on `persistentvolumeclaims` in sandbox namespaces.
 
+Until the adopting create completes, a restored claim still holds the data a
+delete kept, and the restore marks it with `openshell.ai/kept-workspace-adoption`.
+Whatever deletes that create's Sandbox resource first puts the claim back in the
+kept state, detached, without the tracking label and marked kept, exactly as a
+delete keeping the workspace leaves it: the create's rollback, the reaper of a
+create a gateway restart interrupted, and any delete, also an ordinary one,
+while the create's bootstrap is unfinished. A claim restored but not yet adopted
+is kept the same way, and a conflict with the controller adopting it is read
+again. When the claim cannot be kept, the resource is not deleted and the reaper
+tries again. A claim the failed create made new goes with its resource. Before
+this, on 2026-10-23, a create that failed after adopting a kept home rolled back
+by deleting its resource, and garbage collection removed the claim it owned.
+
+Sandbox resources are deleted with foreground propagation: the resource remains,
+marked deleting, until garbage collection has removed its blocking dependents,
+the workload Pod and a claim the resource still owns. The gateway therefore
+reports the sandbox `Deleting` until its Pod is gone, and a client that waits
+for a deleted sandbox to disappear can create the next sandbox of the name
+without meeting the old Pod, which takes the resource's name. A kept claim has no
+owner and does not hold the delete back. A create also refuses, before any
+change, while a Pod of the resource's name still exists, with
+`FAILED_PRECONDITION` and reason `PREVIOUS_SANDBOX_TERMINATING`; it is
+retryable once that Pod is gone. Before this, a delete removed the resource at
+once while its Pod ran out a 30-second termination grace, the gateway reported
+the sandbox gone, and the next create of the name met the old Pod.
+
 The workspace PVC size defaults to `workspace_default_storage_size`. Set
 `workspace_storage_class` to pin the PVC to a specific `StorageClass`; an empty
 value omits `storageClassName` so the cluster's default `StorageClass` applies.
