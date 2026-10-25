@@ -333,9 +333,9 @@ Workspace storage settings cannot change after a sandbox is created. Delete and 
 
 Volume provisioners such as K3s's `local-path` create a workspace PVC root owned by root and writable by everyone, and kubelet's `fsGroup` handling only adds group bits. Before the non-root seed, the `workspace-owner` init container gives the root alone to the sandbox UID and GID with mode `2770`. It runs the sandbox runtime image's own root-owned `/openshell-sandbox`, the image the bootstrap runs, rather than the copy the bootstrap stages for the sandbox user. It runs as root in the sandbox group with only the `CHOWN` and `FOWNER` capabilities, without privilege escalation and with a read-only root filesystem, and changes nothing once the root is owned. Mode `2770` keeps the fsGroup, group `rwx` and setgid that kubelet's `OnRootMismatch` policy checks, so kubelet never walks the workspace again. Pod admission must allow this one root container.
 
-### Kubernetes PVC Mounts
+### Kubernetes Mounts
 
-Mount existing PersistentVolumeClaims into the agent container through driver config. Any mount under `/sandbox` replaces the default workspace PVC for that sandbox.
+Mount existing PersistentVolumeClaims or OCI images into the agent container through driver config. Any mount under `/sandbox` replaces the default workspace PVC for that sandbox.
 
 ```shell
 openshell sandbox create \
@@ -363,10 +363,29 @@ openshell sandbox create \
 | `volumes[].name` | Volume name. |
 | `volumes[].persistent_volume_claim.claim_name` | Existing PVC in the sandbox namespace. |
 | `volumes[].persistent_volume_claim.read_only` | Defaults to `true`. |
+| `volumes[].image.reference` | OCI image reference, such as `registry.example.com/team/tools@sha256:<digest>`. |
+| `volumes[].image.pull_policy` | Optional `always`, `if_not_present`, or `never`. Kubernetes defaults it from the reference. |
 | `containers.agent.volume_mounts[].name` | Volume to mount. |
 | `containers.agent.volume_mounts[].mount_path` | Absolute path in the agent container. |
 | `containers.agent.volume_mounts[].sub_path` | Optional relative path within the PVC. |
 | `containers.agent.volume_mounts[].read_only` | Defaults to `true`. Read-write mounts require a read-write volume. |
+
+Each volume sets exactly one of `persistent_volume_claim` or `image`. An `image` volume mounts the image's filesystem at `mount_path` without running it, so a binary at `/usr/local/bin/tool` in the image runs as `<mount_path>/usr/local/bin/tool` with the agent image's libraries. Image volume mounts must stay read-only and cannot set `sub_path`, and the cluster and its container runtime must support Kubernetes image volumes. To run a mounted binary, list the mount path in the sandbox policy's `filesystem_policy.read_only`, and name the binary's mounted path in network policy rules. Image volumes require disabling resource admission, as [Podman image mounts](#podman-mounts) do:
+
+```shell
+openshell sandbox create \
+  --from registry.example.com/team/claude-code:1.0 \
+  --driver-config-json '{
+    "kubernetes": {
+      "volumes": [{
+        "name": "tools",
+        "image": {"reference": "registry.example.com/team/tools@sha256:<digest>", "pull_policy": "if_not_present"}
+      }],
+      "containers": {"agent": {"volume_mounts": [{"name": "tools", "mount_path": "/opt/tools"}]}}
+    }
+  }' \
+  -- claude
+```
 
 ## Sandbox User Identity
 

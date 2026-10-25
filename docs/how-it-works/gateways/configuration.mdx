@@ -792,10 +792,10 @@ labels. Read-only mounts still require approval. Namespaces do not grant
 approval. Newly provisioned private storage and bootstrap material use driver
 ownership checks instead.
 
-Kubernetes PVC mount destinations must not overlap the driver-managed
-`/.openshell` tree or `/run`, including mounts using `sub_path`. Approval labels
-do not override these restrictions. Mount application data at paths such as
-`/data` or a directory below `/sandbox`.
+Kubernetes PVC and image mount destinations must not overlap the
+driver-managed `/.openshell` tree or `/run`, including mounts using `sub_path`.
+Approval labels do not override these restrictions. Mount application data at
+paths such as `/data` or a directory below `/sandbox`.
 
 RuntimeClasses and PriorityClasses are shared operator infrastructure. They must
 match every fixed required label, but `${workspace}` entries do not apply to
@@ -818,10 +818,11 @@ GPU validation still applies. Explicit GPU device settings inside driver JSON
 still require `allow_driver_config = true`; public GPU-count requests do not.
 The exception does not approve unrelated host mounts or non-GPU devices.
 
-Raw host bind mounts and supplemental image mounts have no trusted label
-resolver and are rejected while admission is enabled. Publisher image labels
-cannot grant operator approval. Docker's existing unsupported image-mount
-restriction remains. MXC host filesystem grants likewise require disabling
+Raw host bind mounts and supplemental image mounts, Podman `image` mounts and
+Kubernetes `image` volumes included, have no trusted label resolver and are
+rejected while admission is enabled. Publisher image labels cannot grant
+operator approval. Docker's existing unsupported image-mount restriction
+remains. MXC host filesystem grants likewise require disabling
 admission until a resolver exists. MXC's command config and VM upload workflows
 encoded in driver JSON require explicit driver-config opt-in.
 
