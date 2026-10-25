@@ -818,11 +818,27 @@ GPU validation still applies. Explicit GPU device settings inside driver JSON
 still require `allow_driver_config = true`; public GPU-count requests do not.
 The exception does not approve unrelated host mounts or non-GPU devices.
 
-Raw host bind mounts and supplemental image mounts, Podman `image` mounts and
-Kubernetes `image` volumes included, have no trusted label resolver and are
-rejected while admission is enabled. Publisher image labels cannot grant
-operator approval. Docker's existing unsupported image-mount restriction
-remains. MXC host filesystem grants likewise require disabling
+Raw host bind mounts and supplemental image mounts, Podman `image` mounts
+included, have no trusted label resolver and are rejected while admission is
+enabled. Publisher image labels cannot grant operator approval. Docker's
+existing unsupported image-mount restriction remains.
+
+A Kubernetes `image` volume is admitted only when its reference is pinned by
+digest and its repository, the reference without its tag and digest, is listed
+in `image_repositories`. Entries are exact repository names; prefixes, patterns,
+tags and digests are invalid. The list is empty by default, so image volumes
+stay refused until an operator lists a repository. A tag-only reference is
+refused even from a listed repository. Pinning by digest fixes the image
+content, so changing a listed image's digest needs no change to the list:
+
+```toml
+[openshell.drivers.kubernetes.resource_admission]
+image_repositories = ["registry.example.com/team/tools"]
+```
+
+With Helm, set `server.drivers.kubernetes.resourceAdmission.imageRepositories`.
+The other drivers ignore `image_repositories`. A saved sandbox's image volumes
+are checked against the list again before a restart. MXC host filesystem grants likewise require disabling
 admission until a resolver exists. MXC's command config and VM upload workflows
 encoded in driver JSON require explicit driver-config opt-in.
 
