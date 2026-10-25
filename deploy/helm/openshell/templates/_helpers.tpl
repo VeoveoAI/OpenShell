@@ -525,6 +525,7 @@ absent fields so every chart consumer observes the same configuration.
 {{- $admission := dict -}}
 {{- if hasKey $legacyAdmission "enabled" -}}{{- $_ := set $admission "enabled" (get $legacyAdmission "enabled") -}}{{- end -}}
 {{- if and (hasKey $legacyAdmission "requiredLabels") (ne (get $legacyAdmission "requiredLabels") nil) -}}{{- $_ := set $admission "required_labels" (deepCopy (get $legacyAdmission "requiredLabels")) -}}{{- end -}}
+{{- if get $legacyAdmission "imageRepositories" -}}{{- $_ := set $admission "image_repositories" (deepCopy (get $legacyAdmission "imageRepositories")) -}}{{- end -}}
 {{- $_ := set $kubernetes "resource_admission" $admission -}}
 {{- end -}}
 {{- if and (get $legacyServer "enableUserNamespaces") (not (hasKey $kubernetes "enable_user_namespaces")) -}}{{- $_ := set $kubernetes "enable_user_namespaces" true -}}{{- end -}}

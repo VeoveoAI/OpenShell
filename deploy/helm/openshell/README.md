@@ -521,6 +521,7 @@ discovery endpoint or its TLS CA.
 | server.drivers.kubernetes.operatorNamespaceFile | string | `""` | Path to a JSON file containing an array of namespace names allowed in operator mode. Hot-reloaded on change. |
 | server.drivers.kubernetes.operatorNamespaceLabel | string | `""` | K8s label selector for namespace discovery in operator mode. The driver watches namespaces matching this label. |
 | server.drivers.kubernetes.resourceAdmission.enabled | bool | `true` | Require operator approval labels on external sandbox attachments (GPU attachments exempt). |
+| server.drivers.kubernetes.resourceAdmission.imageRepositories | list | `[]` | Image repositories, exact names without a tag or digest, from which Kubernetes image volumes pinned by digest are admitted. Empty refuses every image volume while admission is enabled. |
 | server.drivers.kubernetes.resourceAdmission.requiredLabels | string | `nil` | Replacement label map; null uses the built-in admission labels. Empty map is invalid when enabled. |
 | server.drivers.kubernetes.workspaceMode | string | `"shared"` | How workspaces map to Kubernetes namespaces. "shared" (default): all sandboxes in a single namespace. "managed": auto-creates per-workspace namespaces. "operator": uses pre-provisioned namespaces. |
 | server.enableLoopbackServiceHttp | bool | `true` | Enable plaintext HTTP routing for loopback sandbox service URLs on TLS-enabled gateways. |

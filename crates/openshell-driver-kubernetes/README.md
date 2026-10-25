@@ -352,7 +352,9 @@ read-only and cannot set `sub_path`. The driver renders the volume as JSON,
 because the `v1_29` Kubernetes API types it builds against have no image volume
 source, and rechecks saved image mounts, references and pull policies before a
 restart or release, as it does saved PVC mount destinations. Resource admission
-refuses image volumes, so they require disabling it.
+admits an image volume only when its reference is pinned by digest and its
+repository is listed exactly in `resource_admission.image_repositories`; it reads
+no Kubernetes metadata for it, and the check runs again before a restart.
 
 Any explicit driver-config mount under `/sandbox` disables the driver's
 default `/sandbox` workspace PVC injection for that sandbox. Only the explicit

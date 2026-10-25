@@ -48,6 +48,7 @@ use openshell_core::driver_utils::{
     LABEL_SANDBOX_NAME, LABEL_SANDBOX_WORKSPACE, openshell_sandbox_label_selector,
 };
 use openshell_core::gpu::{driver_gpu_requirements, effective_driver_gpu_count};
+use openshell_core::image::ImageReference;
 use openshell_core::progress::{
     PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX, PROGRESS_STEP_STARTING_SANDBOX,
     format_bytes, mark_progress_active, mark_progress_complete, mark_progress_detail,
@@ -578,110 +579,14 @@ fn validate_kubernetes_driver_volumes(
     Ok(())
 }
 
-/// Validate an OCI image reference in the distribution reference grammar,
-/// `[domain/]path[:tag][@digest]`, with a `sha256` or `sha512` digest.
+/// Validate an OCI image reference in the distribution reference grammar.
 fn validate_kubernetes_image_reference(reference: &str, field: &str) -> Result<(), String> {
-    let (named, digest) = match reference.split_once('@') {
-        Some((named, digest)) => (named, Some(digest)),
-        None => (reference, None),
-    };
-    // A tag follows the last ':' after the last '/', so a registry port is not a tag.
-    let path_start = named.rfind('/').map_or(0, |slash| slash + 1);
-    let (name, tag) = named[path_start..]
-        .rfind(':')
-        .map_or((named, None), |colon| {
-            let colon = path_start + colon;
-            (&named[..colon], Some(&named[colon + 1..]))
-        });
-    let components = name.split('/').collect::<Vec<_>>();
-    let path = if components.len() > 1 && is_image_domain(components[0]) {
-        &components[1..]
-    } else {
-        &components[..]
-    };
-    let valid = name.len() <= MAX_IMAGE_NAME_LEN
-        && path
-            .iter()
-            .all(|component| is_image_path_component(component))
-        && tag.is_none_or(is_image_tag)
-        && digest.is_none_or(is_image_digest);
-    if !valid {
+    if ImageReference::parse(reference).is_none() {
         return Err(format!(
             "{field} must be an OCI image reference, such as registry.example.com/team/tools@sha256:<64 hex digits>"
         ));
     }
     Ok(())
-}
-
-/// The longest image name the distribution reference grammar admits.
-const MAX_IMAGE_NAME_LEN: usize = 255;
-
-/// `domain := host [':' port]`, where `host` is dot-separated labels of letters,
-/// digits and inner hyphens, or a bracketed IPv6 address.
-fn is_image_domain(value: &str) -> bool {
-    let (host, port) = match value.rsplit_once(':') {
-        Some((host, port)) if !host.starts_with('[') || host.ends_with(']') => (host, Some(port)),
-        _ => (value, None),
-    };
-    let host_valid = host
-        .strip_prefix('[')
-        .and_then(|host| host.strip_suffix(']'))
-        .map_or_else(
-            || {
-                host.split('.').all(|label| {
-                    let bytes = label.as_bytes();
-                    bytes.first().is_some_and(u8::is_ascii_alphanumeric)
-                        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
-                        && bytes
-                            .iter()
-                            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
-                })
-            },
-            |ipv6| ipv6.parse::<std::net::Ipv6Addr>().is_ok(),
-        );
-    host_valid
-        && port.is_none_or(|port| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()))
-}
-
-/// `path-component := [a-z0-9]+ (separator [a-z0-9]+)*`, with
-/// `separator := [_.] | '__' | [-]+`.
-fn is_image_path_component(value: &str) -> bool {
-    let alphanumeric = |byte: &u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
-    let bytes = value.as_bytes();
-    bytes.first().is_some_and(alphanumeric)
-        && bytes.last().is_some_and(alphanumeric)
-        && value
-            .split(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
-            .all(|separator| {
-                matches!(separator, "" | "." | "_" | "__")
-                    || separator.bytes().all(|byte| byte == b'-')
-            })
-}
-
-/// `tag := [A-Za-z0-9_][A-Za-z0-9_.-]{0,127}`.
-fn is_image_tag(value: &str) -> bool {
-    let word = |byte: &u8| byte.is_ascii_alphanumeric() || *byte == b'_';
-    let bytes = value.as_bytes();
-    (1..=128).contains(&bytes.len())
-        && word(&bytes[0])
-        && bytes[1..]
-            .iter()
-            .all(|byte| word(byte) || matches!(byte, b'.' | b'-'))
-}
-
-/// A `sha256` or `sha512` digest in lowercase hexadecimal.
-fn is_image_digest(value: &str) -> bool {
-    let hex = |encoded: &str, length: usize| {
-        encoded.len() == length
-            && encoded
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    };
-    match value.split_once(':') {
-        Some(("sha256", encoded)) => hex(encoded, 64),
-        Some(("sha512", encoded)) => hex(encoded, 128),
-        _ => false,
-    }
 }
 
 fn validate_kubernetes_driver_volume_mounts(

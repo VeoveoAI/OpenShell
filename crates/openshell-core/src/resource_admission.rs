@@ -20,6 +20,11 @@ const RESERVED_LABEL_KEYS: [&str; 3] =
 pub struct ResourceAdmissionConfig {
     pub enabled: bool,
     pub required_labels: BTreeMap<String, String>,
+    /// Image repositories, exact names without a tag or digest, from which the
+    /// Kubernetes driver admits an image volume pinned by digest. Empty by default, so
+    /// image volumes stay refused while admission is enabled.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub image_repositories: Vec<String>,
 }
 
 impl Default for ResourceAdmissionConfig {
@@ -33,6 +38,7 @@ impl Default for ResourceAdmissionConfig {
                     WORKSPACE_PLACEHOLDER.into(),
                 ),
             ]),
+            image_repositories: Vec::new(),
         }
     }
 }
@@ -162,6 +168,51 @@ impl ResourceAdmissionConfig {
             return Err(
                 "resource_admission.required_labels must include a shared approval label".into(),
             );
+        }
+        let mut repositories = std::collections::BTreeSet::new();
+        for repository in &self.image_repositories {
+            if !crate::image::is_image_repository(repository) {
+                return Err(format!(
+                    "resource_admission.image_repositories entry '{repository}' is not an image repository: name one without a tag, digest or pattern"
+                ));
+            }
+            if !repositories.insert(repository) {
+                return Err(format!(
+                    "resource_admission.image_repositories lists '{repository}' more than once"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Admit an image volume of `reference`: pinned by digest, and from a repository
+    /// `image_repositories` lists exactly. An image has no labels for an operator to
+    /// approve, so the listed repository is the approval.
+    pub fn admit_image(&self, reference: &str) -> Result<(), tonic::Status> {
+        self.validate()
+            .map_err(tonic::Status::failed_precondition)?;
+        if !self.enabled {
+            return Ok(());
+        }
+        let Some(image) = crate::image::ImageReference::parse(reference) else {
+            return Err(tonic::Status::failed_precondition(format!(
+                "image volume '{reference}' not admitted: not an image reference"
+            )));
+        };
+        if image.digest.is_none() {
+            return Err(tonic::Status::failed_precondition(format!(
+                "image volume '{reference}' not admitted: resource admission admits only an image pinned by digest"
+            )));
+        }
+        if !self
+            .image_repositories
+            .iter()
+            .any(|repository| repository == image.repository)
+        {
+            return Err(tonic::Status::failed_precondition(format!(
+                "image volume '{reference}' not admitted: repository '{}' is not in resource_admission.image_repositories",
+                image.repository
+            )));
         }
         Ok(())
     }
@@ -411,5 +462,104 @@ mod tests {
                 .is_err()
         );
         assert!(unsafe_policy.verify_acknowledgement("").is_ok());
+    }
+
+    const LISTED: &str = "registry.example.com:5000/team/tools";
+
+    fn image_policy() -> ResourceAdmissionConfig {
+        ResourceAdmissionConfig {
+            image_repositories: vec![LISTED.into()],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn admits_only_digest_pinned_images_from_listed_repositories() {
+        let digest = format!("sha256:{}", "0123456789abcdef".repeat(4));
+        let policy = image_policy();
+        policy.validate().unwrap();
+        // Admitted: pinned by digest, from the listed repository, with or without a tag.
+        assert!(policy.admit_image(&format!("{LISTED}@{digest}")).is_ok());
+        assert!(
+            policy
+                .admit_image(&format!("{LISTED}:1.0@{digest}"))
+                .is_ok()
+        );
+        // An unlisted repository, a listed repository's prefix or extension, and an
+        // unparsable reference are refused.
+        for reference in [
+            format!("registry.example.com:5000/team/other@{digest}"),
+            format!("registry.example.com:5000/team@{digest}"),
+            format!("registry.example.com:5000/team/tools/cli@{digest}"),
+            format!("registry.example.com/team/tools@{digest}"),
+            "Tools".to_owned(),
+        ] {
+            let error = policy.admit_image(&reference).unwrap_err();
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition, "{reference}");
+        }
+        let error = policy
+            .admit_image(&format!("registry.example.com:5000/team/other@{digest}"))
+            .unwrap_err();
+        assert!(
+            error
+                .message()
+                .contains("is not in resource_admission.image_repositories")
+        );
+        // A tag alone pins nothing, even from the listed repository.
+        for reference in [format!("{LISTED}:1.0"), LISTED.to_owned()] {
+            let error = policy.admit_image(&reference).unwrap_err();
+            assert!(error.message().contains("pinned by digest"), "{reference}");
+        }
+        // The default policy lists no repository, and a disabled policy admits anything.
+        assert!(
+            ResourceAdmissionConfig::default()
+                .admit_image(&format!("{LISTED}@{digest}"))
+                .is_err()
+        );
+        let disabled = ResourceAdmissionConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        assert!(disabled.admit_image(&format!("{LISTED}:1.0")).is_ok());
+    }
+
+    #[test]
+    fn image_repositories_are_exact_repository_names() {
+        for entry in [
+            format!("{LISTED}:1.0"),
+            format!("{LISTED}@sha256:{}", "0".repeat(64)),
+            "registry.example.com:5000/team/*".to_owned(),
+            "registry.example.com:5000/team/".to_owned(),
+            String::new(),
+        ] {
+            let policy = ResourceAdmissionConfig {
+                image_repositories: vec![entry.clone()],
+                ..Default::default()
+            };
+            assert!(policy.validate().is_err(), "{entry}");
+        }
+        let duplicate = ResourceAdmissionConfig {
+            image_repositories: vec![LISTED.into(), LISTED.into()],
+            ..Default::default()
+        };
+        assert!(duplicate.validate().is_err());
+        let parsed: ResourceAdmissionConfig =
+            serde_json::from_str(&format!(r#"{{"image_repositories":["{LISTED}"]}}"#)).unwrap();
+        assert_eq!(parsed, image_policy());
+        // An empty list leaves the acknowledgement as it was before the setting existed.
+        assert!(
+            !DriverAdmissionConfig::default()
+                .acknowledgement()
+                .contains("image_repositories")
+        );
+        let listed = DriverAdmissionConfig {
+            resource_admission: image_policy(),
+            ..Default::default()
+        };
+        assert!(
+            DriverAdmissionConfig::default()
+                .verify_acknowledgement(&listed.acknowledgement())
+                .is_err()
+        );
     }
 }

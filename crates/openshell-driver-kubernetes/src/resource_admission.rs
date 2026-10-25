@@ -84,7 +84,11 @@ fn reference(refs: &mut BTreeSet<Reference>, kind: &'static str, name: Option<&s
     }
 }
 
-fn inventory(spec: &Value, private_secret: &str) -> Result<BTreeSet<Reference>, Status> {
+fn inventory(
+    spec: &Value,
+    private_secret: &str,
+    policy: &ResourceAdmissionConfig,
+) -> Result<BTreeSet<Reference>, Status> {
     let deny = || {
         Status::failed_precondition("workload contains an unsupported external resource attachment")
     };
@@ -128,6 +132,11 @@ fn inventory(spec: &Value, private_secret: &str) -> Result<BTreeSet<Reference>, 
                 Scope::Workspace,
             ),
             "secret" if volume["secret"]["secretName"].as_str() == Some(private_secret) => {}
+            // An image has no labels to approve: the policy admits one pinned by digest
+            // from a repository the operator lists, and it needs no metadata lookup.
+            "image" => {
+                policy.admit_image(volume["image"]["reference"].as_str().unwrap_or_default())?;
+            }
             // The typed Kubernetes driver config does not expose Secret or
             // ConfigMap volumes. The closed-set fallback rejects them instead
             // of expanding gateway RBAC for attachments callers cannot request.
@@ -181,7 +190,7 @@ pub async fn admit(
         return Ok(BTreeMap::new());
     }
     let mut identities = BTreeMap::new();
-    for reference in inventory(spec, private_secret)? {
+    for reference in inventory(spec, private_secret, policy)? {
         let (group, version, plural, cluster) = match reference.kind {
             "PersistentVolumeClaim" => ("", "v1", "persistentvolumeclaims", false),
             "RuntimeClass" => ("node.k8s.io", "v1", "runtimeclasses", true),
@@ -458,7 +467,7 @@ mod tests {
         let pod = serde_json::json!({"automountServiceAccountToken":false,"runtimeClassName":"r","priorityClassName":"p",
             "volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"gateway-db","readOnly":true}}],
             "imagePullSecrets":[{"name":"regcred"}]});
-        let refs = inventory(&pod, "private").unwrap();
+        let refs = inventory(&pod, "private", &ResourceAdmissionConfig::default()).unwrap();
         assert_eq!(refs.len(), 3);
         assert!(
             refs.iter()
@@ -472,14 +481,83 @@ mod tests {
     #[test]
     fn rejects_unsupported_volume_sources_but_allows_gpu() {
         for kind in ["hostPath", "csi", "projected", "image", "configMap"] {
-            assert!(inventory(&serde_json::json!({"automountServiceAccountToken":false,"volumes":[{"name":"x",kind:{}}]}), "private").is_err());
+            assert!(inventory(&serde_json::json!({"automountServiceAccountToken":false,"volumes":[{"name":"x",kind:{}}]}), "private", &ResourceAdmissionConfig::default()).is_err());
         }
-        assert!(inventory(&serde_json::json!({"automountServiceAccountToken":false,"volumes":[{"name":"x","secret":{"secretName":"external"}}]}), "private").is_err());
-        assert!(inventory(&serde_json::json!({"automountServiceAccountToken":false,"volumes":[{"name":"x","secret":{"secretName":"private"}}]}), "private").is_ok());
-        assert!(inventory(&serde_json::json!({"automountServiceAccountToken":false,"containers":[{"envFrom":[{"secretRef":{"name":"external"}}]}]}), "private").is_err());
-        assert!(inventory(&serde_json::json!({"automountServiceAccountToken":false,"containers":[{"env":[{"valueFrom":{"configMapKeyRef":{"name":"external"}}}]}]}), "private").is_err());
-        assert!(inventory(&serde_json::json!({"automountServiceAccountToken":false,"containers":[{"resources":{"limits":{"nvidia.com/gpu":"1"}}}]}), "private").is_ok());
+        assert!(inventory(&serde_json::json!({"automountServiceAccountToken":false,"volumes":[{"name":"x","secret":{"secretName":"external"}}]}), "private", &ResourceAdmissionConfig::default()).is_err());
+        assert!(inventory(&serde_json::json!({"automountServiceAccountToken":false,"volumes":[{"name":"x","secret":{"secretName":"private"}}]}), "private", &ResourceAdmissionConfig::default()).is_ok());
+        assert!(inventory(&serde_json::json!({"automountServiceAccountToken":false,"containers":[{"envFrom":[{"secretRef":{"name":"external"}}]}]}), "private", &ResourceAdmissionConfig::default()).is_err());
+        assert!(inventory(&serde_json::json!({"automountServiceAccountToken":false,"containers":[{"env":[{"valueFrom":{"configMapKeyRef":{"name":"external"}}}]}]}), "private", &ResourceAdmissionConfig::default()).is_err());
+        assert!(inventory(&serde_json::json!({"automountServiceAccountToken":false,"containers":[{"resources":{"limits":{"nvidia.com/gpu":"1"}}}]}), "private", &ResourceAdmissionConfig::default()).is_ok());
     }
+    #[test]
+    fn admits_image_volumes_pinned_by_digest_from_listed_repositories() {
+        const LISTED: &str = "registry.example.com:5000/veoveo/lore";
+        let digest = format!("sha256:{}", "0123456789abcdef".repeat(4));
+        let pod = |reference: &str| {
+            serde_json::json!({"automountServiceAccountToken":false,
+                "volumes":[{"name":"lore","image":{"reference":reference,"pullPolicy":"IfNotPresent"}}]})
+        };
+        let policy = ResourceAdmissionConfig {
+            image_repositories: vec![LISTED.into()],
+            ..Default::default()
+        };
+        // Admitted, with no reference to resolve: the listed repository is the approval.
+        let refs = inventory(&pod(&format!("{LISTED}@{digest}")), "private", &policy).unwrap();
+        assert!(refs.is_empty());
+        // An unlisted repository is refused, and so is the default policy's empty list.
+        let unlisted = format!("registry.example.com:5000/veoveo/other@{digest}");
+        let error = inventory(&pod(&unlisted), "private", &policy).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            error
+                .message()
+                .contains("repository 'registry.example.com:5000/veoveo/other' is not in resource_admission.image_repositories"),
+            "{}",
+            error.message()
+        );
+        assert!(
+            inventory(
+                &pod(&format!("{LISTED}@{digest}")),
+                "private",
+                &ResourceAdmissionConfig::default()
+            )
+            .is_err()
+        );
+        // A tag-only reference to the listed repository pins nothing and is refused.
+        let error = inventory(&pod(&format!("{LISTED}:v1")), "private", &policy).unwrap_err();
+        assert!(
+            error.message().contains("pinned by digest"),
+            "{}",
+            error.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_admission_resolves_nothing_for_image_volumes() {
+        let policy = ResourceAdmissionConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        // Any metadata lookup would fail against this API server.
+        let service = tower::service_fn(|_request: http::Request<kube::client::Body>| async move {
+            Ok::<_, std::convert::Infallible>(
+                http::Response::builder()
+                    .status(500)
+                    .body(kube::client::Body::empty())
+                    .unwrap(),
+            )
+        });
+        let client = Client::new(service, "shared");
+        let pod = serde_json::json!({"automountServiceAccountToken":false,
+            "volumes":[{"name":"lore","image":{"reference":"registry.example.com:5000/veoveo/lore:v1"}}]});
+        assert!(
+            admit(&client, &policy, "team-a", "shared", &pod, "private")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[test]
     fn legacy_and_forbidden_config_records_fail_closed() {
         assert!(check_record(None, true).is_err());

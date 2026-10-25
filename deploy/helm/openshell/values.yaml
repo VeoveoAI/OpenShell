@@ -434,6 +434,8 @@ server:
         enabled: true
         # -- Replacement label map; null uses the built-in admission labels. Empty map is invalid when enabled.
         requiredLabels: null
+        # -- Image repositories, exact names without a tag or digest, from which Kubernetes image volumes pinned by digest are admitted. Empty refuses every image volume while admission is enabled.
+        imageRepositories: []
       # -- How workspaces map to Kubernetes namespaces.
       # "shared" (default): all sandboxes in a single namespace.
       # "managed": auto-creates per-workspace namespaces.

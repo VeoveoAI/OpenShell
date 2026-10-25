@@ -54,6 +54,26 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.drivers\.kubernetes\.resource_admission\]\s*enabled\s*=\s*false'
 
+  - it: renders listed image repositories into label admission
+    template: templates/gateway-config.yaml
+    set:
+      server.drivers.kubernetes.resourceAdmission.imageRepositories:
+        - registry.example.com:5000/team/tools
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\.resource_admission\][^\[]*enabled\s*=\s*true'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\.resource_admission\][^\[]*image_repositories\s*=\s*\[\s*"registry\.example\.com:5000/team/tools"\s*\]'
+
+  - it: omits image repositories when none are listed
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'image_repositories'
+
   - it: renders replacement labels and literal workspace substitution
     template: templates/gateway-config.yaml
     set:
