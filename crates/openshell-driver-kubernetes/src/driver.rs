@@ -443,11 +443,23 @@ struct KubernetesContainerResourceConfig {
     limits: BTreeMap<String, String>,
 }
 
+/// A caller volume. Exactly one of `persistent_volume_claim` or `image` is set.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct KubernetesDriverVolumeConfig {
     name: String,
-    persistent_volume_claim: KubernetesPersistentVolumeClaimConfig,
+    persistent_volume_claim: Option<KubernetesPersistentVolumeClaimConfig>,
+    image: Option<KubernetesImageVolumeConfig>,
+}
+
+impl KubernetesDriverVolumeConfig {
+    /// Whether every mount of the volume must be read-only. Image volumes are always
+    /// read-only.
+    fn read_only(&self) -> bool {
+        self.persistent_volume_claim
+            .as_ref()
+            .is_none_or(|claim| claim.read_only)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -466,6 +478,15 @@ impl Default for KubernetesPersistentVolumeClaimConfig {
     }
 }
 
+/// An OCI image mounted read-only as a Kubernetes image volume.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KubernetesImageVolumeConfig {
+    reference: String,
+    #[serde(default)]
+    pull_policy: Option<crate::KubernetesImagePullPolicy>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct KubernetesDriverVolumeMountConfig {
@@ -482,19 +503,6 @@ impl Default for KubernetesDriverVolumeMountConfig {
             mount_path: String::new(),
             sub_path: None,
             read_only: true,
-        }
-    }
-}
-
-impl From<&KubernetesDriverVolumeConfig> for Volume {
-    fn from(volume: &KubernetesDriverVolumeConfig) -> Self {
-        Self {
-            name: volume.name.clone(),
-            persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
-                claim_name: volume.persistent_volume_claim.claim_name.clone(),
-                read_only: Some(volume.persistent_volume_claim.read_only),
-            }),
-            ..Default::default()
         }
     }
 }
@@ -552,36 +560,160 @@ fn validate_kubernetes_driver_volumes(
                 "duplicate kubernetes driver_config volume '{name}'"
             ));
         }
-        validate_kubernetes_dns1123_subdomain(
-            &volume.persistent_volume_claim.claim_name,
-            "volumes[].persistent_volume_claim.claim_name",
-        )?;
+        match (&volume.persistent_volume_claim, &volume.image) {
+            (Some(claim), None) => validate_kubernetes_dns1123_subdomain(
+                &claim.claim_name,
+                "volumes[].persistent_volume_claim.claim_name",
+            )?,
+            (None, Some(image)) => {
+                validate_kubernetes_image_reference(&image.reference, "volumes[].image.reference")?;
+            }
+            _ => {
+                return Err(format!(
+                    "volume '{name}' must set exactly one of persistent_volume_claim or image"
+                ));
+            }
+        }
     }
     Ok(())
+}
+
+/// Validate an OCI image reference in the distribution reference grammar,
+/// `[domain/]path[:tag][@digest]`, with a `sha256` or `sha512` digest.
+fn validate_kubernetes_image_reference(reference: &str, field: &str) -> Result<(), String> {
+    let (named, digest) = match reference.split_once('@') {
+        Some((named, digest)) => (named, Some(digest)),
+        None => (reference, None),
+    };
+    // A tag follows the last ':' after the last '/', so a registry port is not a tag.
+    let path_start = named.rfind('/').map_or(0, |slash| slash + 1);
+    let (name, tag) = named[path_start..]
+        .rfind(':')
+        .map_or((named, None), |colon| {
+            let colon = path_start + colon;
+            (&named[..colon], Some(&named[colon + 1..]))
+        });
+    let components = name.split('/').collect::<Vec<_>>();
+    let path = if components.len() > 1 && is_image_domain(components[0]) {
+        &components[1..]
+    } else {
+        &components[..]
+    };
+    let valid = name.len() <= MAX_IMAGE_NAME_LEN
+        && path
+            .iter()
+            .all(|component| is_image_path_component(component))
+        && tag.is_none_or(is_image_tag)
+        && digest.is_none_or(is_image_digest);
+    if !valid {
+        return Err(format!(
+            "{field} must be an OCI image reference, such as registry.example.com/team/tools@sha256:<64 hex digits>"
+        ));
+    }
+    Ok(())
+}
+
+/// The longest image name the distribution reference grammar admits.
+const MAX_IMAGE_NAME_LEN: usize = 255;
+
+/// `domain := host [':' port]`, where `host` is dot-separated labels of letters,
+/// digits and inner hyphens, or a bracketed IPv6 address.
+fn is_image_domain(value: &str) -> bool {
+    let (host, port) = match value.rsplit_once(':') {
+        Some((host, port)) if !host.starts_with('[') || host.ends_with(']') => (host, Some(port)),
+        _ => (value, None),
+    };
+    let host_valid = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .map_or_else(
+            || {
+                host.split('.').all(|label| {
+                    let bytes = label.as_bytes();
+                    bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+                        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+                        && bytes
+                            .iter()
+                            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+                })
+            },
+            |ipv6| ipv6.parse::<std::net::Ipv6Addr>().is_ok(),
+        );
+    host_valid
+        && port.is_none_or(|port| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// `path-component := [a-z0-9]+ (separator [a-z0-9]+)*`, with
+/// `separator := [_.] | '__' | [-]+`.
+fn is_image_path_component(value: &str) -> bool {
+    let alphanumeric = |byte: &u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+    let bytes = value.as_bytes();
+    bytes.first().is_some_and(alphanumeric)
+        && bytes.last().is_some_and(alphanumeric)
+        && value
+            .split(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+            .all(|separator| {
+                matches!(separator, "" | "." | "_" | "__")
+                    || separator.bytes().all(|byte| byte == b'-')
+            })
+}
+
+/// `tag := [A-Za-z0-9_][A-Za-z0-9_.-]{0,127}`.
+fn is_image_tag(value: &str) -> bool {
+    let word = |byte: &u8| byte.is_ascii_alphanumeric() || *byte == b'_';
+    let bytes = value.as_bytes();
+    (1..=128).contains(&bytes.len())
+        && word(&bytes[0])
+        && bytes[1..]
+            .iter()
+            .all(|byte| word(byte) || matches!(byte, b'.' | b'-'))
+}
+
+/// A `sha256` or `sha512` digest in lowercase hexadecimal.
+fn is_image_digest(value: &str) -> bool {
+    let hex = |encoded: &str, length: usize| {
+        encoded.len() == length
+            && encoded
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    match value.split_once(':') {
+        Some(("sha256", encoded)) => hex(encoded, 64),
+        Some(("sha512", encoded)) => hex(encoded, 128),
+        _ => false,
+    }
 }
 
 fn validate_kubernetes_driver_volume_mounts(
     volumes: &[KubernetesDriverVolumeConfig],
     volume_mounts: &[KubernetesDriverVolumeMountConfig],
 ) -> Result<(), String> {
-    let mut volume_read_only = BTreeMap::new();
-    for volume in volumes {
-        volume_read_only.insert(
-            volume.name.as_str(),
-            volume.persistent_volume_claim.read_only,
-        );
-    }
+    let volumes = volumes
+        .iter()
+        .map(|volume| (volume.name.as_str(), volume))
+        .collect::<BTreeMap<_, _>>();
 
     let mut mount_paths = HashSet::new();
     for mount in volume_mounts {
         validate_kubernetes_dns1123_label(&mount.name, "containers.agent.volume_mounts[].name")?;
         let volume_name = mount.name.as_str();
-        let Some(volume_is_read_only) = volume_read_only.get(volume_name) else {
+        let Some(volume) = volumes.get(volume_name) else {
             return Err(format!(
                 "volume mount references unknown kubernetes driver_config volume '{volume_name}'"
             ));
         };
-        if *volume_is_read_only && !mount.read_only {
+        if volume.image.is_some() {
+            if !mount.read_only {
+                return Err(format!(
+                    "volume mount '{volume_name}' cannot set read_only=false because image volumes are read-only"
+                ));
+            }
+            if mount.sub_path.is_some() {
+                return Err(format!(
+                    "volume mount '{volume_name}' cannot set sub_path: kubernetes image volume mounts do not support sub_path"
+                ));
+            }
+        } else if volume.read_only() && !mount.read_only {
             return Err(format!(
                 "volume mount '{volume_name}' cannot set read_only=false because the PVC volume is read_only=true"
             ));
@@ -659,27 +791,47 @@ fn validate_kubernetes_protected_mount_target(
     Ok(())
 }
 
-/// Recheck caller PVC destinations in saved Pod templates before restart or release.
-fn validate_stored_kubernetes_pvc_mounts(spec: &serde_json::Value) -> Result<(), String> {
-    let caller_volumes: HashSet<_> = spec["volumes"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|volume| !volume["persistentVolumeClaim"].is_null())
-        .filter_map(|volume| volume["name"].as_str())
-        .filter(|name| *name != WORKSPACE_VOLUME_NAME)
-        .collect();
+/// Recheck caller volume mounts in saved Pod templates before restart or release:
+/// every PVC and image destination, and that each image volume keeps a valid
+/// reference and pull policy and is mounted read-only without a `subPath`.
+fn validate_stored_kubernetes_volume_mounts(spec: &serde_json::Value) -> Result<(), String> {
+    // Caller volumes by name, and whether each is an image volume.
+    let mut caller_volumes = BTreeMap::new();
+    for volume in spec["volumes"].as_array().into_iter().flatten() {
+        let Some(name) = volume["name"]
+            .as_str()
+            .filter(|name| *name != WORKSPACE_VOLUME_NAME)
+        else {
+            continue;
+        };
+        let image = &volume["image"];
+        if !image.is_null() {
+            validate_kubernetes_image_reference(
+                image["reference"].as_str().unwrap_or_default(),
+                "stored image volume reference",
+            )?;
+            if let Some(policy) = image.get("pullPolicy") {
+                policy
+                    .as_str()
+                    .ok_or("stored image volume pullPolicy is not a string")?
+                    .parse::<crate::KubernetesImagePullPolicy>()?;
+            }
+            caller_volumes.insert(name, true);
+        } else if !volume["persistentVolumeClaim"].is_null() {
+            caller_volumes.insert(name, false);
+        }
+    }
     for container in spec["containers"].as_array().into_iter().flatten() {
         for mount in container["volumeMounts"].as_array().into_iter().flatten() {
-            if !mount["name"]
+            let Some(image) = mount["name"]
                 .as_str()
-                .is_some_and(|name| caller_volumes.contains(name))
-            {
+                .and_then(|name| caller_volumes.get(name))
+            else {
                 continue;
-            }
+            };
             let target = mount["mountPath"]
                 .as_str()
-                .ok_or("caller PVC mount lacks a mountPath")?;
+                .ok_or("caller volume mount lacks a mountPath")?;
             driver_mounts::validate_container_mount_target(target)?;
             driver_mounts::validate_workspace_mount_target(
                 target,
@@ -689,13 +841,37 @@ fn validate_stored_kubernetes_pvc_mounts(spec: &serde_json::Value) -> Result<(),
                 target,
                 KUBERNETES_DRIVER_PROTECTED_MOUNT_PATHS,
             )?;
+            if *image && (mount["readOnly"] != true || !mount["subPath"].is_null()) {
+                return Err(format!(
+                    "caller image volume mount '{target}' must be read-only without a subPath"
+                ));
+            }
         }
     }
     Ok(())
 }
 
 fn kubernetes_driver_volume_to_k8s(volume: &KubernetesDriverVolumeConfig) -> serde_json::Value {
-    serde_json::to_value(Volume::from(volume)).expect("Volume serializes to JSON")
+    if let Some(image) = &volume.image {
+        // The `Volume` of k8s-openapi's `v1_29` feature has no image source, so the
+        // image volume is rendered as JSON.
+        let mut source = serde_json::Map::new();
+        source.insert("reference".into(), image.reference.clone().into());
+        if let Some(policy) = image.pull_policy {
+            source.insert("pullPolicy".into(), policy.as_kubernetes_str().into());
+        }
+        return serde_json::json!({"name": volume.name, "image": source});
+    }
+    let claim = volume.persistent_volume_claim.clone().unwrap_or_default();
+    serde_json::to_value(Volume {
+        name: volume.name.clone(),
+        persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+            claim_name: claim.claim_name,
+            read_only: Some(claim.read_only),
+        }),
+        ..Default::default()
+    })
+    .expect("Volume serializes to JSON")
 }
 
 fn kubernetes_driver_volume_mount_to_k8s(
@@ -1891,7 +2067,7 @@ impl KubernetesComputeDriver {
     }
 
     async fn admit_stored_resources(&self, object: &DynamicObject) -> Result<(), tonic::Status> {
-        validate_stored_kubernetes_pvc_mounts(&object.data["spec"]["podTemplate"]["spec"])
+        validate_stored_kubernetes_volume_mounts(&object.data["spec"]["podTemplate"]["spec"])
             .map_err(tonic::Status::failed_precondition)?;
         if self.config.allow_driver_config && !self.config.resource_admission.enabled {
             return Ok(());
@@ -11068,11 +11244,9 @@ mod tests {
 
         assert_eq!(config.volumes.len(), 1);
         assert_eq!(config.volumes[0].name, "user-data");
-        assert_eq!(
-            config.volumes[0].persistent_volume_claim.claim_name,
-            "pvc-user-data"
-        );
-        assert!(!config.volumes[0].persistent_volume_claim.read_only);
+        let claim = config.volumes[0].persistent_volume_claim.as_ref().unwrap();
+        assert_eq!(claim.claim_name, "pvc-user-data");
+        assert!(!claim.read_only);
         assert_eq!(config.containers.agent.volume_mounts.len(), 3);
         assert!(
             config
@@ -11155,7 +11329,11 @@ mod tests {
             .expect("DNS-1123 subdomain PVC names should validate");
 
         assert_eq!(
-            config.volumes[0].persistent_volume_claim.claim_name,
+            config.volumes[0]
+                .persistent_volume_claim
+                .as_ref()
+                .unwrap()
+                .claim_name,
             "pvc.user-data.123"
         );
     }
@@ -11437,7 +11615,8 @@ mod tests {
         ));
         let mut saved = DynamicObject::new("saved-mount", &resource);
         saved.data = rendered;
-        validate_stored_kubernetes_pvc_mounts(&saved.data["spec"]["podTemplate"]["spec"]).unwrap();
+        validate_stored_kubernetes_volume_mounts(&saved.data["spec"]["podTemplate"]["spec"])
+            .unwrap();
         for enabled in [true, false] {
             let mut config = KubernetesComputeConfig {
                 allow_driver_config: true,
@@ -11600,6 +11779,233 @@ mod tests {
         let err = KubernetesSandboxDriverConfig::from_template(&template).unwrap_err();
 
         assert!(err.contains("cannot set read_only=false"));
+    }
+
+    const TOOLS_IMAGE: &str = "registry.example.com/team/tools@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// A template whose driver config mounts `volume` at `/opt/tools` as `mount`
+    /// adds to `{"name": "tools", "mount_path": "/opt/tools"}`.
+    fn template_with_volume(
+        volume: serde_json::Value,
+        mount: serde_json::Value,
+    ) -> SandboxTemplate {
+        let mut mount_config = serde_json::json!({"name": "tools", "mount_path": "/opt/tools"});
+        for (key, value) in mount.as_object().unwrap() {
+            mount_config[key] = value.clone();
+        }
+        let mut volume_config = serde_json::json!({"name": "tools"});
+        for (key, value) in volume.as_object().unwrap() {
+            volume_config[key] = value.clone();
+        }
+        SandboxTemplate {
+            driver_config: Some(json_struct(serde_json::json!({
+                "volumes": [volume_config],
+                "containers": {"agent": {"volume_mounts": [mount_config]}}
+            }))),
+            ..SandboxTemplate::default()
+        }
+    }
+
+    #[test]
+    fn driver_config_image_volumes_render_as_read_only_image_mounts() {
+        for (pull_policy, rendered_policy) in [
+            (Some("if_not_present"), Some("IfNotPresent")),
+            (Some("Always"), Some("Always")),
+            (None, None),
+        ] {
+            let mut image = serde_json::json!({"reference": TOOLS_IMAGE});
+            if let Some(policy) = pull_policy {
+                image["pull_policy"] = policy.into();
+            }
+            let spec = SandboxSpec {
+                template: Some(template_with_volume(
+                    serde_json::json!({"image": image}),
+                    serde_json::json!({}),
+                )),
+                ..SandboxSpec::default()
+            };
+            let cr = sandbox_to_k8s_spec_for_test(Some(&spec), &SandboxPodParams::default());
+            let pod = &cr["spec"]["podTemplate"]["spec"];
+            let volume = pod["volumes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|volume| volume["name"] == "tools")
+                .expect("image volume should be rendered");
+            let mut expected = serde_json::json!({"reference": TOOLS_IMAGE});
+            if let Some(policy) = rendered_policy {
+                expected["pullPolicy"] = policy.into();
+            }
+            assert_eq!(
+                *volume,
+                serde_json::json!({"name": "tools", "image": expected})
+            );
+            let mount = pod["containers"][0]["volumeMounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|mount| mount["name"] == "tools")
+                .expect("image mount should be rendered");
+            assert_eq!(mount["mountPath"], "/opt/tools");
+            assert_eq!(mount["readOnly"], true);
+            assert!(mount["subPath"].is_null());
+            // A mount outside /sandbox keeps the default workspace persistence.
+            assert!(
+                cr["spec"]
+                    .as_object()
+                    .unwrap()
+                    .contains_key("volumeClaimTemplates")
+            );
+            validate_stored_kubernetes_volume_mounts(pod).unwrap();
+        }
+    }
+
+    #[test]
+    fn driver_config_image_mounts_are_read_only_without_sub_path() {
+        let image = serde_json::json!({"image": {"reference": TOOLS_IMAGE}});
+        let err = KubernetesSandboxDriverConfig::from_template(&template_with_volume(
+            image.clone(),
+            serde_json::json!({"read_only": false}),
+        ))
+        .unwrap_err();
+        assert!(err.contains("image volumes are read-only"), "{err}");
+        let err = KubernetesSandboxDriverConfig::from_template(&template_with_volume(
+            image,
+            serde_json::json!({"sub_path": "usr/local/bin"}),
+        ))
+        .unwrap_err();
+        assert!(err.contains("do not support sub_path"), "{err}");
+    }
+
+    #[test]
+    fn driver_config_volumes_name_exactly_one_source() {
+        for volume in [
+            serde_json::json!({}),
+            serde_json::json!({
+                "image": {"reference": TOOLS_IMAGE},
+                "persistent_volume_claim": {"claim_name": "pvc-tools"}
+            }),
+        ] {
+            let err = KubernetesSandboxDriverConfig::from_template(&template_with_volume(
+                volume,
+                serde_json::json!({}),
+            ))
+            .unwrap_err();
+            assert!(
+                err.contains("exactly one of persistent_volume_claim or image"),
+                "{err}"
+            );
+        }
+        let err = KubernetesSandboxDriverConfig::from_template(&template_with_volume(
+            serde_json::json!({"image": {"reference": TOOLS_IMAGE, "read_only": true}}),
+            serde_json::json!({}),
+        ))
+        .unwrap_err();
+        assert!(err.contains("unknown field"), "{err}");
+    }
+
+    #[test]
+    fn driver_config_validates_image_references_and_pull_policies() {
+        let digest = "0123456789abcdef".repeat(4);
+        for reference in [
+            TOOLS_IMAGE.to_string(),
+            format!("registry.veoveo-system.svc.cluster.local:5000/veoveo/lore@sha256:{digest}"),
+            format!("tools:1.0@sha256:{digest}"),
+            format!("tools@sha512:{digest}{digest}"),
+            "ubuntu".to_string(),
+            "nvcr.io/nvidia/base/ubuntu:24.04".to_string(),
+            "localhost:5000/team/tools_cli__x.y-z:v1.2_rc-3".to_string(),
+            "[fd00::1]:5000/tools".to_string(),
+            "Registry.Example.com/tools".to_string(),
+        ] {
+            KubernetesSandboxDriverConfig::from_template(&template_with_volume(
+                serde_json::json!({"image": {"reference": reference}}),
+                serde_json::json!({}),
+            ))
+            .unwrap_or_else(|err| panic!("{reference}: {err}"));
+        }
+        for reference in [
+            String::new(),
+            " tools".to_string(),
+            "Tools".to_string(),
+            "tools:".to_string(),
+            "tools:bad tag".to_string(),
+            format!("tools:{}", "t".repeat(129)),
+            "tools@sha256:0123".to_string(),
+            format!("tools@sha256:{}", digest.to_uppercase()),
+            format!("tools@md5:{digest}"),
+            "registry:5000/".to_string(),
+            "team//tools".to_string(),
+            "-tools".to_string(),
+            "team/tools-".to_string(),
+            "a___b".to_string(),
+            "@image:lore@".to_string(),
+            format!("{}/tools", "a".repeat(250)),
+        ] {
+            let err = KubernetesSandboxDriverConfig::from_template(&template_with_volume(
+                serde_json::json!({"image": {"reference": reference}}),
+                serde_json::json!({}),
+            ))
+            .unwrap_err();
+            assert!(
+                err.contains("volumes[].image.reference must be an OCI image reference"),
+                "{reference:?}: {err}"
+            );
+        }
+        let err = KubernetesSandboxDriverConfig::from_template(&template_with_volume(
+            serde_json::json!({"image": {"reference": TOOLS_IMAGE, "pull_policy": "newer"}}),
+            serde_json::json!({}),
+        ))
+        .unwrap_err();
+        assert!(err.contains("unknown variant"), "{err}");
+    }
+
+    #[test]
+    fn stored_image_volume_mounts_are_rechecked() {
+        fn mount(pod: &mut serde_json::Value) -> &mut serde_json::Value {
+            pod["containers"][0]["volumeMounts"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|mount| mount["name"] == "tools")
+                .unwrap()
+        }
+        fn volume(pod: &mut serde_json::Value) -> &mut serde_json::Value {
+            pod["volumes"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|volume| volume["name"] == "tools")
+                .unwrap()
+        }
+        let spec = SandboxSpec {
+            template: Some(template_with_volume(
+                serde_json::json!({"image": {"reference": TOOLS_IMAGE, "pull_policy": "never"}}),
+                serde_json::json!({}),
+            )),
+            ..SandboxSpec::default()
+        };
+        let rendered = sandbox_to_k8s_spec(Some(&spec), &SandboxPodParams::default()).unwrap();
+        let pod = &rendered["spec"]["podTemplate"]["spec"];
+        validate_stored_kubernetes_volume_mounts(pod).unwrap();
+        let tamper = |change: &dyn Fn(&mut serde_json::Value)| {
+            let mut pod = pod.clone();
+            change(&mut pod);
+            validate_stored_kubernetes_volume_mounts(&pod).unwrap_err()
+        };
+        let err = tamper(&|pod| mount(pod)["readOnly"] = false.into());
+        assert!(err.contains("must be read-only without a subPath"), "{err}");
+        let err = tamper(&|pod| mount(pod)["subPath"] = "usr".into());
+        assert!(err.contains("must be read-only without a subPath"), "{err}");
+        let err = tamper(&|pod| mount(pod)["mountPath"] = "/run/custom".into());
+        assert!(err.contains("reserved OpenShell path"), "{err}");
+        let err = tamper(&|pod| volume(pod)["image"]["reference"] = "Tools".into());
+        assert!(err.contains("must be an OCI image reference"), "{err}");
+        let err = tamper(&|pod| volume(pod)["image"]["pullPolicy"] = "Newer".into());
+        assert!(
+            err.contains("invalid Kubernetes image pull policy"),
+            "{err}"
+        );
     }
 
     #[test]

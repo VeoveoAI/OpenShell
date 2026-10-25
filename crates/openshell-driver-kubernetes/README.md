@@ -310,6 +310,8 @@ nested schema and currently accepts:
 - `volumes[].name`
 - `volumes[].persistent_volume_claim.claim_name`
 - `volumes[].persistent_volume_claim.read_only`
+- `volumes[].image.reference`
+- `volumes[].image.pull_policy`
 
 Nested keys inside the `kubernetes` block use snake_case. The top-level
 `driver_config` envelope is keyed by driver names, so `kubernetes` is not part
@@ -340,6 +342,17 @@ agent container. PVC volumes and mounts default to read-only unless
 rejects duplicate volume names, invalid DNS-1123 volume labels or PVC claim
 subdomain names, mounts that reference unknown volumes, non-normalized or
 protected mount paths, and absolute or parent-traversing `sub_path` values.
+
+Use image volumes to mount an OCI image's filesystem read-only into the agent
+container. Each volume sets exactly one of `persistent_volume_claim` or `image`.
+`image.reference` must follow the distribution reference grammar, with a
+`sha256` or `sha512` digest when it names one, and `image.pull_policy` is
+`always`, `if_not_present` or `never` when set. Image volume mounts must stay
+read-only and cannot set `sub_path`. The driver renders the volume as JSON,
+because the `v1_29` Kubernetes API types it builds against have no image volume
+source, and rechecks saved image mounts, references and pull policies before a
+restart or release, as it does saved PVC mount destinations. Resource admission
+refuses image volumes, so they require disabling it.
 
 Any explicit driver-config mount under `/sandbox` disables the driver's
 default `/sandbox` workspace PVC injection for that sandbox. Only the explicit
