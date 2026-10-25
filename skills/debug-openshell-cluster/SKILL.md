@@ -117,8 +117,11 @@ membership and read-only access do not grant approval. GPU devices and
 operator-selected image-pull Secrets do not need admission labels. In managed
 mode, inspect the configured source image-pull Secret in the gateway namespace
 and the generation copies (`openshell.ai/component=image-pull`) in the workspace
-namespace. Legacy workloads without
-admission provenance need recreation. Do not
+namespace. Image volumes carry no labels: admission accepts one only when its
+reference is pinned by digest and its repository is listed exactly in
+`resourceAdmission.imageRepositories`, so a refused image volume names its
+reference and either the missing digest or the unlisted repository. Legacy
+workloads without admission provenance need recreation. Do not
 automatically label control-plane resources or disable enforcement as a repair.
 
 For Kubernetes mount-path conflicts, move caller PVC mounts away from
