@@ -44,6 +44,7 @@ Provider profiles include these user-facing features:
 - Credential refresh configuration with `openshell provider refresh status|configure|rotate|delete`.
 - Credential expiry metadata with `openshell provider update --credential-expires-at`; values accept Unix epoch milliseconds or ISO/RFC3339 timestamps.
 - Dynamic token grants that use the sandbox's SPIFFE JWT-SVID as an OAuth2 client assertion and inject short-lived tokens into supported headers for matching profile endpoints.
+- Request-scoped refresh, where the gateway mints an OAuth2 client credentials token for a scope named by one request header and the supervisor substitutes it for that request's placeholder.
 - Endpoint-bound static credential placeholders. The sandbox proxy resolves a static credential only for request hosts, ports, and paths declared by its provider profile or explicitly bound in sandbox policy for an endpointless profile.
 
 ## Understand Static Credential Endpoint Binding
@@ -397,6 +398,10 @@ credentials:
           description: OAuth client secret
           required: true
           secret: true
+      # Optional request-scoped refresh; oauth2_client_credentials only.
+      request_scope:
+        header: x-tenant
+        scope_template: "tenant-{value}.read"
 
     # Optional dynamic credential. The sandbox supervisor resolves this on
     # demand for matching endpoint traffic, caches the returned access token,
@@ -532,6 +537,15 @@ Gateway-managed refresh strategies use these material keys:
 
 OpenShell keeps token endpoints profile-owned. Refresh material cannot override `token_url` or `token_uri` during refresh configuration.
 
+An `oauth2_client_credentials` refresh can also declare `request_scope`, with these fields:
+
+| Field | Description |
+|---|---|
+| `header` | Lowercase request header that names the scope value. It cannot be a pseudo-header, a hop-by-hop field, `authorization`, `host`, `cookie`, or the credential's `header_name`. |
+| `scope_template` | OAuth scope that contains `{value}` exactly once. Other characters must be RFC 6749 scope characters: printable ASCII except space, `"`, and `\`. |
+
+Refer to [Request-Scoped Refresh](#request-scoped-refresh).
+
 ### Additional Outputs
 
 Most refresh strategies mint a single credential. `aws_sts_assume_role` mints three. A refresh declares the extra credentials it co-mints with `additional_outputs`, mapping each strategy-defined output id to a sibling credential whose `env_vars` receive the value:
@@ -557,6 +571,47 @@ credentials:
 ```
 
 The refresh attaches to the primary credential (`access_key_id`). Each referenced sibling must exist, declare exactly one env var, and not carry its own refresh. Because a refresh's outputs are runtime-resolvable, a profile whose only credentials are STS-minted can be created with `--runtime-credentials`. The resolved output-to-env-key mapping is pinned when refresh is configured, so later profile edits do not silently redirect where minted values are written.
+
+### Request-Scoped Refresh
+
+Use request-scoped refresh when an issuer grants one narrow token per resource and each request names its resource in a header. For each request that names a resource, the gateway mints that resource's token from the credential's stored client credentials, and the supervisor substitutes it for the credential's placeholder in that request only. The token never enters the sandbox, and the workload keeps using the credential's ordinary environment placeholder.
+
+This profile attaches each gRPC request's repository token. The request names its repository in the `lore-partition-bin` binary metadata header:
+
+```yaml
+credentials:
+  - name: lore_token
+    env_vars: [LORE_TOKEN]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+    refresh:
+      strategy: oauth2_client_credentials
+      token_url: https://hub.example.com/oauth/token
+      refresh_before: "60s"
+      request_scope:
+        header: lore-partition-bin
+        scope_template: "lore-repo-{value}"
+endpoints:
+  - host: lore.example.com
+    port: 443
+    protocol: rest
+    access: full
+```
+
+Configure the credential's refresh with `openshell provider refresh configure --strategy oauth2-client-credentials` as usual. The gateway keeps minting the ordinary token with the profile's `scopes`. The supervisor derives a scope from each inspected HTTP/1 or HTTP/2 request at the credential's endpoints:
+
+- The request must carry the header exactly once. A header name ending in `-bin` is gRPC binary metadata: its standard base64 value, with or without padding, must decode to 1 to 64 bytes, which become lowercase hex. Any other header value must match `[A-Za-z0-9._~-]{1,256}`.
+- The scope is `scope_template` with `{value}` replaced. For the example above, 16 raw bytes become `lore-repo-` followed by 32 hex digits.
+- The gateway mints with the stored client material at the stored token URL and sends only that scope. It re-validates the provider attachment, the profile declaration, and the scope, and it persists nothing.
+
+| Request | Result |
+|---|---|
+| No scope header, a repeated header, or an invalid value | The request carries the credential's ordinary token. |
+| The issuer refuses the scope with an OAuth error, or the gateway refuses the request | The request carries the ordinary token, so the upstream service refuses it natively. |
+| The gateway or the issuer is unavailable | The supervisor answers HTTP 502 with an `x-openshell-request-id` header and does not forward the request. |
+
+The supervisor caches each scoped token per provider attachment, credential, and scope until its expiry minus `refresh_before`, keeps at most 1,024 tokens per sandbox, and coalesces concurrent requests for the same scope into one mint. The gateway limits how many scoped mints one sandbox runs at once. Logs name the provider, credential, and scope, never the token or the issuer's error description. Request-scoped refresh does not apply to `tls: skip` or other uninspected traffic.
 
 ### Dynamic Token Grants
 
@@ -654,7 +709,7 @@ Token grant fields:
 | `subject_token.subject_token_type` | No | RFC 8693 `subject_token_type` for the stored subject token. Defaults to `urn:ietf:params:oauth:token-type:access_token`. |
 | `audience_overrides` | No | Endpoint-specific final-exchange `audience` and `scopes` overrides selected by host, port, and path. These overrides do not affect the gateway intermediate exchange. |
 
-Token grants require the sandbox supervisor to have access to a SPIFFE Workload API socket. `token_exchange` also requires the gateway to have its own Workload API socket so it can present a gateway JWT-SVID during the intermediate exchange. They apply to HTTP traffic that the proxy can inspect. Token-grant profiles reject endpoints with `protocol: sql` or `tls: skip`, including when `allow_uninspected_credentials` is enabled, because those modes cannot inject the required HTTP credential. The token service must return a token value that is safe for HTTP header placement; malformed values are rejected before caching or header injection.
+Token grants require the sandbox supervisor to have access to a SPIFFE Workload API socket. `token_exchange` also requires the gateway to have its own Workload API socket so it can present a gateway JWT-SVID during the intermediate exchange. They apply to HTTP traffic that the proxy can inspect. Token-grant profiles reject endpoints with `protocol: sql` or `tls: skip`, including when `allow_uninspected_credentials` is enabled, because those modes cannot inject the required HTTP credential. The token service must return a token value that is safe for HTTP header placement; malformed values are rejected before caching or header injection. To mint per-request tokens from stored client credentials without SPIFFE, use [request-scoped refresh](#request-scoped-refresh).
 
 The gateway only brokers an intermediate token for a sandbox principal, and only when the requested provider is attached to that sandbox. It verifies the supervisor JWT-SVID issuer, audience, signature, and SPIFFE trust domain against the gateway's own JWT-SVID, then uses the verified supervisor SVID subject as the intermediate-token audience.
 
