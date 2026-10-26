@@ -574,6 +574,7 @@ discovery endpoint or its TLS CA.
 | server.tls.enableMtls | bool | `true` | Enable mTLS client certificate authentication. When false, the gateway runs HTTPS-only without requiring client certificates (use OIDC for auth instead). Must be false when using BackendTLSPolicy because ingress proxies cannot present client certificates to the backend. |
 | server.workspaceDefaultStorageSize | string | `""` | Default storage size for the workspace PVC in sandbox pods. Uses Kubernetes quantity syntax (e.g. "2Gi", "10Gi", "500Mi"). Empty = built-in default (2Gi). |
 | server.workspaceStorageClass | string | `""` | Kubernetes StorageClass for the workspace PVC in sandbox pods. Empty (default) = omit storageClassName, using the cluster's default StorageClass. Set this on clusters with no default StorageClass, otherwise the workspace PVC stays Pending and the sandbox never starts. |
+| service.clusterIP | string | `""` | Cluster IP of the gateway Service, from the cluster's Service CIDR, for clients that must name the gateway by address, such as a host alias. Empty lets Kubernetes assign one. Kubernetes keeps a Service's cluster IP for its lifetime, so set it when the Service is created or to the address it already has. |
 | service.healthPort | int | `8081` | Gateway health service port. |
 | service.metricsPort | int | `9090` | Gateway metrics service port. |
 | service.port | int | `8080` | Gateway gRPC/HTTP service port. |

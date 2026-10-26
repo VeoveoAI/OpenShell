@@ -499,6 +499,9 @@ Use the log and rollout commands for the gateway resource kind that exists in
 the release. Look for failed installs, unexpected values, missing namespace, wrong
 image tag, TLS settings that do not match the registered endpoint, and
 scheduling failures.
+An upgrade that sets `service.clusterIP` to another address than the existing
+Service has fails, because Kubernetes keeps a Service's cluster IP; compare it with
+`kubectl -n openshell get service openshell -o jsonpath='{.spec.clusterIP}'`.
 
 For a GPU sandbox, distinguish node capacity, the agent container's admitted
 `nvidia.com/gpu` limit, and usable CUDA access inside the workload. A selected

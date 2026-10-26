@@ -306,6 +306,7 @@ The most commonly changed values are:
 | `server.auth.allowUnauthenticatedUsers` | Accept user-facing calls without OIDC or mTLS credentials. Use only for trusted local development or a fully trusted access proxy. |
 | `server.enableLoopbackServiceHttp` | Enable local plaintext HTTP for loopback sandbox service URLs. Defaults to `true`. |
 | `pkiInitJob.serverDnsNames` / `certManager.serverDnsNames` | Additional gateway server DNS SANs. Wildcard SANs also enable sandbox service URLs under that domain. |
+| `service.clusterIP` | Cluster IP of the gateway Service, for in-cluster clients that must name it by address, such as a host alias for a sandbox service hostname. Empty lets Kubernetes assign one. Kubernetes keeps a Service's cluster IP, so set it at install or to the address the Service already has. |
 | `supervisor.sandboxRuntime.boundaryPort` | Non-privileged TLS port used between paired supervisor and sandbox Pods. |
 | `upstreamProxy` | Operator-owned corporate HTTP forward proxy for policy-approved TLS egress. Refer to [Configure a Corporate Upstream Proxy](#configure-a-corporate-upstream-proxy). |
 

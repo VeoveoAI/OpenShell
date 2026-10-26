@@ -196,6 +196,8 @@ securityContext:
 service:
   # -- Kubernetes Service type for the gateway.
   type: ClusterIP
+  # -- Cluster IP of the gateway Service, from the cluster's Service CIDR, for clients that must name the gateway by address, such as a host alias. Empty lets Kubernetes assign one. Kubernetes keeps a Service's cluster IP for its lifetime, so set it when the Service is created or to the address it already has.
+  clusterIP: ""
   # -- Gateway gRPC/HTTP service port.
   port: 8080
   # -- Gateway health service port.

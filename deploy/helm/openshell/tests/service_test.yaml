@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: gateway Service
+
+templates:
+  - templates/service.yaml
+
+release:
+  name: openshell
+  namespace: openshell
+
+tests:
+  - it: leaves the cluster IP to Kubernetes by default
+    asserts:
+      - equal:
+          path: spec.type
+          value: ClusterIP
+      - notExists:
+          path: spec.clusterIP
+
+  - it: sets the declared cluster IP
+    set:
+      service.clusterIP: 10.43.227.28
+    asserts:
+      - equal:
+          path: spec.clusterIP
+          value: 10.43.227.28
+      - equal:
+          path: spec.ports[0].port
+          value: 8080
