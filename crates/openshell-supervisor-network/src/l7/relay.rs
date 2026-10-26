@@ -81,6 +81,9 @@ pub struct L7EvalContext {
     /// Dynamic token grant resolver for endpoint-bound credentials.
     pub(crate) token_grant_resolver:
         Option<Arc<dyn crate::l7::token_grant_injection::TokenGrantResolver>>,
+    /// Scoped tokens for static credentials that declare request-scoped refresh.
+    pub(crate) request_scoped_credentials:
+        Option<Arc<crate::request_scoped_credentials::RequestScopedCredentials>>,
     /// Shared feature state for agent-driven policy proposals.
     pub(crate) agent_proposals: openshell_core::proposals::AgentProposals,
     /// Bounded, nonblocking sink for privacy-safe tool server endpoint outcomes.
@@ -232,7 +235,18 @@ pub(crate) async fn prepare_inspected_request(
     if let Some(guard) = credential_generation_guard(&scoped) {
         guard.ensure_current()?;
     }
-    let scoped = scoped_context_for_request(&scoped, &req).unwrap_or(scoped);
+    let mut scoped = scoped_context_for_request(&scoped, &req).unwrap_or(scoped);
+    // Request-scoped static credentials resolve after endpoint scoping and
+    // before any placeholder is rewritten, for HTTP/1 and HTTP/2 alike.
+    crate::request_scoped_credentials::apply(&req, &mut scoped, request_id).await?;
+    if engine.is_stale() {
+        return Err(miette!(
+            "policy changed during request-scoped credential resolution"
+        ));
+    }
+    if let Some(guard) = credential_generation_guard(&scoped) {
+        guard.ensure_current()?;
+    }
     Ok((req, scoped))
 }
 
@@ -691,7 +705,13 @@ where
     {
         Ok(prepared) => prepared,
         Err(error) => {
-            if let Some(refusal) =
+            if error
+                .downcast_ref::<crate::request_scoped_credentials::RequestScopedCredentialUnavailable>()
+                .is_some()
+            {
+                // The unavailability event already names the credential and request ID.
+                write_bad_gateway_response(client, Some(request_id)).await?;
+            } else if let Some(refusal) =
                 error.downcast_ref::<crate::l7::token_grant_injection::TokenGrantInjectionError>()
             {
                 // The refusal event already names the credential and request
@@ -3973,6 +3993,7 @@ mod tests {
             }],
             credential_identity: identity.to_string(),
             workload_credential_handle: String::new(),
+            request_scope: None,
         }
     }
 
@@ -6016,6 +6037,7 @@ network_policies:
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
+                    request_scope: None,
                 },
             )]),
             Vec::new(),
@@ -6120,6 +6142,7 @@ network_policies:
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
+                    request_scope: None,
                 },
             )]),
             Vec::new(),
@@ -6775,6 +6798,7 @@ network_policies:
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
+                    request_scope: None,
                 },
             )]),
             Vec::new(),
@@ -9667,6 +9691,7 @@ network_policies:
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
+                    request_scope: None,
                 },
             )]),
             Vec::new(),
@@ -12479,6 +12504,7 @@ network_policies:
                             }],
                             credential_identity: "provider:API_TOKEN".into(),
                             workload_credential_handle: String::new(),
+                            request_scope: None,
                         },
                     )]),
                     Vec::new(),

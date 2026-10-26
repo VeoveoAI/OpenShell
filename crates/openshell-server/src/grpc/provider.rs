@@ -24,10 +24,10 @@ use crate::storage_proto::{
 use openshell_core::dynamic_credential_key::DynamicCredentialKey;
 use openshell_core::metadata::ObjectWorkspace;
 use openshell_core::proto::{
-    CredentialHandle, Provider, ProviderCredentialRefreshStrategy,
+    CredentialHandle, Provider, ProviderCredentialRefreshStrategy, ProviderCredentialRequestScope,
     ProviderCredentialTokenGrantAudienceOverride, ProviderCredentialTokenGrantType,
     ProviderProfile, ProviderProfileCredential, Sandbox, StaticCredentialBinding,
-    StaticCredentialEndpointBinding,
+    StaticCredentialEndpointBinding, StaticCredentialRequestScope,
 };
 use openshell_core::telemetry::{
     LifecycleOperation, ProviderProfile as TelemetryProviderProfile, TelemetryOutcome,
@@ -1264,6 +1264,7 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
         };
         let has_no_usable_endpoint = effective_endpoints.is_some_and(Vec::is_empty);
         let refresh_epochs = refresh_authorization_epochs_by_key(record)?;
+        let request_scopes = request_scoped_refresh_by_key(profile.as_ref(), record);
 
         for (key, value) in &provider.credentials {
             if accepted_stored_credential_keys
@@ -1333,17 +1334,16 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
                             "provider '{name}' has no stable object identity"
                         )));
                     }
-                    static_credential_bindings.insert(
-                        key.clone(),
-                        static_credential_binding(
-                            sandbox_id,
-                            record,
-                            key,
-                            endpoints,
-                            refresh_epochs.get(key).map(String::as_str),
-                            profile_stable_placeholder_keys.contains(key),
-                        ),
+                    let mut binding = static_credential_binding(
+                        sandbox_id,
+                        record,
+                        key,
+                        endpoints,
+                        refresh_epochs.get(key).map(String::as_str),
+                        profile_stable_placeholder_keys.contains(key),
                     );
+                    binding.request_scope = request_scopes.get(key).cloned();
+                    static_credential_bindings.insert(key.clone(), binding);
                 }
             } else {
                 warn!(
@@ -1412,17 +1412,16 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
                             "provider '{name}' has no stable object identity"
                         )));
                     }
-                    static_credential_bindings.insert(
-                        key.clone(),
-                        static_credential_binding(
-                            sandbox_id,
-                            record,
-                            &key,
-                            endpoints,
-                            refresh_epochs.get(&key).map(String::as_str),
-                            profile_stable_placeholder_keys.contains(&key),
-                        ),
+                    let mut binding = static_credential_binding(
+                        sandbox_id,
+                        record,
+                        &key,
+                        endpoints,
+                        refresh_epochs.get(&key).map(String::as_str),
+                        profile_stable_placeholder_keys.contains(&key),
                     );
+                    binding.request_scope = request_scopes.get(&key).cloned();
+                    static_credential_bindings.insert(key.clone(), binding);
                 }
             } else {
                 warn!(
@@ -1565,6 +1564,69 @@ fn refresh_authorization_epochs_by_key(
     Ok(epochs)
 }
 
+/// Request-scope metadata for each credential key whose profile declares
+/// request-scoped refresh and whose client-credentials refresh is configured.
+///
+/// The snapshot builder stamps the sandbox's provider attachment epoch.
+fn request_scoped_refresh_by_key(
+    profile: Option<&ProviderTypeProfile>,
+    record: &ProviderEnvironmentRecord,
+) -> HashMap<String, StaticCredentialRequestScope> {
+    let Some(profile) = profile else {
+        return HashMap::new();
+    };
+    let mut scopes = HashMap::new();
+    for state in &record.refresh_states {
+        if state.strategy != ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32
+            || state
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.deletion_time.is_some())
+        {
+            continue;
+        }
+        let Some(refresh) = profile
+            .credentials
+            .iter()
+            .find(|credential| {
+                credential.name == state.credential_key
+                    || credential
+                        .env_vars
+                        .iter()
+                        .any(|env_var| env_var == &state.credential_key)
+            })
+            .and_then(|credential| credential.refresh.as_ref())
+            .filter(|refresh| {
+                refresh.strategy == ProviderCredentialRefreshStrategy::Oauth2ClientCredentials
+            })
+        else {
+            continue;
+        };
+        let Some(request_scope) = refresh.request_scope.as_ref() else {
+            continue;
+        };
+        // Without a representable lead time the credential keeps its ordinary token.
+        let Ok(refresh_before) = openshell_core::time::duration_from_std(
+            crate::provider_refresh::effective_refresh_before(state),
+        ) else {
+            continue;
+        };
+        scopes.insert(
+            state.credential_key.clone(),
+            StaticCredentialRequestScope {
+                provider: record.name.clone(),
+                request_scope: Some(ProviderCredentialRequestScope {
+                    header: request_scope.header.clone(),
+                    scope_template: request_scope.scope_template.clone(),
+                }),
+                refresh_before: Some(refresh_before),
+                provider_attachment_epoch: String::new(),
+            },
+        );
+    }
+    scopes
+}
+
 fn static_credential_binding(
     sandbox_id: Option<&str>,
     record: &ProviderEnvironmentRecord,
@@ -1593,6 +1655,7 @@ fn static_credential_binding(
         endpoints: endpoints.to_vec(),
         credential_identity,
         workload_credential_handle,
+        request_scope: None,
     }
 }
 
@@ -3377,7 +3440,7 @@ pub(super) async fn get_provider_type_profile(
     Ok(None)
 }
 
-fn provider_refresh_defaults(
+pub(super) fn provider_refresh_defaults(
     catalog: &EffectiveProviderProfileCatalog,
     provider: &Provider,
     credential_key: &str,
@@ -7178,6 +7241,7 @@ mod tests {
                         secret: true,
                     },
                 ],
+                request_scope: None,
             }),
             token_grant: None,
         }
@@ -11619,6 +11683,7 @@ mod tests {
                                         secret: true,
                                     },
                                 ],
+                                request_scope: None,
                             }),
                             token_grant: None,
                         }],

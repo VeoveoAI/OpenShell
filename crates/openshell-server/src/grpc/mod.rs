@@ -10,6 +10,7 @@ pub mod provider;
 mod provider_credentials;
 pub mod provider_readiness;
 mod sandbox;
+mod scoped_credentials;
 pub mod supervisor_host;
 pub use sandbox::mint_persisted_authentication;
 mod service;
@@ -52,22 +53,22 @@ use openshell_core::proto::{
     ListSandboxProvidersResponse, ListSandboxTemplatesRequest, ListSandboxTemplatesResponse,
     ListSandboxesRequest, ListSandboxesResponse, ListServicesRequest, ListServicesResponse,
     ListWorkspaceMembersRequest, ListWorkspaceMembersResponse, ListWorkspacesRequest,
-    ListWorkspacesResponse, MemoryResourceCapabilities, NegotiatedExtensionInfo,
-    PeerNotifyConfigUpdateRequest, PeerNotifyConfigUpdateResponse, PeerRelayFrame,
-    ProviderProfileResponse, ProviderResponse, PushSandboxLogsRequest, PushSandboxLogsResponse,
-    RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, RejectDraftChunkRequest,
-    RejectDraftChunkResponse, RelayFrame, RemoveWorkspaceMemberRequest,
-    RemoveWorkspaceMemberResponse, ReportEndpointStatusRequest, ReportEndpointStatusResponse,
-    ReportMainProcessExitRequest, ReportMainProcessExitResponse, ReportPolicyStatusRequest,
-    ReportPolicyStatusResponse, ReportProviderReadinessRequest, ReportProviderReadinessResponse,
-    ResourceCapabilities, RevokeSshSessionRequest, RevokeSshSessionResponse,
-    RotateProviderCredentialRequest, RotateProviderCredentialResponse, SandboxResponse,
-    SandboxTemplateResponse, ServiceEndpointResponse, ServiceStatus, StartSandboxRequest,
-    StopSandboxRequest, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
-    SupervisorMessage, TcpForwardFrame, UndoDraftChunkRequest, UndoDraftChunkResponse,
-    UpdateConfigRequest, UpdateConfigResponse, UpdateProviderProfilesRequest,
-    UpdateProviderProfilesResponse, UpdateProviderRequest, WatchSandboxRequest,
-    open_shell_server::OpenShell,
+    ListWorkspacesResponse, MemoryResourceCapabilities, MintScopedProviderCredentialRequest,
+    MintScopedProviderCredentialResponse, NegotiatedExtensionInfo, PeerNotifyConfigUpdateRequest,
+    PeerNotifyConfigUpdateResponse, PeerRelayFrame, ProviderProfileResponse, ProviderResponse,
+    PushSandboxLogsRequest, PushSandboxLogsResponse, RefreshSandboxTokenRequest,
+    RefreshSandboxTokenResponse, RejectDraftChunkRequest, RejectDraftChunkResponse, RelayFrame,
+    RemoveWorkspaceMemberRequest, RemoveWorkspaceMemberResponse, ReportEndpointStatusRequest,
+    ReportEndpointStatusResponse, ReportMainProcessExitRequest, ReportMainProcessExitResponse,
+    ReportPolicyStatusRequest, ReportPolicyStatusResponse, ReportProviderReadinessRequest,
+    ReportProviderReadinessResponse, ResourceCapabilities, RevokeSshSessionRequest,
+    RevokeSshSessionResponse, RotateProviderCredentialRequest, RotateProviderCredentialResponse,
+    SandboxResponse, SandboxTemplateResponse, ServiceEndpointResponse, ServiceStatus,
+    StartSandboxRequest, StopSandboxRequest, SubmitPolicyAnalysisRequest,
+    SubmitPolicyAnalysisResponse, SupervisorMessage, TcpForwardFrame, UndoDraftChunkRequest,
+    UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
+    UpdateProviderProfilesRequest, UpdateProviderProfilesResponse, UpdateProviderRequest,
+    WatchSandboxRequest, open_shell_server::OpenShell,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -652,6 +653,13 @@ impl OpenShell for OpenShellService {
         request: Request<ExchangeProviderSubjectTokenRequest>,
     ) -> Result<Response<ExchangeProviderSubjectTokenResponse>, Status> {
         provider::handle_exchange_provider_subject_token(&self.state, request).await
+    }
+
+    async fn mint_scoped_provider_credential(
+        &self,
+        request: Request<MintScopedProviderCredentialRequest>,
+    ) -> Result<Response<MintScopedProviderCredentialResponse>, Status> {
+        scoped_credentials::handle_mint_scoped_provider_credential(&self.state, request).await
     }
 
     async fn update_config(

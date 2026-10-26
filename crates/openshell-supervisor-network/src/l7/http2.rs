@@ -321,7 +321,27 @@ async fn exchange(
             &info,
             &request_id,
             observation_context.as_ref(),
-        ) => prepared?,
+        ) => match prepared {
+            Ok(prepared) => prepared,
+            Err(error)
+                if error
+                    .downcast_ref::<crate::request_scoped_credentials::RequestScopedCredentialUnavailable>()
+                    .is_some() =>
+            {
+                // Answer without forwarding; the event names the credential and request ID.
+                let response = Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .header(
+                        openshell_core::token_grant_failure::REQUEST_ID_HEADER,
+                        request_id.as_str(),
+                    )
+                    .body(())
+                    .into_diagnostic()?;
+                downstream.send_response(response, true).into_diagnostic()?;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        },
         _ = std::future::poll_fn(|cx| downstream.poll_reset(cx)) => {
             return Err(miette!("HTTP/2 client cancelled before request admission"));
         }

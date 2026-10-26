@@ -335,6 +335,7 @@ func TestProfileCredentialToProto(t *testing.T) {
 			MaxLifetime:       &v1.ProfileDuration{Seconds: 3600},
 			Material:          []v1.ProfileCredentialRefreshMaterial{{Name: "refresh_token", Required: true, Secret: true}},
 			AdditionalOutputs: []v1.ProfileCredentialRefreshOutput{{Output: "session_token", Credential: "SESSION_TOKEN"}},
+			RequestScope:      &v1.ProfileCredentialRequestScope{Header: "lore-partition-bin", ScopeTemplate: "lore-repo-{value}"},
 		},
 		AuthStyle:    "header",
 		HeaderName:   "X-API-Key",
@@ -380,6 +381,10 @@ func TestProfileCredentialToProto(t *testing.T) {
 	assert.Equal(t, &durationpb.Duration{Seconds: 3600}, proto.Refresh.MaxLifetime)
 	require.Len(t, proto.Refresh.Material, 1)
 	require.Len(t, proto.Refresh.AdditionalOutputs, 1)
+	require.NotNil(t, proto.Refresh.RequestScope)
+	assert.Equal(t, "lore-partition-bin", proto.Refresh.RequestScope.Header)
+	assert.Equal(t, "lore-repo-{value}", proto.Refresh.RequestScope.ScopeTemplate)
+	assert.Equal(t, cred.Refresh, profileCredentialRefreshFromProto(proto.Refresh))
 
 	require.NotNil(t, proto.TokenGrant)
 	assert.Equal(t, "https://auth.example.com/token", proto.TokenGrant.TokenEndpoint)

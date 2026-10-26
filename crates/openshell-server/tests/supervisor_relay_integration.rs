@@ -356,6 +356,13 @@ impl OpenShell for RelayGateway {
     ) -> Result<Response<openshell_core::proto::ExchangeProviderSubjectTokenResponse>, Status> {
         Err(Status::unimplemented("unused"))
     }
+
+    async fn mint_scoped_provider_credential(
+        &self,
+        _request: tonic::Request<openshell_core::proto::MintScopedProviderCredentialRequest>,
+    ) -> Result<Response<openshell_core::proto::MintScopedProviderCredentialResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
     async fn create_provider(
         &self,
         _: tonic::Request<openshell_core::proto::CreateProviderRequest>,

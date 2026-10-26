@@ -811,6 +811,13 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("unused"))
     }
 
+    async fn mint_scoped_provider_credential(
+        &self,
+        _request: tonic::Request<proto::MintScopedProviderCredentialRequest>,
+    ) -> Result<Response<proto::MintScopedProviderCredentialResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
     async fn update_config(
         &self,
         _: tonic::Request<proto::UpdateConfigRequest>,

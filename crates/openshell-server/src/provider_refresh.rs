@@ -501,6 +501,9 @@ struct RefreshFailure {
     failure_code: &'static str,
     provider_error_subtype: Option<&'static str>,
     retry_schedule: RefreshRetrySchedule,
+    /// The issuer answered with an OAuth error response (4xx with an `error`
+    /// code), as opposed to a transport, server or local failure.
+    issuer_refused: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -518,6 +521,7 @@ impl RefreshFailure {
             failure_code,
             provider_error_subtype: None,
             retry_schedule: RefreshRetrySchedule::Short,
+            issuer_refused: false,
         }
     }
 
@@ -528,6 +532,7 @@ impl RefreshFailure {
             failure_code,
             provider_error_subtype: None,
             retry_schedule: RefreshRetrySchedule::Short,
+            issuer_refused: false,
         }
     }
 
@@ -542,6 +547,7 @@ impl RefreshFailure {
             failure_code,
             provider_error_subtype,
             retry_schedule: RefreshRetrySchedule::Parked,
+            issuer_refused: false,
         }
     }
 
@@ -552,6 +558,7 @@ impl RefreshFailure {
             failure_code,
             provider_error_subtype: None,
             retry_schedule: RefreshRetrySchedule::Configuration,
+            issuer_refused: false,
         }
     }
 
@@ -566,6 +573,7 @@ impl RefreshFailure {
             failure_code,
             provider_error_subtype: Some(provider_error_subtype),
             retry_schedule: RefreshRetrySchedule::Configuration,
+            issuer_refused: false,
         }
     }
 
@@ -1692,6 +1700,15 @@ async fn mint_oauth2_refresh_token(
 async fn mint_oauth2_client_credentials(
     state: &StoredProviderCredentialRefreshState,
 ) -> Result<MintedCredential, RefreshFailure> {
+    mint_oauth2_client_credentials_for_scope(state, &refresh_scopes(state).join(" ")).await
+}
+
+/// Client-credentials token request shared by the credential's refresh and its
+/// request-scoped mints. An empty `scope` omits the parameter.
+async fn mint_oauth2_client_credentials_for_scope(
+    state: &StoredProviderCredentialRefreshState,
+    scope: &str,
+) -> Result<MintedCredential, RefreshFailure> {
     let token_url = oauth2_token_url(state)?;
     let client_id = required_material(&state.material, "client_id")?;
     let client_secret = required_material(&state.material, "client_secret")?;
@@ -1700,9 +1717,8 @@ async fn mint_oauth2_client_credentials(
         ("client_id".to_string(), client_id),
         ("client_secret".to_string(), client_secret),
     ];
-    let scope = refresh_scopes(state).join(" ");
     if !scope.is_empty() {
-        form.push(("scope".to_string(), scope));
+        form.push(("scope".to_string(), scope.to_string()));
     }
 
     request_token(
@@ -2038,6 +2054,20 @@ fn classify_oauth_token_error(
         );
     };
 
+    let mut failure = classify_oauth_error_code(status, &error_response, grant_kind);
+    // A temporary-failure code reports issuer unavailability, not a decision.
+    failure.issuer_refused = !matches!(
+        error_response.error.as_str(),
+        "server_error" | "temporarily_unavailable"
+    );
+    failure
+}
+
+fn classify_oauth_error_code(
+    status: reqwest::StatusCode,
+    error_response: &OAuthErrorResponse,
+    grant_kind: OAuthGrantKind,
+) -> RefreshFailure {
     match error_response.error.as_str() {
         "invalid_grant" if grant_kind == OAuthGrantKind::UserRefreshToken => {
             let subtype = error_response
@@ -2129,6 +2159,90 @@ fn classify_oauth_token_error(
             "oauth_unrecognized_error",
         ),
     }
+}
+
+/// Why a request-scoped mint produced no token. Each variant carries a
+/// gateway-owned failure code, never issuer-supplied text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopedMintFailure {
+    /// The token issuer answered with an OAuth error response.
+    IssuerRefused(&'static str),
+    /// The issuer was unreachable, failed, or answered unusably.
+    Unavailable(&'static str),
+    /// The stored refresh configuration cannot mint this credential.
+    Configuration(&'static str),
+}
+
+impl ScopedMintFailure {
+    fn from_refresh_failure(failure: &RefreshFailure) -> Self {
+        if failure.issuer_refused {
+            Self::IssuerRefused(failure.failure_code)
+        } else if failure.failure_code == "refresh_configuration_invalid" {
+            Self::Configuration(failure.failure_code)
+        } else {
+            Self::Unavailable(failure.failure_code)
+        }
+    }
+}
+
+/// A token minted for one request scope. It is returned to the caller only and
+/// never persisted.
+pub struct ScopedMintedCredential {
+    pub access_token: String,
+    pub expires_at_ms: i64,
+}
+
+impl std::fmt::Debug for ScopedMintedCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScopedMintedCredential")
+            .field("expires_at_ms", &self.expires_at_ms)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Mint a client-credentials token for `scope` from a credential's stored
+/// refresh material at its stored token URL.
+///
+/// This uses the same token request as the credential's ordinary refresh but
+/// sends `scope` in place of the configured scopes. It writes nothing: the
+/// resolved secret material exists only for this request.
+pub async fn mint_scoped_client_credentials(
+    credentials: &crate::credentials::CredentialRuntime,
+    state: &StoredProviderCredentialRefreshState,
+    scope: &str,
+) -> Result<ScopedMintedCredential, ScopedMintFailure> {
+    if state.strategy != ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32 {
+        return Err(ScopedMintFailure::Configuration(
+            "refresh_strategy_not_client_credentials",
+        ));
+    }
+    let transient = resolve_refresh_material(Some(credentials), state)
+        .await
+        .map_err(|status| match status.code() {
+            Code::InvalidArgument | Code::FailedPrecondition | Code::NotFound => {
+                ScopedMintFailure::Configuration("refresh_material_unavailable")
+            }
+            _ => ScopedMintFailure::Unavailable("refresh_material_unavailable"),
+        })?;
+    let minted = mint_oauth2_client_credentials_for_scope(&transient, scope)
+        .await
+        .map_err(|failure| ScopedMintFailure::from_refresh_failure(&failure))?;
+    Ok(ScopedMintedCredential {
+        access_token: minted.access_token,
+        expires_at_ms: minted.expires_at_ms,
+    })
+}
+
+/// Effective lead time before expiry at which a token is replaced.
+#[must_use]
+pub fn effective_refresh_before(state: &StoredProviderCredentialRefreshState) -> Duration {
+    state
+        .refresh_before
+        .as_ref()
+        .and_then(|value| openshell_core::time::duration_to_std(value).ok())
+        .unwrap_or_else(|| {
+            Duration::from_secs(u64::try_from(DEFAULT_REFRESH_BEFORE_SECONDS).unwrap_or(u64::MAX))
+        })
 }
 
 pub fn refresh_scopes(state: &StoredProviderCredentialRefreshState) -> Vec<String> {

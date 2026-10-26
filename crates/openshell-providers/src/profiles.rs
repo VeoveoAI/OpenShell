@@ -11,9 +11,10 @@ use openshell_core::proto::{
     GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule, McpOptions, NetworkBinary,
     NetworkEndpoint, NetworkPolicyRule, ProviderCredentialRefresh,
     ProviderCredentialRefreshMaterial, ProviderCredentialRefreshOutput,
-    ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrantSubjectToken,
-    ProviderCredentialTokenGrantType, ProviderProfile, ProviderProfileCategory,
-    ProviderProfileCredential, ProviderProfileDiscovery, ProviderProfileFile,
+    ProviderCredentialRefreshStrategy, ProviderCredentialRequestScope,
+    ProviderCredentialTokenGrantSubjectToken, ProviderCredentialTokenGrantType, ProviderProfile,
+    ProviderProfileCategory, ProviderProfileCredential, ProviderProfileDiscovery,
+    ProviderProfileFile,
 };
 use openshell_core::secrets::uses_reserved_revision_namespace;
 use openshell_policy::{
@@ -283,6 +284,11 @@ pub struct CredentialRefreshProfile {
     /// credential whose `env_vars` receive the minted value.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub additional_outputs: Vec<CredentialRefreshOutputProfile>,
+    /// Optional request-scoped refresh: derive the OAuth scope of a request's
+    /// token from one of its headers. Valid only with
+    /// `oauth2_client_credentials`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_scope: Option<CredentialRequestScopeProfile>,
 }
 
 impl PartialEq for CredentialRefreshProfile {
@@ -294,10 +300,20 @@ impl PartialEq for CredentialRefreshProfile {
             && self.max_lifetime_seconds == other.max_lifetime_seconds
             && self.material == other.material
             && self.additional_outputs == other.additional_outputs
+            && self.request_scope == other.request_scope
     }
 }
 
 impl Eq for CredentialRefreshProfile {}
+
+/// Request header and scope template for request-scoped refresh.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CredentialRequestScopeProfile {
+    /// Lowercase HTTP field name. A `-bin` name is gRPC binary metadata.
+    pub header: String,
+    /// OAuth scope token containing `{value}` exactly once.
+    pub scope_template: String,
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct CredentialRefreshMaterialProfile {
@@ -1476,6 +1492,12 @@ fn credential_refresh_from_proto(refresh: &ProviderCredentialRefresh) -> Credent
                 credential: output.credential.clone(),
             })
             .collect(),
+        request_scope: refresh.request_scope.as_ref().map(|request_scope| {
+            CredentialRequestScopeProfile {
+                header: request_scope.header.clone(),
+                scope_template: request_scope.scope_template.clone(),
+            }
+        }),
     }
 }
 
@@ -1523,6 +1545,12 @@ fn credential_refresh_to_proto(refresh: &CredentialRefreshProfile) -> ProviderCr
                 credential: output.credential.clone(),
             })
             .collect(),
+        request_scope: refresh.request_scope.as_ref().map(|request_scope| {
+            ProviderCredentialRequestScope {
+                header: request_scope.header.clone(),
+                scope_template: request_scope.scope_template.clone(),
+            }
+        }),
     }
 }
 
@@ -2650,6 +2678,16 @@ pub fn validate_profile_set(
                         ),
                     ));
                 }
+
+                if let Some(request_scope) = refresh.request_scope.as_ref() {
+                    diagnostics.extend(validate_request_scope(
+                        source,
+                        profile_id,
+                        credential,
+                        refresh.strategy,
+                        request_scope,
+                    ));
+                }
             }
 
             if let Some(token_grant) = credential.token_grant.as_ref() {
@@ -3279,6 +3317,59 @@ struct TokenGrantOverrideBinding {
     score: u32,
 }
 
+/// Request-scoped refresh mints from the credential's own client material, so
+/// it requires client credentials. The selecting header must not collide with
+/// the credential's own placement or with framing and credential fields.
+fn validate_request_scope(
+    source: &str,
+    profile_id: &str,
+    credential: &CredentialProfile,
+    strategy: ProviderCredentialRefreshStrategy,
+    request_scope: &CredentialRequestScopeProfile,
+) -> Vec<ProfileValidationDiagnostic> {
+    let mut diagnostics = Vec::new();
+    if strategy != ProviderCredentialRefreshStrategy::Oauth2ClientCredentials {
+        diagnostics.push(ProfileValidationDiagnostic::error(
+            source,
+            profile_id,
+            "credentials.refresh.request_scope",
+            format!(
+                "request_scope requires strategy oauth2_client_credentials, found {}",
+                provider_refresh_strategy_to_yaml(strategy)
+            ),
+        ));
+    }
+    let header = request_scope.header.as_str();
+    if let Err(message) = openshell_core::request_scope::validate_header_name(header) {
+        diagnostics.push(ProfileValidationDiagnostic::error(
+            source,
+            profile_id,
+            "credentials.refresh.request_scope.header",
+            message,
+        ));
+    } else if credential.header_name.trim().eq_ignore_ascii_case(header) {
+        diagnostics.push(ProfileValidationDiagnostic::error(
+            source,
+            profile_id,
+            "credentials.refresh.request_scope.header",
+            format!(
+                "request_scope.header '{header}' must differ from the credential's header_name"
+            ),
+        ));
+    }
+    if let Err(message) =
+        openshell_core::request_scope::validate_scope_template(&request_scope.scope_template)
+    {
+        diagnostics.push(ProfileValidationDiagnostic::error(
+            source,
+            profile_id,
+            "credentials.refresh.request_scope.scope_template",
+            message,
+        ));
+    }
+    diagnostics
+}
+
 fn validate_token_grant_subject_token(
     source: &str,
     profile_id: &str,
@@ -3740,9 +3831,10 @@ mod tests {
     use openshell_core::proto::{ProviderCredentialTokenGrantType, ProviderProfileCategory};
 
     use super::{
-        DiscoveryProfile, EndpointProfile, L7AllowProfile, L7QueryMatcherProfile,
-        ProfileDurationWkt, ProfileError, ProviderTypeProfile, is_mcp_diagnostic_field,
-        normalize_profile_id, parse_profile_catalog_yamls, parse_profile_json, parse_profile_yaml,
+        CredentialRequestScopeProfile, DiscoveryProfile, EndpointProfile, L7AllowProfile,
+        L7QueryMatcherProfile, ProfileDurationWkt, ProfileError, ProfileValidationDiagnostic,
+        ProviderTypeProfile, is_mcp_diagnostic_field, normalize_profile_id,
+        parse_profile_catalog_yamls, parse_profile_json, parse_profile_yaml,
         profile_duration_to_proto, profile_to_json, profile_to_yaml, profiles_to_json,
         profiles_to_yaml, token_grant_from_proto, token_grant_to_proto, validate_profile_duration,
         validate_profile_set,
@@ -3930,6 +4022,254 @@ credentials:
         }));
     }
 
+    fn request_scope_profile(strategy: &str, header: &str, scope_template: &str) -> String {
+        format!(
+            r#"
+id: lore
+display_name: Lore
+credentials:
+  - name: lore_token
+    env_vars: [LORE_TOKEN]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+    refresh:
+      strategy: {strategy}
+      token_url: https://hub.example.com/oauth/token
+      request_scope:
+        header: "{header}"
+        scope_template: "{scope_template}"
+endpoints:
+  - host: lore.example.com
+    port: 443
+    protocol: rest
+    access: full
+"#
+        )
+    }
+
+    fn request_scope_diagnostics(yaml: &str) -> Vec<ProfileValidationDiagnostic> {
+        let profile = parse_profile_yaml(yaml).expect("profile should parse");
+        validate_profile_set(&[("lore.yaml".to_string(), profile)])
+    }
+
+    #[test]
+    fn request_scope_is_accepted_for_client_credentials_refresh() {
+        let yaml = request_scope_profile(
+            "oauth2_client_credentials",
+            "lore-partition-bin",
+            "lore-repo-{value}",
+        );
+        assert_eq!(request_scope_diagnostics(&yaml), Vec::new());
+        let text_header =
+            request_scope_profile("oauth2_client_credentials", "x-repo", "repo:{value}:read");
+        assert_eq!(request_scope_diagnostics(&text_header), Vec::new());
+    }
+
+    #[test]
+    fn request_scope_rejects_invalid_strategy_header_and_template() {
+        let cases = [
+            (
+                request_scope_profile(
+                    "oauth2_refresh_token",
+                    "lore-partition-bin",
+                    "lore-repo-{value}",
+                ),
+                "credentials.refresh.request_scope",
+                "requires strategy oauth2_client_credentials",
+            ),
+            (
+                request_scope_profile("static", "lore-partition-bin", "lore-repo-{value}"),
+                "credentials.refresh.request_scope",
+                "requires strategy oauth2_client_credentials",
+            ),
+            (
+                request_scope_profile(
+                    "oauth2_client_credentials",
+                    "Lore-Partition-Bin",
+                    "lore-repo-{value}",
+                ),
+                "credentials.refresh.request_scope.header",
+                "lowercase HTTP field name",
+            ),
+            (
+                request_scope_profile(
+                    "oauth2_client_credentials",
+                    ":authority",
+                    "lore-repo-{value}",
+                ),
+                "credentials.refresh.request_scope.header",
+                "pseudo-header",
+            ),
+            (
+                request_scope_profile(
+                    "oauth2_client_credentials",
+                    "transfer-encoding",
+                    "lore-repo-{value}",
+                ),
+                "credentials.refresh.request_scope.header",
+                "hop-by-hop",
+            ),
+            (
+                request_scope_profile("oauth2_client_credentials", "cookie", "lore-repo-{value}"),
+                "credentials.refresh.request_scope.header",
+                "must not be 'cookie'",
+            ),
+            (
+                request_scope_profile("oauth2_client_credentials", "host", "lore-repo-{value}"),
+                "credentials.refresh.request_scope.header",
+                "must not be 'host'",
+            ),
+            (
+                request_scope_profile(
+                    "oauth2_client_credentials",
+                    "authorization",
+                    "lore-repo-{value}",
+                ),
+                "credentials.refresh.request_scope.header",
+                "must not be 'authorization'",
+            ),
+            (
+                request_scope_profile("oauth2_client_credentials", "", "lore-repo-{value}"),
+                "credentials.refresh.request_scope.header",
+                "is required",
+            ),
+            (
+                request_scope_profile("oauth2_client_credentials", "lore-partition-bin", "lore"),
+                "credentials.refresh.request_scope.scope_template",
+                "exactly once",
+            ),
+            (
+                request_scope_profile(
+                    "oauth2_client_credentials",
+                    "lore-partition-bin",
+                    "{value}-{value}",
+                ),
+                "credentials.refresh.request_scope.scope_template",
+                "exactly once",
+            ),
+            (
+                request_scope_profile(
+                    "oauth2_client_credentials",
+                    "lore-partition-bin",
+                    "lore repo {value}",
+                ),
+                "credentials.refresh.request_scope.scope_template",
+                "OAuth scope characters",
+            ),
+        ];
+        for (yaml, field, message) in cases {
+            let diagnostics = request_scope_diagnostics(&yaml);
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.field == field
+                        && diagnostic.message.contains(message)),
+                "expected {field}: {message}; got {diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_scope_header_must_differ_from_credential_header_name() {
+        let yaml = request_scope_profile(
+            "oauth2_client_credentials",
+            "x-lore-token",
+            "lore-repo-{value}",
+        )
+        .replace("auth_style: bearer", "auth_style: header")
+        .replace("header_name: authorization", "header_name: X-Lore-Token");
+        let diagnostics = request_scope_diagnostics(&yaml);
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.field == "credentials.refresh.request_scope.header"
+                && diagnostic.message.contains("must differ")
+        }));
+    }
+
+    #[test]
+    fn request_scope_requires_both_fields() {
+        let missing = r"
+id: lore
+display_name: Lore
+credentials:
+  - name: lore_token
+    refresh:
+      strategy: oauth2_client_credentials
+      request_scope:
+        header: lore-partition-bin
+";
+        assert!(parse_profile_yaml(missing).is_err());
+    }
+
+    #[test]
+    fn request_scope_round_trips_through_yaml_json_and_proto() {
+        let yaml = request_scope_profile(
+            "oauth2_client_credentials",
+            "lore-partition-bin",
+            "lore-repo-{value}",
+        );
+        let profile = parse_profile_yaml(&yaml).unwrap();
+        let expected = Some(CredentialRequestScopeProfile {
+            header: "lore-partition-bin".to_string(),
+            scope_template: "lore-repo-{value}".to_string(),
+        });
+        let refresh = |profile: &ProviderTypeProfile| {
+            profile.credentials[0]
+                .refresh
+                .as_ref()
+                .unwrap()
+                .request_scope
+                .clone()
+        };
+        assert_eq!(refresh(&profile), expected);
+
+        let proto = profile.to_proto();
+        let proto_scope = proto.credentials[0]
+            .refresh
+            .as_ref()
+            .unwrap()
+            .request_scope
+            .as_ref()
+            .unwrap();
+        assert_eq!(proto_scope.header, "lore-partition-bin");
+        assert_eq!(proto_scope.scope_template, "lore-repo-{value}");
+
+        // Import and update decode the proto; export renders YAML or JSON.
+        let imported = ProviderTypeProfile::from_proto(&proto);
+        assert_eq!(imported, profile);
+        let exported_yaml = profile_to_yaml(&imported).unwrap();
+        assert!(exported_yaml.contains("request_scope"));
+        assert_eq!(parse_profile_yaml(&exported_yaml).unwrap(), profile);
+        let exported_json = profile_to_json(&imported).unwrap();
+        assert_eq!(parse_profile_json(&exported_json).unwrap(), profile);
+        assert_eq!(
+            ProviderTypeProfile::from_proto(
+                &parse_profile_json(&exported_json).unwrap().to_proto()
+            )
+            .to_proto(),
+            proto
+        );
+
+        // A refresh without request scope keeps the field absent.
+        let plain = parse_profile_yaml(
+            &yaml.replace(
+                "      request_scope:\n        header: \"lore-partition-bin\"\n        scope_template: \"lore-repo-{value}\"\n",
+                "",
+            ),
+        )
+        .unwrap();
+        assert_eq!(refresh(&plain), None);
+        assert!(!profile_to_yaml(&plain).unwrap().contains("request_scope"));
+        assert!(
+            plain.to_proto().credentials[0]
+                .refresh
+                .as_ref()
+                .unwrap()
+                .request_scope
+                .is_none()
+        );
+    }
+
     #[test]
     fn builtin_agent_conversation_defaults_preserve_own_and_foreign_body_text() {
         use openshell_core::proto::{StaticCredentialBinding, StaticCredentialEndpointBinding};
@@ -3948,6 +4288,7 @@ credentials:
                     path: endpoint.path.clone(),
                 })
                 .collect(),
+            request_scope: None,
         };
         for id in ["codex", "claude-code", "copilot"] {
             let profile = example_profile(id);

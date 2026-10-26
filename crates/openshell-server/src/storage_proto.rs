@@ -163,11 +163,11 @@ mod tests {
     // Older rows decode it absent, which reads as no recorded activity, and
     // the next activity report records it without a rewrite.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "c9c612695b454a8980cd8c66e5b47adacebe4d0c6a1efd6fa69bc696dc3aafc3";
+        "3964d427305044c9008e76f60c9ff55c177e5dfd0a0f4bf7299dbe60903fe97c";
     const DURABLE_SCHEMA_SHA256: &str =
-        "93e162ecd86f97f06bfad878c843eaa3e353ded3ecddbb9e6bc6ac45dabcb9f1";
+        "f8265f291bf9317a373f2c01ef45c9e6222805451d5d256a2b90e582fa7dc5bf";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "ac1ffc4b5b81467de27270a4e33f6db1e31eeb2c52f79750dbaaf19515eadbb2";
+        "6d11476ef9aae6310fbd43716c50f541e7e4cc6fef98c72fa9c64f6e87a9370a";
     // Encoded with the schema that omitted stable_placeholder. Keep these
     // bytes fixed so the current encoder cannot hide a compatibility change.
     const LEGACY_STATIC_PROFILE: &str = "0a240a116c65676163792d70726f66696c652d6964120d6c65676163792d737461746963280712510a0d6c65676163792d73746174696312184c6567616379207374617469632063726564656e7469616c2a260a076170695f6b65791a1153594e5448455449435f4150495f4b455920012a06626561726572";
@@ -630,7 +630,7 @@ mod tests {
         }
         assert_eq!(
             compiled_method_count,
-            103 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            104 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len()
                 + isolation_methods.len()
@@ -640,7 +640,7 @@ mod tests {
         );
         assert_eq!(
             methods.len(),
-            78 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            79 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
@@ -650,7 +650,7 @@ mod tests {
                 .iter()
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
-            78 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            79 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len()
         );
@@ -701,9 +701,9 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (328, 29),
-                (95, 22),
-                (83, 22),
+                (332, 29),
+                (96, 22),
+                (84, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256

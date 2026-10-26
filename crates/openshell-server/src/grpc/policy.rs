@@ -3939,6 +3939,14 @@ pub async fn build_provider_environment_snapshot_from_inputs(
             Some(&sandbox_id),
         )
         .await?;
+    // A scoped mint is authorized only for the attachment that delivered it.
+    for binding in provider_environment.static_credential_bindings.values_mut() {
+        if let Some(request_scope) = binding.request_scope.as_mut() {
+            request_scope
+                .provider_attachment_epoch
+                .clone_from(&spec.provider_attachment_epoch);
+        }
+    }
 
     if matches!(policy_source, PolicySource::Global) {
         // A global policy replaces provider ACLs. Grants retain their profile

@@ -1882,6 +1882,82 @@ pub async fn exchange_provider_subject_token(
     ))
 }
 
+/// One `MintScopedProviderCredential` request from a supervisor.
+pub struct ScopedProviderCredentialRequest<'a> {
+    pub sandbox_id: &'a str,
+    pub provider: &'a str,
+    pub credential_key: &'a str,
+    pub scope: &'a str,
+    pub provider_attachment_epoch: &'a str,
+    /// Supervisor-minted ID of the HTTP exchange that needs the token.
+    pub request_id: &'a str,
+}
+
+/// A token minted for one request scope.
+pub struct ScopedProviderCredential {
+    pub access_token: String,
+    pub expires_at_ms: i64,
+}
+
+impl std::fmt::Debug for ScopedProviderCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScopedProviderCredential")
+            .field("expires_at_ms", &self.expires_at_ms)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Upper bound for one scoped mint, including the gateway's issuer request.
+const SCOPED_PROVIDER_CREDENTIAL_TIMEOUT: Duration = Duration::from_secs(35);
+
+/// Mint a token for one request scope of a request-scoped refresh credential.
+///
+/// Transport failures and every status other than an explicit refusal are
+/// [`ScopedCredentialFailure::Unavailable`]. No gateway diagnostics are kept.
+#[tracing::instrument(
+    name = "supervisor.gateway.mint_scoped_provider_credential",
+    skip_all,
+    fields(otel.kind = "client", otel.status_code = tracing::field::Empty)
+)]
+pub async fn mint_scoped_provider_credential(
+    gateway: &GatewayEndpoint,
+    request: ScopedProviderCredentialRequest<'_>,
+) -> std::result::Result<ScopedProviderCredential, crate::request_scope::ScopedCredentialFailure> {
+    use crate::request_scope::ScopedCredentialFailure;
+
+    let status = ClientSpanStatus::current();
+    let mut client = connect(gateway)
+        .await
+        .map_err(|_| ScopedCredentialFailure::Unavailable)?;
+    let mut rpc = tonic::Request::new(crate::proto::MintScopedProviderCredentialRequest {
+        sandbox_id: request.sandbox_id.to_string(),
+        provider: request.provider.to_string(),
+        credential_key: request.credential_key.to_string(),
+        scope: request.scope.to_string(),
+        provider_attachment_epoch: request.provider_attachment_epoch.to_string(),
+    });
+    rpc.set_timeout(SCOPED_PROVIDER_CREDENTIAL_TIMEOUT);
+    if let Ok(request_id) = request.request_id.parse() {
+        rpc.metadata_mut().insert("x-request-id", request_id);
+    }
+    let response = client
+        .mint_scoped_provider_credential(rpc)
+        .await
+        .map_err(|status| ScopedCredentialFailure::from_status(&status))?
+        .into_inner();
+    let expires_at_ms = response
+        .expiration_time
+        .as_ref()
+        .ok_or(ScopedCredentialFailure::Unavailable)
+        .and_then(|time| {
+            timestamp_to_millis(time).map_err(|_| ScopedCredentialFailure::Unavailable)
+        });
+    status.finish(expires_at_ms.map(|expires_at_ms| ScopedProviderCredential {
+        access_token: response.access_token,
+        expires_at_ms,
+    }))
+}
+
 /// Attach the exchange's request ID as `x-request-id` gRPC metadata.
 ///
 /// A value that is not valid metadata is omitted, never rewritten.

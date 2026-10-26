@@ -202,6 +202,9 @@ func profileCredentialRefreshFromProto(r *pb.ProviderCredentialRefresh) *types.P
 	for _, output := range r.GetAdditionalOutputs() {
 		result.AdditionalOutputs = append(result.AdditionalOutputs, types.ProfileCredentialRefreshOutput{Output: output.GetOutput(), Credential: output.GetCredential()})
 	}
+	if scope := r.GetRequestScope(); scope != nil {
+		result.RequestScope = &types.ProfileCredentialRequestScope{Header: scope.GetHeader(), ScopeTemplate: scope.GetScopeTemplate()}
+	}
 	return result
 }
 
@@ -219,6 +222,9 @@ func profileCredentialRefreshToProto(r *types.ProfileCredentialRefresh) *pb.Prov
 	}
 	for _, output := range r.AdditionalOutputs {
 		result.AdditionalOutputs = append(result.AdditionalOutputs, &pb.ProviderCredentialRefreshOutput{Output: output.Output, Credential: output.Credential})
+	}
+	if r.RequestScope != nil {
+		result.RequestScope = &pb.ProviderCredentialRequestScope{Header: r.RequestScope.Header, ScopeTemplate: r.RequestScope.ScopeTemplate}
 	}
 	return result
 }

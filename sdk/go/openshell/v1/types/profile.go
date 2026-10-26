@@ -75,6 +75,18 @@ type ProfileCredentialRefresh struct {
 	MaxLifetime       *ProfileDuration
 	Material          []ProfileCredentialRefreshMaterial
 	AdditionalOutputs []ProfileCredentialRefreshOutput
+	// RequestScope derives each request's OAuth scope from one of its headers.
+	// Nil keeps one token per credential.
+	RequestScope *ProfileCredentialRequestScope
+}
+
+// ProfileCredentialRequestScope selects a request's OAuth scope from one
+// request header. It is valid only with the OAuth2 client credentials strategy.
+type ProfileCredentialRequestScope struct {
+	// Header is a lowercase HTTP field name. A "-bin" name is gRPC binary metadata.
+	Header string
+	// ScopeTemplate is an OAuth scope containing "{value}" exactly once.
+	ScopeTemplate string
 }
 
 // ProfileCredentialRefreshMaterial declares one input required by a refresh strategy.

@@ -537,6 +537,16 @@ service OpenShell {
     };
   }
 
+  // Mint a token for one request scope of a request-scoped refresh credential
+  // of a provider attached to the calling sandbox. The gateway mints with the
+  // credential's stored refresh material and persists nothing.
+  rpc MintScopedProviderCredential(MintScopedProviderCredentialRequest)
+      returns (MintScopedProviderCredentialResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "sandbox"
+    };
+  }
+
   // Fetch recent sandbox logs (one-shot).
   rpc GetSandboxLogs(GetSandboxLogsRequest) returns (GetSandboxLogsResponse) {
     option (openshell.options.v1.authorization) = {
@@ -2429,6 +2439,18 @@ message ProviderCredentialRefreshOutput {
   string credential = 2;  // sibling credential name whose env_vars receive this output
 }
 
+// Derives an OAuth scope from one request header. A request that carries the
+// header exactly once with a valid value uses a token minted for the rendered
+// scope instead of the credential's ordinary refreshed token. Valid only with
+// the oauth2_client_credentials strategy.
+message ProviderCredentialRequestScope {
+  // Lowercase HTTP field name. A name ending in "-bin" is gRPC binary
+  // metadata: its base64 value is decoded and rendered as lowercase hex.
+  string header = 1;
+  // OAuth scope token containing "{value}" exactly once.
+  string scope_template = 2;
+}
+
 message ProviderCredentialRefresh {
   reserved 4, 5;
   reserved "refresh_before_seconds", "max_lifetime_seconds";
@@ -2439,6 +2461,8 @@ message ProviderCredentialRefresh {
   google.protobuf.Duration max_lifetime = 105;
   repeated ProviderCredentialRefreshMaterial material = 6;
   repeated ProviderCredentialRefreshOutput additional_outputs = 7;
+  // Optional request-scoped refresh. Absence keeps one token per credential.
+  ProviderCredentialRequestScope request_scope = 8;
 }
 
 message ProviderCredentialRefreshStatus {
@@ -2716,6 +2740,26 @@ message StaticCredentialBinding {
   // sandbox, provider, credential key, endpoint authorization, or an applicable
   // refresh authorization epoch changes.
   string workload_credential_handle = 3;
+  // Present when the credential declares request-scoped refresh and its
+  // gateway-managed refresh is configured. Supervisors that ignore it keep
+  // resolving the credential's ordinary token.
+  StaticCredentialRequestScope request_scope = 4;
+}
+
+// Request-scoped refresh metadata for one static credential environment key.
+// The environment key is the credential key passed to
+// MintScopedProviderCredential.
+message StaticCredentialRequestScope {
+  // Attached provider that owns the credential.
+  string provider = 1;
+  // Request header and scope template from the provider profile.
+  ProviderCredentialRequestScope request_scope = 2;
+  // Effective lead time before a scoped token's expiry at which the supervisor
+  // stops reusing it.
+  google.protobuf.Duration refresh_before = 3;
+  // Sandbox provider attachment that delivered this metadata. The gateway
+  // refuses mints for any other attachment.
+  string provider_attachment_epoch = 4;
 }
 
 // Polling projection of ProviderEnvironmentSnapshot. The parallel maps below
@@ -2822,6 +2866,32 @@ message ExchangeProviderSubjectTokenResponse {
   string access_token = 1 [(openshell.options.v1.secret) = true];
   google.protobuf.Duration expires_after = 102;
   string token_type = 3;
+}
+
+// Mint a scoped token for a request-scoped refresh credential. The gateway
+// re-validates every field against the sandbox's current provider attachment
+// and the credential's profile. A refusal by the token issuer returns
+// PERMISSION_DENIED with google.rpc.ErrorInfo reason
+// SCOPED_CREDENTIAL_ISSUER_REFUSED; a gateway refusal returns
+// PERMISSION_DENIED, FAILED_PRECONDITION or INVALID_ARGUMENT without it; an
+// unreachable or failing issuer returns UNAVAILABLE.
+message MintScopedProviderCredentialRequest {
+  // The sandbox ID. Must match the authenticated sandbox principal.
+  string sandbox_id = 1;
+  // Attached provider that owns the credential.
+  string provider = 2;
+  // Credential environment key that declares request-scoped refresh.
+  string credential_key = 3;
+  // OAuth scope rendered from the credential's scope template.
+  string scope = 4;
+  // Provider attachment epoch delivered with the credential's metadata.
+  string provider_attachment_epoch = 5;
+}
+
+message MintScopedProviderCredentialResponse {
+  string access_token = 1 [(openshell.options.v1.secret) = true];
+  // Absolute expiry of access_token.
+  google.protobuf.Timestamp expiration_time = 2;
 }
 
 // ---------------------------------------------------------------------------

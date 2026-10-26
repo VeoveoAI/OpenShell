@@ -7,7 +7,9 @@ use crate::secrets::SecretResolver;
 use crate::{
     endpoint_path::EndpointPathPattern,
     host_pattern::HostPattern,
-    proto::{StaticCredentialBinding, StaticCredentialEndpointBinding},
+    proto::{
+        StaticCredentialBinding, StaticCredentialEndpointBinding, StaticCredentialRequestScope,
+    },
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
@@ -70,6 +72,31 @@ struct CompiledStaticCredentialBinding {
     endpoints: Vec<CompiledStaticCredentialEndpointBinding>,
     credential_identity: String,
     workload_credential_handle: String,
+    request_scope: Option<RequestScopedCredential>,
+}
+
+/// Request-scoped refresh metadata for one endpoint-bound static credential.
+///
+/// A request at the credential's endpoint that carries `header` exactly once
+/// with a valid value resolves the credential's placeholder to a token minted
+/// for the rendered scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestScopedCredential {
+    /// Environment key whose placeholder resolves to the scoped token.
+    pub env_key: String,
+    /// Identity of the credential's current binding. It changes with the
+    /// provider record, the refresh authorization, and the endpoint boundary.
+    pub credential_identity: String,
+    /// Attached provider that owns the credential.
+    pub provider: String,
+    /// Provider attachment that delivered this metadata.
+    pub provider_attachment_epoch: String,
+    /// Lowercase request header that selects the scope.
+    pub header: String,
+    /// Scope template containing `{value}` exactly once.
+    pub scope_template: String,
+    /// Lead time before a scoped token's expiry at which it is replaced.
+    pub refresh_before: std::time::Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -421,6 +448,43 @@ impl ProviderCredentialState {
             ))
         });
         (resolver, classifier, revision)
+    }
+
+    /// Request-scoped credentials whose endpoint binding admits this request.
+    ///
+    /// Returns them with the provider revision they were read from, so the
+    /// caller can pair them with a resolver from the same revision.
+    #[must_use]
+    pub fn request_scoped_credentials_for_endpoint(
+        &self,
+        host: &str,
+        port: u16,
+        path: &str,
+    ) -> (Vec<RequestScopedCredential>, u64) {
+        let request_path = path.split_once('?').map_or(path, |(path, _)| path);
+        let request_path = crate::secrets::redact_target_for_policy(request_path);
+        let normalized_host = host.to_ascii_lowercase();
+        let host_labels = normalized_host.split('.').collect::<Vec<_>>();
+        let inner = self
+            .inner
+            .read()
+            .expect("provider credential state poisoned");
+        let revision = inner.current.revision;
+        let Ok(request_path) = request_path else {
+            return (Vec::new(), revision);
+        };
+        let mut credentials = inner
+            .static_credential_bindings
+            .values()
+            .filter(|binding| {
+                binding.endpoints.iter().any(|endpoint| {
+                    static_credential_endpoint_matches(endpoint, &host_labels, port, &request_path)
+                })
+            })
+            .filter_map(|binding| binding.request_scope.clone())
+            .collect::<Vec<_>>();
+        credentials.sort_by(|left, right| left.env_key.cmp(&right.env_key));
+        (credentials, revision)
     }
 
     #[must_use]
@@ -1044,6 +1108,9 @@ fn compile_static_credential_bindings(
                 "static credential binding has an invalid workload credential handle",
             ));
         }
+        if let Some(request_scope) = binding.request_scope.as_ref() {
+            validate_request_scope(request_scope)?;
+        }
         for endpoint in &binding.endpoints {
             if endpoint.port == 0 || endpoint.port > u32::from(u16::MAX) {
                 return Err(binding_error(
@@ -1061,16 +1128,69 @@ fn compile_static_credential_bindings(
                 .into_iter()
                 .map(compile_static_credential_endpoint)
                 .collect::<Result<_, _>>()?;
+            let request_scope = binding
+                .request_scope
+                .map(|request_scope| {
+                    compile_request_scope(&key, &binding.credential_identity, request_scope)
+                })
+                .transpose()?;
             Ok((
                 key,
                 CompiledStaticCredentialBinding {
                     endpoints,
                     credential_identity: binding.credential_identity,
                     workload_credential_handle: binding.workload_credential_handle,
+                    request_scope,
                 },
             ))
         })
         .collect()
+}
+
+fn validate_request_scope(
+    request_scope: &StaticCredentialRequestScope,
+) -> Result<(), StaticCredentialBindingError> {
+    let Some(scope) = request_scope.request_scope.as_ref() else {
+        return Err(binding_error(
+            "static credential request scope has no header or scope template",
+        ));
+    };
+    if request_scope.provider.is_empty()
+        || crate::request_scope::validate_header_name(&scope.header).is_err()
+        || crate::request_scope::validate_scope_template(&scope.scope_template).is_err()
+        || request_scope
+            .refresh_before
+            .as_ref()
+            .is_none_or(|value| crate::time::duration_to_std(value).is_err())
+    {
+        return Err(binding_error(
+            "static credential binding contains an invalid request scope",
+        ));
+    }
+    Ok(())
+}
+
+fn compile_request_scope(
+    key: &str,
+    credential_identity: &str,
+    request_scope: StaticCredentialRequestScope,
+) -> Result<RequestScopedCredential, StaticCredentialBindingError> {
+    let invalid = || binding_error("static credential binding contains an invalid request scope");
+    let scope = request_scope.request_scope.ok_or_else(invalid)?;
+    let refresh_before = request_scope
+        .refresh_before
+        .as_ref()
+        .and_then(|value| crate::time::duration_to_std(value).ok())
+        .ok_or_else(invalid)?;
+    Ok(RequestScopedCredential {
+        env_key: key.to_string(),
+        credential_identity: credential_identity.to_string(),
+        provider: request_scope.provider,
+        provider_attachment_epoch: request_scope.provider_attachment_epoch,
+        header: scope.header,
+        scope_template: scope.scope_template,
+        refresh_before,
+    })
 }
 
 fn compile_static_credential_endpoint(
@@ -1355,6 +1475,7 @@ mod tests {
             }],
             credential_identity: "provider-a:API_KEY".to_string(),
             workload_credential_handle: String::new(),
+            request_scope: None,
         }
     }
 

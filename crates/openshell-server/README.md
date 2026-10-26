@@ -131,6 +131,14 @@ A crash or lost database-lock session can leave a parked marker. Reconfigure or
 reauthorize the refresh grant after investigating its issuer state. Changing a
 marker directly is not a supported recovery workflow.
 
+`MintScopedProviderCredential` mints a request-scoped token outside this
+coordination: it reads the refresh state, resolves its secret material for the
+one request, and sends the scope through the same client-credentials token
+request as refresh. It writes no refresh state, provider credential, or
+expiry. An issuer OAuth error answers `PERMISSION_DENIED` with the
+`SCOPED_CREDENTIAL_ISSUER_REFUSED` reason; transport, 429, and 5xx failures
+answer `UNAVAILABLE`. A per-sandbox semaphore bounds concurrent scoped mints.
+
 ## Sandbox activity
 
 `SandboxStatus.last_activity_time` is the latest time the supervisor reported

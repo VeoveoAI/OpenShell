@@ -115,6 +115,10 @@ pub(super) fn http_context(
         .as_ref()
         .and(policy_local)
         .and_then(crate::policy_local::PolicyLocalContext::token_grant_resolver);
+    let request_scoped_credentials = provider_credentials
+        .as_ref()
+        .and(policy_local)
+        .and_then(crate::policy_local::PolicyLocalContext::request_scoped_credentials);
     let workspace = policy_local
         .map(crate::policy_local::PolicyLocalContext::workspace)
         .unwrap_or_default();
@@ -150,6 +154,7 @@ pub(super) fn http_context(
         body_classifier: None,
         activity_tx: signals.activity,
         token_grant_resolver,
+        request_scoped_credentials,
         agent_proposals,
         workspace,
         endpoint_observation_tx: signals.endpoint_observation,
@@ -450,6 +455,7 @@ mod tests {
             body_classifier: None,
             activity_tx: None,
             token_grant_resolver: None,
+            request_scoped_credentials: None,
             agent_proposals: openshell_core::proposals::AgentProposals::default(),
             workspace: String::new(),
             endpoint_observation_tx: None,

@@ -320,6 +320,13 @@ pub async fn run_networking(
         sandbox_id.clone(),
         provider_workload_api_socket,
     ));
+    let request_scoped_credentials =
+        crate::request_scoped_credentials::RequestScopedCredentials::new(Arc::new(
+            crate::request_scoped_credentials::GatewayScopedTokenMinter::new(
+                gateway.clone(),
+                sandbox_id.clone(),
+            ),
+        ));
     let policy_local_ctx = Arc::new(
         PolicyLocalContext::new(
             retained_proto.cloned(),
@@ -329,7 +336,8 @@ pub async fn run_networking(
             workspace_rx,
         )
         .with_denial_log(denial_log)
-        .with_token_grants(Arc::new(token_grants)),
+        .with_token_grants(Arc::new(token_grants))
+        .with_request_scoped_credentials(Arc::new(request_scoped_credentials)),
     );
 
     // Readiness signal for the proxy accept loop: the proxy binds the TCP

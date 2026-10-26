@@ -359,6 +359,7 @@ mod tests {
                             port: 443,
                             path: "/**".into(),
                         }],
+                        request_scope: None,
                     },
                 )]),
                 vec![],

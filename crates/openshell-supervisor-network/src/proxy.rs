@@ -6443,7 +6443,10 @@ async fn handle_forward_proxy(
         Err(e) => {
             let refusal =
                 e.downcast_ref::<crate::l7::token_grant_injection::TokenGrantInjectionError>();
-            if refusal.is_none() {
+            let scoped_unavailable = e
+                .downcast_ref::<crate::request_scoped_credentials::RequestScopedCredentialUnavailable>()
+                .is_some();
+            if refusal.is_none() && !scoped_unavailable {
                 warn!(
                     dst_host = %host_lc,
                     dst_port = port,
@@ -6455,6 +6458,15 @@ async fn handle_forward_proxy(
                 session
                     .end(openshell_core::proto::MiddlewareSessionEndReason::Cancellation)
                     .await;
+            }
+            if scoped_unavailable {
+                // The unavailability event already names the credential and request ID.
+                respond(
+                    client,
+                    &build_request_scoped_credential_failure_response(&request_id),
+                )
+                .await?;
+                return Ok(());
             }
             let response = refusal.map_or_else(
                 || {
@@ -6941,6 +6953,27 @@ fn build_json_error_response(status: u16, status_text: &str, error: &str, detail
         body_str,
     )
     .into_bytes()
+}
+
+/// Build the forward proxy's answer when a request-scoped credential is
+/// unavailable. Like a grant refusal, it carries only the request ID.
+fn build_request_scoped_credential_failure_response(request_id: &str) -> Vec<u8> {
+    let generic = build_json_error_response(
+        502,
+        "Bad Gateway",
+        "request_scoped_credential_unavailable",
+        "request-scoped credential unavailable",
+    );
+    String::from_utf8_lossy(&generic)
+        .replacen(
+            "\r\nConnection: close\r\n",
+            &format!(
+                "\r\n{}: {request_id}\r\nConnection: close\r\n",
+                openshell_core::token_grant_failure::REQUEST_ID_HEADER
+            ),
+            1,
+        )
+        .into_bytes()
 }
 
 /// Build the forward proxy's refusal for a failed dynamic token grant.
@@ -10758,6 +10791,7 @@ network_policies:
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
+                    request_scope: None,
                 },
             )]),
             Vec::new(),
@@ -13124,6 +13158,7 @@ network_policies:
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
+                    request_scope: None,
                 },
             )]),
             Vec::new(),
@@ -13166,6 +13201,7 @@ network_policies:
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
+                    request_scope: None,
                 },
             )]),
             Vec::new(),
@@ -13212,6 +13248,7 @@ network_policies:
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
+                    request_scope: None,
                 },
             )]),
             Vec::new(),
@@ -13890,6 +13927,7 @@ network_policies:
                         port: 80,
                         path: "/**".into(),
                     }],
+                    request_scope: None,
                 },
             )]),
             vec![],
@@ -14037,6 +14075,7 @@ network_policies:
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
+                    request_scope: None,
                 },
             )]),
             Vec::new(),
@@ -14128,6 +14167,7 @@ network_policies:
                         }],
                         credential_identity: format!("provider-a:{key}"),
                         workload_credential_handle: String::new(),
+                        request_scope: None,
                     },
                 )
             })

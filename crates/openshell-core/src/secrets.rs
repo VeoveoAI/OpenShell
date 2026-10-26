@@ -411,6 +411,27 @@ impl SecretResolver {
         }
     }
 
+    /// Return a view in which every placeholder of `key` this resolver holds
+    /// resolves to `value` instead of its current secret.
+    ///
+    /// Placeholder identity, endpoint and revision checks are unchanged: a
+    /// request resolves `value` only where it would have resolved the key's
+    /// ordinary value. Keys this resolver does not hold stay unresolvable.
+    #[must_use]
+    pub fn with_env_key_value(&self, key: &str, value: &str, expires_at_ms: i64) -> Self {
+        let replacement = SecretValue {
+            value: Arc::from(value),
+            expires_at_ms,
+        };
+        let mut resolver = self.clone();
+        for (placeholder, secret) in &mut resolver.by_placeholder {
+            if placeholder_env_key(placeholder) == Some(key) {
+                *secret = replacement.clone();
+            }
+        }
+        resolver
+    }
+
     fn unresolved_for(
         &self,
         location: &'static str,

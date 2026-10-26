@@ -269,6 +269,7 @@ mock_gateway! {
         report_sandbox_configuration(proto::ReportSandboxConfigurationRequest) -> proto::ReportSandboxConfigurationResponse;
         get_sandbox_provider_environment(proto::GetSandboxProviderEnvironmentRequest) -> proto::GetSandboxProviderEnvironmentResponse;
         exchange_provider_subject_token(proto::ExchangeProviderSubjectTokenRequest) -> proto::ExchangeProviderSubjectTokenResponse;
+        mint_scoped_provider_credential(proto::MintScopedProviderCredentialRequest) -> proto::MintScopedProviderCredentialResponse;
         get_sandbox_logs(proto::GetSandboxLogsRequest) -> proto::GetSandboxLogsResponse;
         report_main_process_exit(proto::ReportMainProcessExitRequest) -> proto::ReportMainProcessExitResponse;
         finalize_main_process_exit(proto::FinalizeMainProcessExitRequest) -> proto::FinalizeMainProcessExitResponse;

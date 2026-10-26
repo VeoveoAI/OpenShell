@@ -1957,6 +1957,7 @@ mod tests {
                     }],
                     credential_identity: "provider-a:EXTERNAL_TOKEN".into(),
                     workload_credential_handle: String::new(),
+                    request_scope: None,
                 },
             );
         }

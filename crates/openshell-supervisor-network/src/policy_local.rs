@@ -160,6 +160,8 @@ pub struct PolicyLocalContext {
     sandbox_name: Option<String>,
     denials: DenialLogSource,
     token_grants: Option<Arc<dyn TokenGrantResolver>>,
+    request_scoped_credentials:
+        Option<Arc<crate::request_scoped_credentials::RequestScopedCredentials>>,
     workspace_rx: tokio::sync::watch::Receiver<String>,
 }
 
@@ -190,6 +192,7 @@ impl PolicyLocalContext {
             sandbox_name,
             denials: DenialLogSource::default(),
             token_grants: None,
+            request_scoped_credentials: None,
             workspace_rx,
         }
     }
@@ -231,6 +234,24 @@ impl PolicyLocalContext {
     /// unavailable and must fail closed.
     pub(crate) fn token_grant_resolver(&self) -> Option<Arc<dyn TokenGrantResolver>> {
         self.token_grants.clone()
+    }
+
+    /// Mint request-scoped static credentials for this sandbox's HTTP relays.
+    #[must_use]
+    pub fn with_request_scoped_credentials(
+        mut self,
+        credentials: Arc<crate::request_scoped_credentials::RequestScopedCredentials>,
+    ) -> Self {
+        self.request_scoped_credentials = Some(credentials);
+        self
+    }
+
+    /// The sandbox instance's request-scoped credential cache, absent when
+    /// requests keep their ordinary static credentials.
+    pub(crate) fn request_scoped_credentials(
+        &self,
+    ) -> Option<Arc<crate::request_scoped_credentials::RequestScopedCredentials>> {
+        self.request_scoped_credentials.clone()
     }
 
     pub async fn set_current_policy(&self, policy: ProtoSandboxPolicy) {
