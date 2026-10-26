@@ -57,6 +57,45 @@ Override with env vars before running `helm:k3s:create`:
   `mcr.microsoft.com/dotnet/aspire-dashboard:latest`)
 - `HELM_K3S_COLLECTOR_HEALTH_TIMEOUT` (default: `120` seconds)
 
+### Shared supervisor plumbing
+
+Set `gatewayConfig.openshell.drivers.kubernetes.supervisor_topology`
+using a values file (the table key is literally `openshell.drivers.kubernetes`):
+
+```yaml
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    supervisor_topology: gateway
+```
+
+The gateway chart creates a single-replica shared supervisor Deployment,
+Service, NetworkPolicy, and an empty `<release>-supervisor-token` Secret in
+the release namespace, regardless of shared/managed/operator workspace mode.
+The gateway mints a supervisor token from its sandbox-JWT signing key, writes
+it into that Secret (the gateway Role may `get`/`patch` only that Secret), and
+renews it at half its lifetime; the supervisor mounts the Secret and presents
+the token on the private `openshell.supervisor.host.v1` assignment stream,
+which accepts nothing else. The topology requires gateway TLS and the signing
+key (`server.disableTls` is rejected; the gateway refuses to start without
+`gateway_jwt`). New sandbox generations run as sandbox instances in that
+process. The chart starts `--mode=shared`, sets `--gateway-endpoint` to the
+gateway gRPC URL, mounts the token at `--token-file`, and binds `--address`
+(5501) to a plain TCP health listener for the `tcpSocket` probes; nothing
+dials the supervisor but sandbox runtimes (5500) and the kubelet. Build the gateway, supervisor, and sandbox
+images from the same branch: all three must support the routed runtime
+connection and the assignment stream. `workspace` is reserved and rejected.
+Omit the field to disable it. `mise run
+e2e:kubernetes:shared-supervisor` runs the focused e2e
+(`ci/values-supervisor.yaml`). The task prepends that overlay to any
+colon-separated `OPENSHELL_E2E_KUBE_EXTRA_VALUES` list, so layer a
+workspace-mode overlay to cover managed namespaces:
+
+```bash
+OPENSHELL_E2E_KUBE_EXTRA_VALUES=deploy/helm/openshell/ci/values-workspace-managed.yaml \
+OPENSHELL_E2E_KUBE_IMAGE_PULL_SECRET=e2e-regcred \
+  mise run e2e:kubernetes:shared-supervisor
+```
+
 ### 2. Deploy OpenShell
 
 **Iterative dev** (rebuilds on file changes, recommended during active development):
@@ -81,7 +120,16 @@ The Skaffold flow builds distinct `gateway`, `sandbox`, and `supervisor` images
 and deploys the OpenShell Helm chart. The Kubernetes driver creates a
 capability-free workload Pod and a directly managed capability-free supervisor
 Pod. One namespace-wide NetworkPolicy denies direct egress from every OpenShell
-workload Pod. The
+workload Pod. New sandbox generations use `runtime-initiated` control: the sandbox
+runtime dials its supervisor through `os-supervisor-<id>`. The legacy
+`os-boundary-<id>` Service keeps selecting the workload for old gateways during
+rolling upgrades. New gateways create both Services and bind the control-mode
+annotation to its runtime generation. The driver adds a per-sandbox
+`os-control-<id>` NetworkPolicy for that path only. Existing running generations
+keep their connection until replaced; stop/start and gateway recovery that
+recreates both Pods upgrade legacy generations automatically. Use compatible
+gateway, supervisor, and sandbox runtime images together; there is no legacy
+rollout flag. The
 `pkiInitJob` hook (a pre-install Job that runs `openshell-gateway generate-certs`)
 generates gateway and CLI TLS secrets on first install. Supervisor Pods project
 only `ca.crt` and authenticate gateway RPCs with sandbox bearer tokens. User

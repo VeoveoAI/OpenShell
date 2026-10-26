@@ -560,12 +560,12 @@ impl MainSession {
     ) {
         match io {
             ProcessIo::Pty(master) => {
-                // SAFETY: the registration takes ownership of the PTY master `File`,
-                // whose descriptor stays open and unchanged until the `AsyncFd`, the
-                // last owner of `master`, drops.
+                // SAFETY: `master` owns a valid PTY descriptor and is moved into AsyncFd.
+                // The descriptor is never closed or replaced while registered.
                 #[allow(unsafe_code)]
-                let registered = unsafe { AsyncFd::register(master) };
-                let master = Arc::new(registered.expect("register canonical PTY master"));
+                let master =
+                    unsafe { AsyncFd::register(master) }.expect("register canonical PTY master");
+                let master = Arc::new(master);
                 let reader = Arc::clone(&master);
                 let output = Arc::clone(this);
                 tokio::spawn(async move {

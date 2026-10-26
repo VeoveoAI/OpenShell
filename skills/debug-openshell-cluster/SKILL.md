@@ -72,7 +72,7 @@ Common findings:
 - `No active gateway`: register one with `openshell gateway add <endpoint>`.
 - Connection refused: gateway process is not running, service exposure is wrong, or a port-forward/proxy is not active.
 - TLS/certificate errors: the endpoint scheme or trust chain is wrong, a CLI mTLS bundle does not match the gateway CA, a supervisor is missing the gateway CA, or TLS termination does not match the gateway listener. Workloads and supervisors should not contain a user TLS client certificate or private key.
-- Fresh snap installations use `openshell.user-gateway`; upgraded installations retain their system-owned state through `openshell.system-gateway`. Existing HTTPS registrations continue to work after the service rename. Follow the published snap installation steps to enroll a new user, replace an old HTTP registration, or change modes safely through the `disable` maintenance state. If `gateway-mode=disable`, no local snap gateway is expected to run.
+- Fresh snap installations select `gateway-mode=user`, but the user gateway is globally disabled by default. `install.sh` enables `snap.openshell.user-gateway.service` only for its target user; direct snap installations must select one user and run `systemctl --user enable --now snap.openshell.user-gateway.service` from that user's session. Do not enable it for multiple concurrently logged-in users: every instance binds to `127.0.0.1:17670`, so later instances fail with an address-in-use error. Older snap revisions could leave the unit globally enabled; remove that state with `sudo systemctl disable --global snap.openshell.user-gateway.service`, then disable and stop the service from every other affected user's session. The global command does not stop running user services. Setting `gateway-mode=user` disables the system gateway without changing any user's service. To change the selected user, disable and stop the current user's unit before enabling the new user's unit. Upgraded installations retain their system-owned state through `openshell.system-gateway`. Existing HTTPS registrations continue to work after the service rename. Follow the published snap installation steps to enroll a new user, replace an old HTTP registration, or change modes safely through the `disable` maintenance state. If `gateway-mode=disable`, no local snap gateway is expected to run.
 - `Unauthenticated` from an edge or OIDC gateway: refresh stored credentials with `openshell gateway login [name]`, then retry. Use `gateway logout` only when intentionally clearing local credentials.
 - Operator credential retrieval requires direct gateway mTLS, `[openshell.gateway.mtls_auth] operator_enabled = true`, and a verified certificate with exact `OU=operator`. OIDC admin roles and forwarded certificate headers do not grant access. Do not combine the operator certificate with an `Authorization` header. Enabling this role grants gateway-wide administration; never repair a denial by issuing operator certificates to ordinary users. See the published gateway authentication and provider references.
 - A direct development endpoint with a private or self-signed certificate can be isolated with `--gateway-endpoint <url> --gateway-insecure`; do not persist or recommend insecure verification for shared gateways.
@@ -108,6 +108,10 @@ The gateway container uses a Distroless Debian runtime. For OS-library
 vulnerability findings, check the deployed image digest and package version;
 deploy a rebuilt gateway image with the patched base. Updating the gateway
 binary alone does not update the libraries supplied by its container image.
+
+For stable releases, inspect the version tag or deployed digest. Promotion
+preserves the qualified prerelease's commit-SHA image tags; those tags do not
+identify the stable rebuild. See [image contents verification](https://docs.nvidia.com/openshell/latest/security/verify-image-contents).
 
 For resource-admission failures, distinguish disabled caller driver config from
 missing resource approval. Helm defaults `server.drivers.kubernetes.allowDriverConfig`
@@ -348,6 +352,13 @@ Common findings:
 - Sandbox runtime image exits before printing `openshell-sandbox --version`: verify the configured image contains a static executable at `/openshell-sandbox`.
 - A sandbox with explicit `protocol: tcp` endpoints fails before workload readiness: inspect supervisor and backend logs for policy rejection, network-mediation initialization, protected-channel setup, or listener failures. A backend that cannot enforce the admitted policy must reject it before starting workload code.
 - Supervisor runtime validation fails: verify `supervisor_image` contains an `/openshell-supervisor` executable from the same release as the sandbox runtime, and that the dynamic loader and shared libraries it links against are available inside that image. `docker run --rm --network none --entrypoint /openshell-supervisor <supervisor_image> --version` should print that release; a `no such file or directory` error for a binary that exists means the loader or a library is missing. The supervisor runs from its own image and does not need to be static; only `/openshell-sandbox` must be.
+- New Docker and Podman sandboxes dial the supervisor over a separate private
+  Unix socket volume; the workload keeps `network=none`. Check both containers'
+  mounts and socket-directory ownership if attachment times out. Existing
+  containers retain their saved legacy transport through restart. New VM
+  generations dial host CID 2 over vsock; libkrun forwards to a protected host
+  Unix socket, while QEMU uses a per-guest host port. Keep supervisor and runtime
+  binaries compatible when creating new generations.
 - Sandbox startup reports an `isolation control contract` failure: inspect the supervisor and sandbox-runtime image versions and update them together. An older runtime or incompatible isolation capability set fails before workload startup. See the published Sandbox Runtimes documentation for trusted image override precedence.
 - The sandbox fails its enforcement probe: inspect the sandbox log for the exact nested seccomp user-notification, task-memory, Landlock, loopback DNS, or socket-injection check that failed. A runtime may return `ENOSYS` for `process_vm_readv` and `process_vm_writev` while satisfying the production parent-to-workload-child task-memory probe through `/proc/<pid>/mem`; only failure of both backends is fatal. Do not add capabilities or switch to an unconfined seccomp profile; use a runtime whose default profile permits the unprivileged probe.
 - A GPU sandbox fails because Docker reports no discovered NVIDIA CDI devices: verify `.DiscoveredDevices` contains entries such as `nvidia.com/gpu=all`, verify `/etc/cdi` or `/var/run/cdi` contains a generated NVIDIA spec, and check that `nvidia-cdi-refresh.service` and `nvidia-cdi-refresh.path` from NVIDIA Container Toolkit are enabled and healthy. The service is a one-shot unit, so `inactive (dead)` can be normal after a successful run; use `systemctl status` and `journalctl` to distinguish success from a skipped or failed refresh. Restart `nvidia-cdi-refresh.service` to regenerate missing or stale CDI specs, then restart or reload Docker and re-check `docker info`.
@@ -575,7 +586,9 @@ workspace-profile, and other replicas' global changes delay them only while
 another operation on the same sandbox waits behind the change, holding that
 sandbox's key. Provisioning-deadline expiry also takes
 its workspace key locally, so provider and workspace-profile changes on the
-same replica can delay it. Each
+same replica can delay it;
+`openshell_server_provisioning_deadline_skips_total{overdue="true"}` counts
+the checks that skipped an overdue sandbox. Each
 replica takes its advisory locks on a dedicated lock pool of PostgreSQL
 connections, one per guard, 4 by default (gateway config
 `database_lock_max_connections`), so at most that many guarded
@@ -1047,10 +1060,50 @@ per-sandbox Service, split immutable bootstrap Secrets, and a gated supervisor
 Pod before releasing either Pod. The supervisor Pod runs
 `/openshell-supervisor`. Both Pods use the
 same resolved non-root identity, request no capabilities, drop `ALL`, disable
-privilege escalation, and use `RuntimeDefault` seccomp. The supervisor reaches
-the sandbox over per-sandbox TLS with server-certificate verification plus
-bootstrap-token client authentication, and owns gateway policy, provider
-credentials, DNS, and mediated upstream connections.
+privilege escalation, and use `RuntimeDefault` seccomp. The supervisor and
+sandbox talk over per-sandbox TLS with server-certificate verification plus
+bootstrap-token client authentication; the supervisor owns gateway policy,
+provider credentials, DNS, and mediated upstream connections.
+
+Each sandbox records which side opens that connection in the Sandbox annotation
+`openshell.ai/sandbox-runtime-control-connection`, bound to
+`openshell.ai/sandbox-runtime-control-generation`. A missing marker or a
+different current runtime generation means
+`supervisor-initiated`: the `os-boundary-<id>` Service selects the workload Pod
+and the supervisor dials it. With `runtime-initiated` (used for new
+generations), a separate `os-supervisor-<id>` Service selects the supervisor Pod, the sandbox runtime dials
+it, and a per-sandbox NetworkPolicy `os-control-<id>` admits only that
+connection at both the workload (egress) and the supervisor (ingress). The
+Service publishes the supervisor before it is Ready, because readiness follows
+the runtime's attach. If the runtime logs `cannot reach the supervisor`, check
+that the CNI applied both directions of `os-control-<id>`.
+Stop/start upgrades legacy sandboxes to runtime-initiated control, as does
+gateway recovery that recreates both Pods. Existing running generations keep
+their current connection until replaced. Check the mode first when a sandbox
+never becomes ready, especially after changing images:
+
+```bash
+kubectl -n <sandbox-namespace> get sandbox <sandbox-name> \
+  -o jsonpath='{.metadata.annotations.openshell\.ai/sandbox-runtime-control-connection}{"\n"}'
+kubectl -n <sandbox-namespace> get service os-boundary-<sandbox-id> -o jsonpath='{.spec.selector}{"\n"}'
+kubectl -n <sandbox-namespace> get service os-supervisor-<sandbox-id> -o jsonpath='{.spec.selector}{"\n"}'
+kubectl -n <sandbox-namespace> get networkpolicy os-control-<sandbox-id> -o yaml
+```
+
+A `runtime-initiated` sandbox needs a gateway, supervisor image, and sandbox
+runtime image that all support the mode. An older supervisor or runtime fails
+to decode its launch descriptor, so the sandbox cannot start or restart.
+Old gateways can restart sandboxes by creating their own compatible pair;
+`os-boundary-<id>` always keeps its workload selector. New gateways also create
+it for new sandboxes, alongside the supervisor Service. Upgrade the images
+together within each generation. There is no legacy rollout flag.
+Adding the supervisor endpoint on restart requires `create` and `get` on
+Services in the sandbox namespace. For a `Forbidden` restart error, check the
+gateway ServiceAccount with `kubectl auth can-i create services --namespace
+<sandbox-namespace> --as system:serviceaccount:<gateway-namespace>:<gateway-service-account>`.
+Do not edit the annotation, Service selector, or `os-control-<id>` policy:
+reconciliation suspends a sandbox whose Service or control policy no longer
+matches its recorded mode.
 
 The supervisor loads its startup configuration through the polling RPCs and
 opens `ConnectSupervisor` once the workload runs. When the gateway runs with
@@ -1300,9 +1353,12 @@ credential failures.
 | `helm upgrade` fails with an `autoscaling.*` message | HPA values invalid: missing `resources.requests` (or `resources.limits`), `maxReplicas` above 1 without `server.externalDbSecret` (or on a StatefulSet without `workload.allowMultiReplicaStatefulSet`), no metric target, or min/max out of order. "`minReplicas` and `maxReplicas` are not set" means `--reuse-values` kept a release without the chart's autoscaling defaults | Fix the values named in the error; upgrade with `--reset-then-reuse-values` instead of `--reuse-values` |
 | HPA shows `<unknown>` targets | No metrics-server for CPU/memory, or the metrics adapter does not serve the custom metric | `kubectl -n openshell describe hpa openshell`, `kubectl get --raw /apis/custom.metrics.k8s.io/v1beta1` |
 | One replica holds most sessions after a rollout | Expected: sessions stay where they reconnected | `openshell_server_supervisor_sessions` per pod; it fades as sandboxes are recreated |
+| Certificate hook Job stays active after `certgen` exits successfully | An injected sidecar is still running in the hook Pod | Inspect all container statuses. Configure `pkiInitJob.podLabels` or `pkiInitJob.podAnnotations` as required by the injector, then retry the Helm install or upgrade to recreate the hook Pods |
 | Gateway or `<release>-certgen` hook pod rejected with `violates PodSecurity "restricted:latest"` | The rendered container lacks `runAsNonRoot` or `seccompProfile`: an older chart version does not set them, or an override in `securityContext` / `pkiInitJob.securityContext` unset them | `kubectl -n openshell get events --field-selector reason=FailedCreate`; upgrade the chart, then remove overrides that unset those fields |
 | OpenShift gateway pod fails to start with an SCC/`runAsUser` error (e.g. `unable to validate against any security context constraint`) | Chart's default `podSecurityContext`/`securityContext` hardcodes `runAsUser`/`fsGroup`, which the restricted-v2 SCC rejects; it must instead inject the namespace-assigned UID/GID range | `oc -n openshell describe pod <pod>`; deploy with `podSecurityContext: null` and clear `securityContext.runAsUser` (see `deploy/helm/openshell/ci/values-openshift-scc.yaml`) |
-| OpenShift sandbox pod fails to start (`unable to validate against any security context constraint`) | The `openshell-sandbox` service account lacks the privileged SCC it needs | `oc adm policy add-scc-to-user privileged -z openshell-sandbox -n openshell`; remove with `remove-scc-from-user` when done |
+| OpenShift `<release>-supervisor` Deployment never creates pods after setting `supervisor_topology = "gateway"` (SCC `runAsUser`/`fsGroup` not in the namespace range) | `supervisor.podSecurityContext` defaults `runAsUser`, `runAsGroup`, and `fsGroup` to 65534, outside the namespace's assigned UID/GID ranges | `kubectl -n openshell get events --field-selector reason=FailedCreate`; compare with the `openshift.io/sa.scc.*` annotations from `oc describe ns openshell`; set `supervisor.podSecurityContext.runAsUser`, `.runAsGroup`, and `.fsGroup` to `null`, as `deploy/helm/openshell/ci/values-openshift-scc.yaml` does, and keep `runAsNonRoot` and `seccompProfile` |
+| Shared sandboxes stay `Starting` or report `unavailable` readiness with `supervisor_topology = "gateway"`, gateway logs say no shared supervisor host is connected | The `<release>-supervisor` Pod cannot reach or authenticate to the gateway: wrong `OPENSHELL_TLS_CA`, the `<release>-supervisor-token` Secret is missing or still empty (gateway logs `wrote the supervisor token Secret` once it has delivered a token; `no usable supervisor token` in the supervisor means it has not), or the gateway was deployed without TLS or without the sandbox-JWT signing key | `kubectl -n openshell logs deployment/<release>-supervisor` for `gateway accepted the supervisor host` or a refusal; gateway logs for `supervisor host attached`, `wrote the supervisor token Secret`, or `failed to write the supervisor token Secret`; `kubectl -n openshell get secret <release>-supervisor-token -o jsonpath='{.metadata.annotations}'` shows the token expiry; the gateway refuses to start the topology without TLS or `gateway_jwt` |
+| OpenShift sandbox pod fails to start (`unable to validate against any security context constraint`) | An explicit sandbox UID/GID override or custom security context conflicts with the namespace's SCC range | Inspect pod events and the namespace's `openshift.io/sa.scc.uid-range` and `openshift.io/sa.scc.supplemental-groups` annotations; remove incompatible `sandbox_uid` / `sandbox_gid` overrides so the driver uses the namespace-assigned identity. Current sandbox pods use `restricted-v2` without a privileged SCC grant; see the [OpenShift guide](https://docs.nvidia.com/openshell/latest/kubernetes/openshift) and [RFC 0012](https://github.com/NVIDIA/OpenShell/blob/main/rfc/0012-isolation-backend/README.md#motivation). |
 | OpenShift self-hosted Vault/OpenBao credential store pod never schedules (waits time out with `no matching resources found`) | The store's Helm chart pins `runAsUser`/`fsGroup`/seccomp, which restricted-v2 rejects, so the StatefulSet controller never creates the pod | Deploy the store's chart in its OpenShift mode (`--set global.openshift=true` for the OpenBao/Vault chart) so the namespace SCC assigns a compliant security context — no manual SCC grant needed |
 | Vault credential driver returns HTTP 403 / `Vault Kubernetes auth denied the configured role` on provider create | Vault's `auth/kubernetes` method or the gateway login role is not provisioned, or the role is not bound to the gateway service account and namespace | In Vault: `bao auth enable kubernetes` and `bao write auth/kubernetes/config kubernetes_host=... kubernetes_ca_cert=@...`; ensure the login role's `bound_service_account_names`/`bound_service_account_namespaces` match the gateway SA and namespace and its policy grants the credential paths |
 | CLI TLS error | Local mTLS bundle does not match server cert/CA | Check `~/.config/openshell/gateways/<name>/mtls/` |

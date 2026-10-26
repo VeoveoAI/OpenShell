@@ -18,10 +18,20 @@ use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::{Layer as _, layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
 mod logging;
+mod shared;
 
 const DEBUG_RPC_SUBCOMMAND: &str = "debug-rpc";
 const HEALTH_SUBCOMMAND: &str = "health";
 const SERVICE_NAME: &str = "openshell-supervisor";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum SupervisorMode {
+    /// Supervise a single sandbox generation.
+    #[default]
+    Dedicated,
+    /// Host sandbox supervision sessions in a shared process.
+    Shared,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 enum SupervisorRole {
@@ -46,6 +56,33 @@ struct HealthArgs {
 #[command(about = "OpenShell policy and workload supervisor")]
 #[allow(clippy::struct_excessive_bools)]
 struct Args {
+    /// Supervisor deployment mode.
+    #[arg(long, value_enum, default_value_t)]
+    mode: SupervisorMode,
+
+    /// Gateway endpoint for the shared supervisor's outbound connection.
+    #[arg(long, required_if_eq("mode", "shared"))]
+    gateway_endpoint: Option<String>,
+
+    /// Shared supervisor TCP health listener: it accepts and closes probe
+    /// connections and carries no control traffic.
+    #[arg(long, required_if_eq("mode", "shared"))]
+    address: Option<std::net::SocketAddr>,
+
+    /// File holding the supervisor token the gateway issues for the shared
+    /// supervisor's assignment stream. Re-read on every connection attempt,
+    /// so a renewed token takes effect without a restart.
+    #[arg(long, required_if_eq("mode", "shared"))]
+    token_file: Option<PathBuf>,
+
+    /// Listener for routed runtime-initiated Sandbox Protocol connections.
+    #[arg(long, required_if_eq("mode", "shared"))]
+    runtime_listen: Option<std::net::SocketAddr>,
+
+    /// Private directory for shared-host sandbox instance files.
+    #[arg(long, required_if_eq("mode", "shared"))]
+    session_root: Option<PathBuf>,
+
     /// Supervisor responsibility to run.
     #[arg(long, value_enum, default_value_t)]
     role: SupervisorRole,
@@ -355,7 +392,7 @@ fn main() -> Result<()> {
             .build()
             .into_diagnostic()?;
         return runtime.block_on(async move {
-            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            openshell_crypto::tls::ensure_default_provider();
             let exit = openshell_supervisor_process::debug_rpc::run(&raw_args[2..]).await?;
             std::process::exit(exit);
         });
@@ -366,10 +403,23 @@ fn main() -> Result<()> {
     }
 
     let args = Args::parse();
+    if args.mode == SupervisorMode::Shared {
+        return shared::run(args);
+    }
+    if args.gateway_endpoint.is_some()
+        || args.address.is_some()
+        || args.token_file.is_some()
+        || args.runtime_listen.is_some()
+        || args.session_root.is_some()
+    {
+        return Err(miette::miette!(
+            "shared supervisor options require --mode=shared"
+        ));
+    }
     validate_role_arguments(&args)?;
     arm_parent_liveness(args.parent_liveness_stdin)?;
     validate_main_exit_marker(args.main_exit_marker.as_deref())?;
-    let mut isolation_inputs = if args.role == SupervisorRole::IsolationBackend {
+    let isolation_inputs = if args.role == SupervisorRole::IsolationBackend {
         let admitted_backend =
             std::env::var(openshell_core::sandbox_env::ADMITTED_ISOLATION_BACKEND)
                 .map_err(|_| miette::miette!("driver must supply an admitted isolation backend"))?;
@@ -387,16 +437,23 @@ fn main() -> Result<()> {
         .enable_all()
         .build()
         .into_diagnostic()?;
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    if let Some((_, _, auth, _)) = isolation_inputs.as_mut() {
-        *auth = runtime.block_on(openshell_core::grpc_client::prepare_supervisor_auth_bundle(
-            auth,
-            args.openshell_endpoint.as_deref(),
-        ))?;
-        // Complete declared native bootstrap before log push or policy discovery
-        // can consume either credential or start periodic renewal.
-        let _ = openshell_core::grpc_client::install_supervisor_auth_bundle(auth)?;
-    }
+    openshell_crypto::tls::ensure_default_provider();
+    let isolation_inputs = isolation_inputs
+        .map(|(setup, descriptor, auth, admitted_backend)| {
+            // Complete declared native bootstrap before log push or policy
+            // discovery can consume either credential or start periodic renewal.
+            let auth =
+                runtime.block_on(openshell_core::grpc_client::prepare_supervisor_auth_bundle(
+                    &auth,
+                    args.openshell_endpoint.as_deref(),
+                ))?;
+            // Log push and supervision share these credentials, so either one's
+            // renewal keeps the other's gateway token current.
+            let credentials =
+                openshell_core::grpc_client::GatewayCredentials::from_dedicated_auth_bundle(&auth)?;
+            Ok::<_, miette::Report>((setup, descriptor, auth, admitted_backend, credentials))
+        })
+        .transpose()?;
     let export_config = |endpoint| openshell_otel::OtlpExportConfig {
         endpoint,
         service_name: openshell_otel::ServiceName::Fixed(SERVICE_NAME),
@@ -412,7 +469,7 @@ fn main() -> Result<()> {
     });
     let ocsf_headers = isolation_inputs
         .as_ref()
-        .and_then(|(_, _, auth, _)| auth.ocsf_otlp_headers.as_ref())
+        .and_then(|(_, _, auth, _, _)| auth.ocsf_otlp_headers.as_ref())
         .map(openshell_core::jwt::SecretOtlpHeaders::expose_secret);
     let (ocsf_export, ocsf_setup_error) = runtime.block_on(async {
         start_ocsf_export(
@@ -425,11 +482,18 @@ fn main() -> Result<()> {
     let ocsf_layer = ocsf_export.as_ref().map(openshell_otel::OcsfOtlp::layer);
 
     let exit_code = runtime.block_on(async move {
-        let log_push_state = if args.role == SupervisorRole::IsolationBackend
-            && let (Some(sandbox_id), Some(endpoint)) = (&args.sandbox_id, &args.openshell_endpoint)
-        {
+        let log_push_state = if let (Some(sandbox_id), Some(endpoint), Some(credentials)) = (
+            &args.sandbox_id,
+            &args.openshell_endpoint,
+            isolation_inputs
+                .as_ref()
+                .map(|(_, _, _, _, credentials)| credentials),
+        ) {
             let (tx, handle) = openshell_supervisor_process::log_push::spawn_log_push_task(
-                endpoint.clone(),
+                openshell_core::grpc_client::GatewayEndpoint::new(
+                    endpoint.as_str(),
+                    credentials.clone(),
+                ),
                 sandbox_id.clone(),
             );
             let layer =
@@ -506,38 +570,62 @@ fn main() -> Result<()> {
         match args.role {
             SupervisorRole::IsolationBackend => {
                 info!(command = ?command, "Starting sandbox supervision");
-                let Some((backend_setup, backend_descriptor, auth_bundle, admitted_backend)) =
-                    isolation_inputs
+                let Some((
+                    backend_setup,
+                    backend_descriptor,
+                    auth_bundle,
+                    admitted_backend,
+                    gateway_credentials,
+                )) = isolation_inputs
                 else {
                     return Err(miette::miette!(
                         "isolation-backend role started without validated runtime inputs"
                     ));
                 };
+                let config = openshell_supervisor::SandboxInstanceConfig {
+                    command,
+                    workdir,
+                    timeout_secs: args.timeout,
+                    interactive,
+                    await_main_process_attachment,
+                    sandbox_id: args.sandbox_id,
+                    sandbox: args.sandbox,
+                    container_image: std::env::var("OPENSHELL_CONTAINER_IMAGE").unwrap_or_default(),
+                    openshell_endpoint: args.openshell_endpoint,
+                    policy_rules: args.policy_rules,
+                    policy_data: args.policy_data,
+                    ssh_socket_path: args.ssh_socket_path,
+                    shared_ssh_socket: openshell_supervisor::shared_ssh_socket_from_env(),
+                    upstream_proxy_args,
+                    additional_ca_bundle: args.additional_ca_bundle,
+                    backend_descriptor,
+                    auth_bundle,
+                    admitted_isolation_backend: Some(admitted_backend),
+                    main_exit_marker: args.main_exit_marker,
+                    trace_context: openshell_supervisor::trace_context_from_environment(),
+                    provider_workload_api_socket: std::env::var_os(
+                        openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
+                    )
+                    .filter(|path| !path.is_empty())
+                    .map(PathBuf::from),
+                    proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::from_environment(),
+                };
+                // Log push already shares these credentials and the logging
+                // layers these OCSF JSON settings.
+                let bindings = openshell_supervisor::SandboxInstanceBindings::dedicated(
+                    &config,
+                    gateway_credentials,
+                    openshell_ocsf::OcsfJsonSettings {
+                        enabled: ocsf_enabled,
+                        target_version: ocsf_schema_version,
+                    },
+                );
                 let result = Box::pin(openshell_supervisor::run_sandbox_with_backend(
                     backend_setup.as_ref(),
-                    openshell_supervisor::SandboxRunConfig {
-                        command,
-                        workdir,
-                        timeout_secs: args.timeout,
-                        interactive,
-                        await_main_process_attachment,
-                        sandbox_id: args.sandbox_id,
-                        sandbox: args.sandbox,
-                        openshell_endpoint: args.openshell_endpoint,
-                        policy_rules: args.policy_rules,
-                        policy_data: args.policy_data,
-                        ssh_socket_path: args.ssh_socket_path,
-                        health_socket_path: args.health_socket_path,
-                        health_port: args.health_port,
-                        ocsf_enabled,
-                        ocsf_schema_version,
-                        upstream_proxy_args,
-                        additional_ca_bundle: args.additional_ca_bundle,
-                        backend_descriptor,
-                        auth_bundle,
-                        admitted_isolation_backend: Some(admitted_backend),
-                        main_exit_marker: args.main_exit_marker,
-                    },
+                    config,
+                    bindings,
+                    args.health_socket_path,
+                    args.health_port,
                 ))
                 .await;
                 supervisor_exit(result)

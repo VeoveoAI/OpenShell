@@ -15,7 +15,7 @@ use tokio::sync::oneshot;
 
 #[tokio::test]
 async fn invalid_tls_response_preserves_the_original_transport_cause() {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    openshell_crypto::tls::ensure_default_provider();
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let address = listener.local_addr().unwrap();
     let (finished, client_finished) = oneshot::channel();

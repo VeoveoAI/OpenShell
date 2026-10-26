@@ -44,6 +44,7 @@ use oci_client::manifest::{
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Reference, RegistryOperation};
 use openshell_core::UpstreamProxyConfig;
+use openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS;
 use openshell_core::driver_mounts;
 use openshell_core::gpu::{
     driver_gpu_requirements, effective_driver_gpu_count, validate_specific_gpu_device_request,
@@ -90,9 +91,11 @@ use std::os::fd::AsRawFd as _;
 use std::os::fd::OwnedFd;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -1453,9 +1456,9 @@ impl VmDriver {
         let boundary_generation =
             match tokio::fs::read_to_string(state_dir.join(HOST_BOUNDARY_GENERATION_FILE)).await {
                 Ok(generation) if !generation.trim().is_empty() => generation.trim().to_string(),
-                Ok(_) => random_boundary_token(),
+                Ok(_) => random_boundary_token()?,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    random_boundary_token()
+                    random_boundary_token()?
                 }
                 Err(error) => {
                     return Err(Status::internal(format!(
@@ -1634,14 +1637,20 @@ impl VmDriver {
             trust_anchor_pem: channel_tls.trust_anchor_pem.clone(),
         };
         let transport = if plan.backend == VmBackend::Qemu {
-            SandboxTransport::Vsock {
-                guest_cid: plan.vsock_cid.ok_or_else(|| {
-                    Status::internal("QEMU launch plan is missing a guest vsock CID")
-                })?,
-                port: VM_CONTROL_PORT,
+            let guest_cid = plan
+                .vsock_cid
+                .ok_or_else(|| Status::internal("QEMU launch plan is missing a guest vsock CID"))?;
+            SandboxTransport::RuntimeInitiatedVsock {
+                guest_cid,
+                // Each QEMU guest connects to a distinct host port. The CID
+                // allocator already guarantees uniqueness among live guests.
+                port: VM_CONTROL_PORT
+                    .checked_add(guest_cid)
+                    .filter(|port| *port != u32::MAX)
+                    .ok_or_else(|| Status::resource_exhausted("VM control port space exhausted"))?,
             }
         } else {
-            SandboxTransport::Unix {
+            SandboxTransport::RuntimeInitiatedUnix {
                 socket_path: control_socket.clone(),
             }
         };
@@ -1731,6 +1740,7 @@ impl VmDriver {
         } else {
             let _ = tokio::fs::remove_file(&control_socket).await;
             command
+                .arg("--vm-vsock-runtime-initiated")
                 .arg("--vm-vsock-control-port")
                 .arg(VM_CONTROL_PORT.to_string())
                 .arg("--vm-vsock-control-socket")
@@ -3302,6 +3312,43 @@ impl VmDriver {
         )
     }
 
+    fn publish_pulling_event(&self, sandbox_id: &str, image_ref: &str) {
+        self.publish_platform_event(
+            sandbox_id.to_string(),
+            platform_event(
+                "vm",
+                "Normal",
+                "Pulling",
+                format!("Pulling image \"{image_ref}\""),
+            ),
+        );
+    }
+
+    /// A registry-sourced root disk found in the cache: `Pulling`, the
+    /// `CacheHit` progress and `Pulled`, so the image step still advances.
+    async fn publish_registry_cache_hit(
+        &self,
+        sandbox_id: &str,
+        image_ref: &str,
+        image_identity: &str,
+        image_path: &Path,
+    ) {
+        self.publish_pulling_event(sandbox_id, image_ref);
+        self.publish_vm_progress(
+            sandbox_id,
+            "CacheHit",
+            format!("Using cached VM root disk for image \"{image_ref}\""),
+            HashMap::from([
+                ("image_ref".to_string(), image_ref.to_string()),
+                ("image_source".to_string(), "registry".to_string()),
+                ("cache_hit".to_string(), "true".to_string()),
+                ("image_identity".to_string(), image_identity.to_string()),
+            ]),
+        );
+        self.publish_pulled_event(sandbox_id, image_ref, image_path)
+            .await;
+    }
+
     async fn ensure_cached_registry_rootfs_image(
         &self,
         sandbox_id: &str,
@@ -3312,6 +3359,31 @@ impl VmDriver {
         let span_status = openshell_otel::ErrorStatusGuard::current();
         info!(image_ref = %image_ref, "vm driver: ensuring cached root disk image (registry)");
         let reference = parse_registry_reference(image_ref)?;
+        // A digest pin already names the image's content, and a cached root
+        // disk is only published after its manifest was verified against
+        // that digest. On a hit the registry cannot add anything, so neither
+        // authenticate nor resolve: the sandbox boots from the cache without a
+        // network round trip, and keeps booting while the registry is down.
+        // Tags still resolve through the registry below.
+        if let Some(digest) = reference.digest() {
+            let image_identity = bootstrap_image_cache_identity(digest);
+            let image_path = image_cache_rootfs_image(&self.config.state_dir, &image_identity);
+            if tokio::fs::metadata(&image_path).await.is_ok() {
+                info!(
+                    image_identity = %image_identity,
+                    image_path = %image_path.display(),
+                    "vm driver: root disk image cache hit (digest-pinned, no registry call)"
+                );
+                self.publish_registry_cache_hit(
+                    sandbox_id,
+                    image_ref,
+                    &image_identity,
+                    &image_path,
+                )
+                .await;
+                return span_status.finish(Ok(image_identity));
+            }
+        }
         info!(image_ref = %image_ref, "vm driver: authenticating with registry");
         self.publish_vm_progress(
             sandbox_id,
@@ -3356,39 +3428,19 @@ impl VmDriver {
         let image_identity = bootstrap_image_cache_identity(&source_image_identity);
         let image_path = image_cache_rootfs_image(&self.config.state_dir, &image_identity);
 
-        // Emit a driver progress hint for cache hits too and immediately
-        // follow with `Pulled` so the image step still advances cleanly.
-        self.publish_platform_event(
-            sandbox_id.to_string(),
-            platform_event(
-                "vm",
-                "Normal",
-                "Pulling",
-                format!("Pulling image \"{image_ref}\""),
-            ),
-        );
-
         if tokio::fs::metadata(&image_path).await.is_ok() {
             info!(
                 image_identity = %image_identity,
                 image_path = %image_path.display(),
                 "vm driver: root disk image cache hit (no build needed)"
             );
-            self.publish_vm_progress(
-                sandbox_id,
-                "CacheHit",
-                format!("Using cached VM root disk for image \"{image_ref}\""),
-                HashMap::from([
-                    ("image_ref".to_string(), image_ref.to_string()),
-                    ("image_source".to_string(), "registry".to_string()),
-                    ("cache_hit".to_string(), "true".to_string()),
-                    ("image_identity".to_string(), image_identity.clone()),
-                ]),
-            );
-            self.publish_pulled_event(sandbox_id, image_ref, &image_path)
+            self.publish_registry_cache_hit(sandbox_id, image_ref, &image_identity, &image_path)
                 .await;
             return span_status.finish(Ok(image_identity));
         }
+
+        // A driver progress hint before the build, so the image step advances.
+        self.publish_pulling_event(sandbox_id, image_ref);
 
         info!(
             image_identity = %image_identity,
@@ -6230,12 +6282,14 @@ fn merged_environment(sandbox: &Sandbox) -> HashMap<String, String> {
     environment
 }
 
-fn random_boundary_token() -> String {
+fn random_boundary_token() -> Result<String, Status> {
     let mut token = String::with_capacity(64);
-    for byte in rand::random::<[u8; 32]>() {
+    for byte in openshell_crypto::random_bytes::<32>()
+        .map_err(|error| Status::internal(error.to_string()))?
+    {
         write!(&mut token, "{byte:02x}").expect("writing to String cannot fail");
     }
-    token
+    Ok(token)
 }
 
 fn build_guest_environment(sandbox: &Sandbox, config: &VmDriverConfig) -> Vec<String> {
@@ -6303,17 +6357,19 @@ fn sandbox_socket_dir(socket_root: &Path, sandbox_id: &str) -> PathBuf {
 fn allocate_socket_root() -> Result<(PathBuf, OwnedFd), std::io::Error> {
     let uid = rustix::process::geteuid().as_raw();
     allocate_socket_root_with(Path::new("/tmp"), || {
-        let random: u128 = rand::random();
-        format!("os-{uid}-{random:032x}")
+        let random = u128::from_ne_bytes(
+            openshell_crypto::random_bytes::<16>().map_err(std::io::Error::other)?,
+        );
+        Ok(format!("os-{uid}-{random:032x}"))
     })
 }
 
 fn allocate_socket_root_with(
     base: &Path,
-    mut gen_name: impl FnMut() -> String,
+    mut gen_name: impl FnMut() -> Result<String, std::io::Error>,
 ) -> Result<(PathBuf, OwnedFd), std::io::Error> {
     for _ in 0..SOCKET_ROOT_ALLOC_RETRIES {
-        let root = base.join(gen_name());
+        let root = base.join(gen_name()?);
         match rustix::fs::mkdir(&root, rustix::fs::Mode::from_raw_mode(0o700)) {
             Ok(()) => {
                 let fd = rustix::fs::open(
@@ -7117,7 +7173,10 @@ fn inject_guest_boundary_bundle(
     let tls = match &config.listener {
         BoundaryListener::Unix { tls, .. }
         | BoundaryListener::TlsTcp { tls, .. }
-        | BoundaryListener::Vsock { tls, .. } => tls.clone(),
+        | BoundaryListener::Vsock { tls, .. }
+        | BoundaryListener::RuntimeInitiatedTlsTcp { tls, .. }
+        | BoundaryListener::RuntimeInitiatedUnix { tls, .. }
+        | BoundaryListener::RuntimeInitiatedVsock { tls, .. } => tls.clone(),
     };
     let encoded_config = config
         .encode()
@@ -7468,7 +7527,47 @@ fn overlay_staging_dir(overlay_disk: &Path) -> PathBuf {
     ))
 }
 
+/// Grace after SIGTERM before killing a host process.
+const PROCESS_TERMINATION_GRACE: Duration = Duration::from_secs(5);
+
+/// Mirrors the supervisor's workload SIGTERM grace.
+const SUPERVISOR_WORKLOAD_TERM_SECS: u64 = 5;
+/// Guest process-tree termination grace plus forced-kill reap time.
+const GUEST_PROCESS_TREE_SECS: u64 = DEFAULT_STOP_TIMEOUT_SECS as u64 + 2;
+/// Mirrors the guest's filesystem flush timeout.
+const GUEST_FLUSH_SECS: u64 = 3;
+/// Allow control round trips and scheduling between shutdown stages.
+const SHUTDOWN_SCHEDULING_SECS: u64 = 2;
+
+/// Budget for workload termination, guest process cleanup and filesystem flush.
+/// The cap may interrupt slow shutdown or log draining. Only the stop timeout
+/// is shared; changes to the other stage limits must be reflected here.
+const SUPERVISOR_SHUTDOWN_GRACE: Duration = Duration::from_secs(
+    SUPERVISOR_WORKLOAD_TERM_SECS
+        + GUEST_PROCESS_TREE_SECS
+        + GUEST_FLUSH_SECS
+        + SHUTDOWN_SCHEDULING_SECS,
+);
+
+/// Mirrors the gateway's stop deadline when reclaiming expired provisioning.
+const STOP_CALLER_DEADLINE: Duration = Duration::from_secs(30);
+
+// The longest stop is the supervisor's grace plus the VM's.
+const _: () = assert!(
+    SUPERVISOR_SHUTDOWN_GRACE.as_secs() + PROCESS_TERMINATION_GRACE.as_secs()
+        < STOP_CALLER_DEADLINE.as_secs()
+);
+
 async fn terminate_vm_process(child: &mut Child) -> Result<(), std::io::Error> {
+    terminate_vm_process_within(child, PROCESS_TERMINATION_GRACE)
+        .await
+        .map(|_| ())
+}
+
+async fn terminate_vm_process_within(
+    child: &mut Child,
+    grace: Duration,
+) -> Result<ExitStatus, std::io::Error> {
     if let Some(pid) = child.id()
         && let Err(err) = kill(Pid::from_raw(pid.cast_signed()), Signal::SIGTERM)
         && err != Errno::ESRCH
@@ -7478,23 +7577,41 @@ async fn terminate_vm_process(child: &mut Child) -> Result<(), std::io::Error> {
         )));
     }
 
-    match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(err)) => Err(err),
-        Err(_) => {
-            child.kill().await?;
-            child.wait().await.map(|_| ())
-        }
+    if let Ok(status) = tokio::time::timeout(grace, child.wait()).await {
+        status
+    } else {
+        child.kill().await?;
+        child.wait().await
     }
 }
 
+/// Stop the host supervisor first, then the VM it was supervising.
+///
+/// Keep liveness open until the supervisor exits: EOF skips orderly workload
+/// teardown, the guest filesystem flush and the supervisor's log export drain.
 async fn terminate_sandbox_processes(process: &mut VmProcess) -> Result<(), std::io::Error> {
-    // Liveness EOF makes the supervisor exit at once, skipping workload
-    // teardown and its OCSF export flush, so close it only after SIGTERM has
-    // had its chance. Each process keeps its five-second budget, so a stop
-    // still completes within ten seconds; a slow workload stop can leave the
-    // supervisor too little time to flush.
-    let supervisor_error = terminate_vm_process(&mut process.supervisor).await.err();
+    terminate_sandbox_processes_within(process, SUPERVISOR_SHUTDOWN_GRACE).await
+}
+
+async fn terminate_sandbox_processes_within(
+    process: &mut VmProcess,
+    supervisor_grace: Duration,
+) -> Result<(), std::io::Error> {
+    let supervisor_pid = process.supervisor.id();
+    let supervisor_error = terminate_vm_process_within(&mut process.supervisor, supervisor_grace)
+        .await
+        .inspect(|status| {
+            // An orderly shutdown returns the workload's exit code, which can
+            // be nonzero even after the guest acknowledges termination.
+            if status.signal().is_some() {
+                warn!(
+                    ?supervisor_pid,
+                    %status,
+                    "VM host supervisor was terminated by a signal; guest filesystem flush was not confirmed and recent writes may be lost"
+                );
+            }
+        })
+        .err();
     process.supervisor_liveness.take();
     let vm_error = terminate_vm_process(&mut process.child).await.err();
 
@@ -7759,7 +7876,10 @@ mod tests {
     use tonic::Code;
 
     fn test_socket_root() -> (PathBuf, Arc<OwnedFd>) {
-        let dir = std::env::temp_dir().join(format!("os-test-{:016x}", rand::random::<u64>()));
+        let dir = std::env::temp_dir().join(format!(
+            "os-test-{:016x}",
+            u64::from_ne_bytes(openshell_crypto::random_bytes::<8>().expect("test entropy"))
+        ));
         std::fs::create_dir(&dir).expect("create test socket root");
         std::fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
             .expect("set test socket root permissions");
@@ -9743,12 +9863,12 @@ mod tests {
         let mut counter = 0u64;
         let (root_a, _fd_a) = allocate_socket_root_with(tmp.path(), || {
             counter += 1;
-            format!("root-{counter}")
+            Ok(format!("root-{counter}"))
         })
         .unwrap();
         let (root_b, _fd_b) = allocate_socket_root_with(tmp.path(), || {
             counter += 1;
-            format!("root-{counter}")
+            Ok(format!("root-{counter}"))
         })
         .unwrap();
         assert_ne!(
@@ -9772,7 +9892,7 @@ mod tests {
         let call_count = AtomicUsize::new(0);
         let (root, _fd) = allocate_socket_root_with(tmp.path(), || {
             let n = call_count.fetch_add(1, Ordering::SeqCst);
-            format!("attempt-{n}")
+            Ok(format!("attempt-{n}"))
         })
         .expect("should succeed after retries");
 
@@ -9799,12 +9919,23 @@ mod tests {
     }
 
     #[test]
+    fn allocate_socket_root_propagates_name_generation_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = allocate_socket_root_with(tmp.path(), || {
+            Err(std::io::Error::other(openshell_crypto::CryptoError::Random))
+        })
+        .expect_err("entropy failure must stop allocation");
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
     fn allocate_socket_root_exhaustion_returns_error() {
         let tmp = tempfile::tempdir().unwrap();
         let blocked = tmp.path().join("blocked");
         std::fs::create_dir(&blocked).unwrap();
 
-        let err = allocate_socket_root_with(tmp.path(), || "blocked".to_string())
+        let err = allocate_socket_root_with(tmp.path(), || Ok("blocked".to_string()))
             .expect_err("should fail when all names are occupied");
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
     }
@@ -11406,7 +11537,7 @@ mod tests {
         let outside = Path::new("/tmp").join(format!(
             "openshell-vm-layer-test-{}-{:x}",
             std::process::id(),
-            rand::random::<u64>()
+            u64::from_ne_bytes(openshell_crypto::random_bytes::<8>().expect("test entropy"))
         ));
         fs::create_dir_all(&outside).unwrap();
         fs::write(outside.join("sentinel"), "unchanged").unwrap();
@@ -12015,59 +12146,184 @@ mod tests {
             .unwrap()
     }
 
-    /// A stand-in supervisor that drains for a second on SIGTERM and then
-    /// writes `marker`, unless liveness reached EOF while it drained, which
-    /// would have made the real supervisor exit at once.
-    #[cfg(unix)]
-    fn spawn_draining_supervisor(marker: &Path) -> (Child, fs::File) {
-        let (liveness_read, liveness_write) = nix::unistd::pipe().unwrap();
-        // As in production, so the child does not inherit the write end.
-        nix::fcntl::fcntl(
-            liveness_write.as_raw_fd(),
-            nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
-        )
-        .unwrap();
-        // bash, not sh: dash gives an asynchronous list /dev/null as stdin even
-        // with an explicit `<&0`, so the stand-in would see EOF at once.
-        let mut child = Command::new("bash")
-            .arg("-c")
-            .arg(
-                r#"(cat >/dev/null; touch "$0.eof") <&0 &
-trap 'sleep 1; [ -e "$0.eof" ] || echo drained > "$0"; exit 0' TERM
-wait $!
-exit 1"#,
-            )
-            .arg(marker)
-            .stdin(Stdio::from(liveness_read))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        // Let the shell install its trap before the test signals it.
-        std::thread::sleep(Duration::from_millis(200));
-        assert!(child.try_wait().unwrap().is_none());
-        (child, fs::File::from(liveness_write))
-    }
-
-    #[cfg(unix)]
+    /// Delay SIGTERM handling so premature liveness EOF wins the race.
     #[tokio::test]
-    async fn stopping_a_sandbox_lets_the_supervisor_drain_before_closing_liveness() {
+    async fn stop_signals_supervisor_before_closing_its_liveness_pipe() {
         let dir = unique_temp_dir();
         fs::create_dir_all(&dir).unwrap();
-        let marker = dir.join("drained");
-        let (supervisor, liveness) = spawn_draining_supervisor(&marker);
+        let driver_log = dir.join("driver.log");
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(Arc::new(fs::File::create(&driver_log).unwrap()))
+            .finish();
+        let _tracing = tracing::subscriber::set_default(subscriber);
+        let events = dir.join("events");
+        let (read_end, write_end) = nix::unistd::pipe().unwrap();
+        for fd in [&read_end, &write_end] {
+            nix::fcntl::fcntl(
+                fd.as_raw_fd(),
+                nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+            )
+            .unwrap();
+        }
+        let read_fd = read_end.as_raw_fd();
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(
+                r#"events=$1
+(cat <&3 >/dev/null; echo eof >>"$events") &
+trap 'sleep 0.2; echo term >>"$events"; exit 143' TERM
+echo ready >>"$events"
+while :; do sleep 0.05; done"#,
+            )
+            .arg("supervisor")
+            .arg(&events)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: only async-signal-safe `dup2` runs between fork and exec.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(read_fd, 3) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let supervisor = command.spawn().unwrap();
+        drop(read_end);
+
+        let ready = async {
+            while !fs::read_to_string(&events).is_ok_and(|log| log.contains("ready")) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), ready)
+            .await
+            .expect("stand-in supervisor installs its SIGTERM handler");
+
         let mut process = VmProcess {
             child: spawn_exited_child(),
             supervisor,
-            supervisor_liveness: Some(liveness),
-            deleting: true,
+            supervisor_liveness: Some(fs::File::from(write_end)),
+            deleting: false,
         };
-
         terminate_sandbox_processes(&mut process).await.unwrap();
 
-        assert_eq!(fs::read_to_string(&marker).unwrap(), "drained\n");
+        let log = fs::read_to_string(&events).unwrap();
+        let first_event = log.lines().find(|line| *line != "ready");
+        assert_eq!(
+            first_event,
+            Some("term"),
+            "SIGTERM must reach the supervisor before its liveness pipe closes; events: {log:?}"
+        );
+        assert!(
+            fs::read_to_string(&driver_log).unwrap().is_empty(),
+            "an orderly supervisor shutdown must not warn about lost writes"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A supervisor that ignores SIGTERM is killed once its grace expires, and
+    /// only then is its liveness pipe closed.
+    #[tokio::test]
+    async fn stop_kills_a_supervisor_that_ignores_sigterm_after_the_grace() {
+        let dir = unique_temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let driver_log = dir.join("driver.log");
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(Arc::new(fs::File::create(&driver_log).unwrap()))
+            .finish();
+        let _tracing = tracing::subscriber::set_default(subscriber);
+        let events = dir.join("events");
+        let (read_end, write_end) = nix::unistd::pipe().unwrap();
+        for fd in [&read_end, &write_end] {
+            nix::fcntl::fcntl(
+                fd.as_raw_fd(),
+                nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+            )
+            .unwrap();
+        }
+        let read_fd = read_end.as_raw_fd();
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(
+                r#"events=$1
+(cat <&3 >/dev/null; echo eof >>"$events") &
+trap '' TERM
+echo ready >>"$events"
+while :; do sleep 0.05; done"#,
+            )
+            .arg("supervisor")
+            .arg(&events)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: only async-signal-safe `dup2` runs between fork and exec.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(read_fd, 3) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let supervisor = command.spawn().unwrap();
+        drop(read_end);
+        let ready = async {
+            while !fs::read_to_string(&events).is_ok_and(|log| log.contains("ready")) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), ready)
+            .await
+            .expect("stand-in supervisor starts");
+
+        let mut process = VmProcess {
+            child: spawn_exited_child(),
+            supervisor,
+            supervisor_liveness: Some(fs::File::from(write_end)),
+            deleting: false,
+        };
+        let grace = Duration::from_millis(300);
+        let started = tokio::time::Instant::now();
+        terminate_sandbox_processes_within(&mut process, grace)
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= grace,
+            "the supervisor must get its full grace before the kill: {elapsed:?}"
+        );
+        assert!(
+            process.supervisor.try_wait().unwrap().is_some(),
+            "the supervisor is gone once the grace has expired"
+        );
         assert!(process.supervisor_liveness.is_none());
-        let _ = fs::remove_dir_all(dir);
+        // The liveness pipe closes only after the supervisor has been dealt with.
+        let closed = async {
+            while !fs::read_to_string(&events).is_ok_and(|log| log.contains("eof")) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), closed)
+            .await
+            .expect("the liveness pipe is closed after the stop");
+        let driver_log = fs::read_to_string(&driver_log).unwrap();
+        assert!(
+            driver_log.contains("WARN")
+                && driver_log.contains("guest filesystem flush was not confirmed"),
+            "a forced supervisor shutdown must warn that recent writes may be lost: {driver_log:?}"
+        );
+        fs::remove_dir_all(&dir).ok();
     }
 
     async fn insert_test_record(

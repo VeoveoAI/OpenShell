@@ -656,14 +656,13 @@ impl super::BoundaryTransportConnector for Connector {
 fn client(peer: Peer) -> Arc<BoundaryClient> {
     let session_id = "550e8400-e29b-41d4-a716-446655440000".parse().unwrap();
     let material = w::generate_sandbox_tls_material(session_id).unwrap();
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let certs = rustls_pemfile::certs(&mut material.certificate_chain_pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     let key = rustls_pemfile::private_key(&mut material.private_key_pem.as_bytes())
         .unwrap()
         .unwrap();
-    let mut config = rustls::ServerConfig::builder()
+    let mut config = openshell_crypto::tls::server_builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .unwrap();
@@ -723,7 +722,7 @@ fn client(peer: Peer) -> Arc<BoundaryClient> {
     .unwrap();
     let mut client =
         BoundaryClient::with_backend(descriptor, bearer, crate::BACKEND_NAME.into(), vec![]);
-    client.connector = Some(Arc::new(Connector {
+    client.transport = crate::BoundaryTransport::connector(Arc::new(Connector {
         peer,
         address,
         task,
@@ -861,7 +860,7 @@ pub fn backend(
     )
     .unwrap();
     let mut backend = crate::OpenShellRuntimeBackend::new(ca, credentials, bearer);
-    backend.connector.clone_from(&peer.connector);
+    backend.transport.clone_from(&peer.transport);
     backend.delegated = Some(crate::runtime::DelegatedRuntime {
         backend_name: name,
         descriptor,
