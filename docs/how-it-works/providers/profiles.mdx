@@ -477,10 +477,15 @@ binaries:
 ```
 
 Duration fields use protobuf duration strings and preserve fractional seconds.
-An absent `refresh_before` uses the gateway default, while `"0s"` refreshes at
-expiry. An absent `max_lifetime` uses the strategy default; an explicit zero
+An absent `refresh_before` uses the gateway default, while `"0s"` sets no lead
+time. An absent `max_lifetime` uses the strategy default; an explicit zero
 maximum lifetime is invalid. Existing `*_seconds` fields remain accepted on
 import for compatibility.
+
+The gateway checks refresh schedules every 60 seconds and refreshes a
+credential between `refresh_before` and `refresh_before` plus 60 seconds before
+it expires. With the default `poll` configuration delivery, a running sandbox
+receives the new value at its next configuration poll, within about 10 seconds.
 
 ### Profile Sections
 

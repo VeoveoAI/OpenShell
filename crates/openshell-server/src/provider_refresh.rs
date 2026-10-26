@@ -2345,6 +2345,7 @@ pub fn spawn_refresh_worker(state: std::sync::Arc<crate::ServerState>, interval:
         interval_seconds = interval.as_secs(),
         "provider credential refresh worker started"
     );
+    let interval_ms = i64::try_from(interval.as_millis()).unwrap_or(i64::MAX);
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -2354,6 +2355,8 @@ pub fn spawn_refresh_worker(state: std::sync::Arc<crate::ServerState>, interval:
                 state.store.as_ref(),
                 Some(&state.credentials),
                 Some(&state.compute),
+                current_time_ms(),
+                interval_ms,
             ))
             .await
             {
@@ -2374,19 +2377,22 @@ pub fn spawn_refresh_worker(state: std::sync::Arc<crate::ServerState>, interval:
     });
 }
 
-/// Returns the `(workspace, provider)` pairs whose provider records changed.
+/// Sweeps every refresh state as of `now_ms`, the sweep start; the next sweep
+/// starts `interval_ms` later. Returns the `(workspace, provider)` pairs whose
+/// provider records changed.
 async fn run_refresh_worker_tick(
     store: &Store,
     credentials: Option<&crate::credentials::CredentialRuntime>,
     compute: Option<&crate::compute::ComputeRuntime>,
+    now_ms: i64,
+    interval_ms: i64,
 ) -> Result<std::collections::HashSet<(String, String)>, Status> {
     let changed_providers = std::collections::HashSet::new();
-    let now_ms = current_time_ms();
     let states = list_all_refresh_states(store).await?;
     let watched_count = states.len();
     let due_count = states
         .iter()
-        .filter(|state| state.next_refresh_at_ms <= 0 || state.next_refresh_at_ms <= now_ms)
+        .filter(|state| refresh_due(state, now_ms, interval_ms))
         .count();
     let rotation_requested_count = states
         .iter()
@@ -2398,7 +2404,7 @@ async fn run_refresh_worker_tick(
     );
     if !states
         .iter()
-        .any(|state| refresh_state_has_work(state, now_ms))
+        .any(|state| refresh_state_has_work(state, now_ms, interval_ms))
     {
         return Ok(changed_providers);
     }
@@ -2408,20 +2414,49 @@ async fn run_refresh_worker_tick(
         watched_count,
         due_count,
     );
-    Ok(
-        Box::pin(refresh_states(store, credentials, compute, states, now_ms).instrument(span))
-            .await,
+    Ok(Box::pin(
+        refresh_states(store, credentials, compute, states, now_ms, interval_ms).instrument(span),
     )
+    .await)
 }
 
-fn refresh_state_has_work(state: &StoredProviderCredentialRefreshState, now_ms: i64) -> bool {
+/// Whether the sweep starting at `now_ms` must refresh `state`, given that
+/// the next sweep starts `interval_ms` later.
+///
+/// A healthy schedule is a deadline: `next_refresh_at_ms` is the last moment
+/// that still leaves `refresh_before` of lifetime, so a sweep refreshes the
+/// credential when that deadline falls before the next sweep. The lead before
+/// expiry is then between `refresh_before` and `refresh_before + interval`.
+/// A schedule set by a failure is a not-before time instead: retry and backoff
+/// never run early, matching [`ensure_automatic_refresh_ready`].
+fn refresh_due(
+    state: &StoredProviderCredentialRefreshState,
+    now_ms: i64,
+    interval_ms: i64,
+) -> bool {
+    if state.next_refresh_at_ms <= 0 {
+        return true;
+    }
+    let horizon_ms =
+        if state.recovery_action == ProviderCredentialRefreshRecoveryAction::Unspecified as i32 {
+            now_ms.saturating_add(interval_ms)
+        } else {
+            now_ms
+        };
+    state.next_refresh_at_ms <= horizon_ms
+}
+
+fn refresh_state_has_work(
+    state: &StoredProviderCredentialRefreshState,
+    now_ms: i64,
+    interval_ms: i64,
+) -> bool {
     state
         .metadata
         .as_ref()
         .is_some_and(|metadata| metadata.deletion_time.is_some())
         || !state.pending_secret_deletions.is_empty()
-        || state.next_refresh_at_ms <= 0
-        || state.next_refresh_at_ms <= now_ms
+        || refresh_due(state, now_ms, interval_ms)
         || state.status == "rotation_requested"
 }
 
@@ -2431,6 +2466,7 @@ async fn refresh_states(
     compute: Option<&crate::compute::ComputeRuntime>,
     states: Vec<StoredProviderCredentialRefreshState>,
     now_ms: i64,
+    interval_ms: i64,
 ) -> std::collections::HashSet<(String, String)> {
     let mut changed_providers = std::collections::HashSet::new();
     for state in states {
@@ -2490,7 +2526,7 @@ async fn refresh_states(
             );
             continue;
         }
-        let due = state.next_refresh_at_ms <= 0 || state.next_refresh_at_ms <= now_ms;
+        let due = refresh_due(&state, now_ms, interval_ms);
         let rotation_requested = state.status == "rotation_requested";
         info!(
             provider = %state.provider_name,
@@ -2565,7 +2601,7 @@ mod tests {
         enqueue_pending_secret_deletion, ensure_automatic_refresh_ready, get_refresh_state,
         list_all_refresh_states, list_refresh_states_for_provider, max_lifetime_seconds,
         new_refresh_state, next_refresh_at_ms, put_refresh_state, read_bounded_oauth_error_body,
-        refresh_has_expiration, refresh_material_scope, refresh_provider_credential,
+        refresh_due, refresh_has_expiration, refresh_material_scope, refresh_provider_credential,
         refresh_state_name, refresh_status_from_state, refresh_strategy_name, request_token,
         run_refresh_worker_tick, seconds_until_ms, set_refresh_expiration_presence,
         validate_secret_material_references,
@@ -2573,6 +2609,9 @@ mod tests {
     use crate::credentials::CredentialRuntime;
     use crate::persistence::{current_time_ms, test_store};
     use crate::storage_proto::StoredProviderCredentialRefreshStateV2 as StoredProviderCredentialRefreshState;
+
+    /// The production worker interval.
+    const WORKER_INTERVAL_MS: i64 = 60_000;
 
     fn proto_duration(seconds: i64) -> prost_types::Duration {
         prost_types::Duration { seconds, nanos: 0 }
@@ -3816,6 +3855,7 @@ mod tests {
                 None,
                 vec![sweep_snapshot],
                 current_time_ms(),
+                WORKER_INTERVAL_MS,
             )
             .await;
         });
@@ -4069,9 +4109,15 @@ mod tests {
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
 
-        Box::pin(run_refresh_worker_tick(&store, None, None))
-            .await
-            .unwrap();
+        Box::pin(run_refresh_worker_tick(
+            &store,
+            None,
+            None,
+            current_time_ms(),
+            WORKER_INTERVAL_MS,
+        ))
+        .await
+        .unwrap();
 
         let stored_state = get_refresh_state(
             &store,
@@ -4116,8 +4162,12 @@ mod tests {
                     .code(),
                 tonic::Code::Unavailable,
             );
+            // The worker agrees: a failure schedule is not-before, even when it
+            // falls before the next sweep.
+            assert!(!refresh_due(&state, now_ms, WORKER_INTERVAL_MS));
             state.next_refresh_at_ms = now_ms;
             ensure_automatic_refresh_ready(&state, now_ms).unwrap();
+            assert!(refresh_due(&state, now_ms, WORKER_INTERVAL_MS));
         }
         let state = StoredProviderCredentialRefreshState {
             recovery_action: ProviderCredentialRefreshRecoveryAction::Reauthorize as i32,
@@ -4132,11 +4182,231 @@ mod tests {
         );
         // A healthy credential's proactive schedule must not block an on-read
         // mint requested to meet a longer minimum remaining lifetime.
-        let state = StoredProviderCredentialRefreshState {
+        let mut state = StoredProviderCredentialRefreshState {
             next_refresh_at_ms: now_ms + 1,
             ..Default::default()
         };
         ensure_automatic_refresh_ready(&state, now_ms).unwrap();
+        // A healthy schedule is a deadline: due when it falls before the next
+        // sweep, not after it.
+        state.next_refresh_at_ms = now_ms + WORKER_INTERVAL_MS;
+        assert!(refresh_due(&state, now_ms, WORKER_INTERVAL_MS));
+        state.next_refresh_at_ms = now_ms + WORKER_INTERVAL_MS + 1;
+        assert!(!refresh_due(&state, now_ms, WORKER_INTERVAL_MS));
+        state.next_refresh_at_ms = 0;
+        assert!(refresh_due(&state, now_ms, WORKER_INTERVAL_MS));
+    }
+
+    fn client_credentials_refresh_state(
+        provider: &Provider,
+        token_url: String,
+        refresh_before_seconds: i64,
+        max_lifetime_seconds: i64,
+    ) -> StoredProviderCredentialRefreshState {
+        new_refresh_state(
+            provider,
+            "default",
+            "MS_GRAPH_ACCESS_TOKEN",
+            NewRefreshStateConfig {
+                additional_output_keys: HashMap::new(),
+                strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials,
+                material: HashMap::from([
+                    ("client_id".to_string(), "client-id".to_string()),
+                    ("client_secret".to_string(), "client-secret".to_string()),
+                ]),
+                secret_material_keys: vec!["client_secret".to_string()],
+                expires_at_ms: 0,
+                token_url,
+                scopes: vec!["https://graph.microsoft.com/.default".to_string()],
+                refresh_before: Some(proto_duration(refresh_before_seconds)),
+                max_lifetime: Some(proto_duration(max_lifetime_seconds)),
+            },
+        )
+        .unwrap()
+    }
+
+    async fn issuer_requests(server: &MockServer) -> usize {
+        server.received_requests().await.unwrap().len()
+    }
+
+    /// Regression: a mint completes shortly after the sweep that runs it
+    /// starts. When `max_lifetime - refresh_before` is an exact multiple of
+    /// the interval, the refresh deadline then falls just after a later sweep.
+    /// That sweep must refresh, not the next one at the credential's expiry.
+    #[tokio::test]
+    async fn refresh_worker_refreshes_before_a_deadline_that_falls_between_sweeps() {
+        use std::time::Duration;
+
+        const REFRESH_BEFORE_MS: i64 = 60_000;
+        const LIFETIME_MS: i64 = 300_000;
+        const MINT_DELAY_MS: i64 = 200;
+        assert_eq!((LIFETIME_MS - REFRESH_BEFORE_MS) % WORKER_INTERVAL_MS, 0);
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({
+                        "access_token": "minted-graph-token",
+                        "expires_in": LIFETIME_MS / 1000,
+                        "token_type": "Bearer"
+                    }))
+                    .set_delay(Duration::from_millis(MINT_DELAY_MS.unsigned_abs())),
+            )
+            .mount(&mock_server)
+            .await;
+        let store = test_store().await;
+        let provider = provider("deadline-refresh", "outlook");
+        store.put_message(&provider).await.unwrap();
+        let state = client_credentials_refresh_state(
+            &provider,
+            format!("{}/token", mock_server.uri()),
+            REFRESH_BEFORE_MS / 1000,
+            LIFETIME_MS / 1000,
+        );
+        put_refresh_state(&store, &state).await.unwrap();
+        let credentials = test_credentials();
+
+        let first_sweep_ms = current_time_ms();
+        Box::pin(run_refresh_worker_tick(
+            &store,
+            Some(&credentials),
+            None,
+            first_sweep_ms,
+            WORKER_INTERVAL_MS,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(issuer_requests(&mock_server).await, 1);
+        let minted = get_refresh_state(
+            &store,
+            "default",
+            provider.object_id(),
+            "MS_GRAPH_ACCESS_TOKEN",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(minted.status, "refreshed");
+        assert_eq!(
+            minted.expires_at_ms - minted.next_refresh_at_ms,
+            REFRESH_BEFORE_MS
+        );
+        assert!(
+            minted.expires_at_ms - first_sweep_ms >= LIFETIME_MS + MINT_DELAY_MS,
+            "the mint completes after its sweep starts"
+        );
+
+        let mut attempted_at_ms = None;
+        for sweep in 1..=LIFETIME_MS / WORKER_INTERVAL_MS {
+            let sweep_ms = first_sweep_ms + sweep * WORKER_INTERVAL_MS;
+            Box::pin(run_refresh_worker_tick(
+                &store,
+                Some(&credentials),
+                None,
+                sweep_ms,
+                WORKER_INTERVAL_MS,
+            ))
+            .await
+            .unwrap();
+            if issuer_requests(&mock_server).await > 1 {
+                attempted_at_ms = Some(sweep_ms);
+                break;
+            }
+        }
+        let lead_ms = minted.expires_at_ms
+            - attempted_at_ms.expect("the worker attempts a refresh before expiry");
+        assert!(
+            lead_ms >= REFRESH_BEFORE_MS,
+            "refresh attempted {lead_ms} ms before expiry, less than refresh_before"
+        );
+        assert!(
+            lead_ms <= REFRESH_BEFORE_MS + WORKER_INTERVAL_MS,
+            "refresh attempted {lead_ms} ms before expiry, more than refresh_before plus one interval"
+        );
+    }
+
+    /// A failure schedule is a not-before time. The wall clock is already past
+    /// it, so only the sweep's own due decision prevents an early retry.
+    #[tokio::test]
+    async fn refresh_worker_does_not_retry_before_the_backoff_not_before_time() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "minted-graph-token",
+                "expires_in": 300,
+                "token_type": "Bearer"
+            })))
+            .mount(&mock_server)
+            .await;
+        let store = test_store().await;
+        let provider = provider("backoff-refresh", "outlook");
+        store.put_message(&provider).await.unwrap();
+        let mut state = client_credentials_refresh_state(
+            &provider,
+            format!("{}/token", mock_server.uri()),
+            60,
+            300,
+        );
+        let not_before_ms = current_time_ms();
+        state.status = "error".to_string();
+        state.last_error = "temporary issuer outage".to_string();
+        state.recovery_action = ProviderCredentialRefreshRecoveryAction::Retry as i32;
+        state.failure_code = "refresh_failed".to_string();
+        state.last_error_at_ms = not_before_ms - super::REFRESH_ERROR_RETRY_SECONDS * 1000;
+        state.next_refresh_at_ms = not_before_ms;
+        put_refresh_state(&store, &state).await.unwrap();
+        let credentials = test_credentials();
+
+        // This sweep's next sweep would start after the not-before time.
+        Box::pin(run_refresh_worker_tick(
+            &store,
+            Some(&credentials),
+            None,
+            not_before_ms - WORKER_INTERVAL_MS / 2,
+            WORKER_INTERVAL_MS,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(issuer_requests(&mock_server).await, 0);
+        let waiting = get_refresh_state(
+            &store,
+            "default",
+            provider.object_id(),
+            "MS_GRAPH_ACCESS_TOKEN",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(waiting.status, "error");
+        assert_eq!(waiting.next_refresh_at_ms, not_before_ms);
+        assert_eq!(
+            waiting.recovery_action,
+            ProviderCredentialRefreshRecoveryAction::Retry as i32
+        );
+
+        Box::pin(run_refresh_worker_tick(
+            &store,
+            Some(&credentials),
+            None,
+            not_before_ms,
+            WORKER_INTERVAL_MS,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(issuer_requests(&mock_server).await, 1);
+        let retried = get_refresh_state(
+            &store,
+            "default",
+            provider.object_id(),
+            "MS_GRAPH_ACCESS_TOKEN",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(retried.status, "refreshed");
     }
 
     #[tokio::test]
@@ -4173,6 +4443,8 @@ mod tests {
             &store,
             Some(&test_credentials()),
             None,
+            current_time_ms(),
+            WORKER_INTERVAL_MS,
         ))
         .await
         .unwrap();
@@ -4234,9 +4506,15 @@ mod tests {
         put_refresh_state(&store, &state).await.unwrap();
         assert_eq!(credentials.stored_credential_count(), Some(1));
 
-        let changed = Box::pin(run_refresh_worker_tick(&store, Some(&credentials), None))
-            .await
-            .unwrap();
+        let changed = Box::pin(run_refresh_worker_tick(
+            &store,
+            Some(&credentials),
+            None,
+            current_time_ms(),
+            WORKER_INTERVAL_MS,
+        ))
+        .await
+        .unwrap();
 
         assert_eq!(
             changed,
@@ -4267,9 +4545,15 @@ mod tests {
         let store = test_store().await;
 
         let traced = test_exporter::install_traced();
-        Box::pin(run_refresh_worker_tick(&store, None, None))
-            .await
-            .unwrap();
+        Box::pin(run_refresh_worker_tick(
+            &store,
+            None,
+            None,
+            current_time_ms(),
+            WORKER_INTERVAL_MS,
+        ))
+        .await
+        .unwrap();
         assert!(
             traced
                 .spans_named("refresh.provider_credentials")
@@ -4298,9 +4582,15 @@ mod tests {
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
 
-        Box::pin(run_refresh_worker_tick(&store, None, None))
-            .await
-            .unwrap();
+        Box::pin(run_refresh_worker_tick(
+            &store,
+            None,
+            None,
+            current_time_ms(),
+            WORKER_INTERVAL_MS,
+        ))
+        .await
+        .unwrap();
         test_exporter::assert_is_root(&traced.wait_for_span("refresh.provider_credentials").await);
     }
 
