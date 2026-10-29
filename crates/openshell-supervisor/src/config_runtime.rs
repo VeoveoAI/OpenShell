@@ -763,9 +763,9 @@ impl ConfigRuntime {
         self.settings = result.settings;
     }
 
-    /// Fetch and prepare the provider environment a polled snapshot requests. A
-    /// later revision of the same attachment and policy serves the request: the
-    /// gateway refreshed a credential after the poll.
+    /// Fetch and prepare the provider environment a polled snapshot requests. Any
+    /// revision of the same attachment and policy serves the request: the gateway
+    /// may refresh a credential after the poll.
     async fn fetch_provider_environment<C: PolicyGatewayClient>(
         &self,
         ctx: &PolicyPollLoopContext,
@@ -851,7 +851,11 @@ impl ConfigRuntime {
             .severity(SeverityId::High)
             .status(StatusId::Failure)
             .state(StateId::Disabled, "fail_closed")
-            .message("Provider environment refresh failed; static credentials were revoked and previous dynamic grants remain active")
+            .unmapped("reason", serde_json::json!(reason.as_str_name()))
+            .message(format!(
+                "Provider environment refresh failed; static credentials were revoked and previous dynamic grants remain active [reason:{}]",
+                reason.as_str_name()
+            ))
             .build());
         ctx.provider_credentials
             .revoke_static_provider_environment(revision);
@@ -2390,32 +2394,29 @@ mod tests {
         let generation = delivery.engine.current_generation();
         let tunnel = delivery.pin();
 
-        // The poll names revision 2; another refresh made revision 3 before the fetch.
+        // The poll names revision 3; another refresh made revision 2 before the fetch.
+        // Revisions are opaque: the later one may be the smaller number.
         let outcome = delivery
-            .fetch(2, stable_provider_environment(3, Some("third")))
+            .fetch(3, stable_provider_environment(2, Some("second")))
             .await;
         assert!(matches!(outcome, ReconcileOutcome::Applied));
         assert_eq!(delivery.engine.current_generation(), generation);
         assert!(!tunnel.is_stale(), "open relays stay open");
-        assert_eq!(delivery.resolved().as_deref(), Some("third"));
-        // The poll that names revision 3 finds it installed and fetches nothing.
+        assert_eq!(delivery.resolved().as_deref(), Some("second"));
+        // The poll that names revision 2 finds it installed and fetches nothing.
         let outcome = delivery
-            .fetch(3, stable_provider_environment(4, None))
+            .fetch(2, stable_provider_environment(4, None))
             .await;
         assert!(matches!(outcome, ReconcileOutcome::Unchanged));
-        assert_eq!(delivery.resolved().as_deref(), Some("third"));
+        assert_eq!(delivery.resolved().as_deref(), Some("second"));
 
-        // An earlier revision, or one of another policy or attachment, does not serve
-        // the request: static credentials are revoked until the next poll.
+        // One of another policy or attachment does not serve the request: static
+        // credentials are revoked until the next poll.
         let mut other_policy = stable_provider_environment(5, Some("other"));
         other_policy.policy_hash = "hash-v2".into();
         let mut other_attachment = stable_provider_environment(5, Some("other"));
         other_attachment.provider_attachment_epoch = "epoch-2".into();
-        for environment in [
-            stable_provider_environment(3, Some("third")),
-            other_policy,
-            other_attachment,
-        ] {
+        for environment in [other_policy, other_attachment] {
             let mut delivery = Delivery::start(stable_provider_environment(1, Some("first"))).await;
             let outcome = delivery.fetch(4, environment).await;
             assert!(matches!(outcome, ReconcileOutcome::Rejected(_)));

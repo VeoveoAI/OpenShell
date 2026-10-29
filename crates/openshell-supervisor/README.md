@@ -118,10 +118,11 @@ Lore token refresh every 4 to 5 minutes closed every L7 tunnel in a Computer.
 
 A settings poll and the fetch of the environment it names are separate calls, and
 the gateway may refresh another credential between them. The fetched environment
-is then a later revision of the same attachment and policy, and it installs in
-place as that refresh would. Any other environment than the one requested revokes
-static credentials until the next poll. Before this, a refresh between the two
-revoked them for a poll interval and closed every relay once they returned.
+is then another revision of the same attachment and policy, and it installs as
+that refresh would. Revisions are opaque, so any revision serves. An environment of
+another attachment or policy revokes static credentials until the next poll, and
+the revocation logs its reason. Before this, a refresh between the two revoked them
+for a poll interval and closed every relay once they returned.
 
 ## Portable supervisor access
 
