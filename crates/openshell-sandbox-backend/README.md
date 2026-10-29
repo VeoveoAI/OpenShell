@@ -35,6 +35,16 @@ Missing bindings, repeated bindings, and frames that do not match the operation
 or direction are rejected. There is no nested JSON or length/channel framing on
 the wire. Private in-process adapters retain the Rust byte-stream interfaces.
 
+Every exchange, relay and mediation session shares one HTTP/2 connection of up to
+1024 concurrent streams. The sandbox's outbound TCP connections and their pending
+accepts have 96 of them, and connections into the sandbox's own ports, such as the
+gateway's relays to a service it exposes, have 896. Each kind waits for a stream of
+its own, so neither takes the other's or the remainder that exec and control
+exchanges keep. Before this, connections into the sandbox had no budget of their own
+within 128 streams, of which pending accepts and outbound connections held most: a
+sandbox serving long-lived requests took about 60, and the next waited unannounced
+until the gateway gave up on it.
+
 Opening a boundary only validates and reserves a route. It neither attaches a
 supervisor nor runs workload code. Policy discovery is followed by the existing
 attach, mediation setup, confirm, and explicit start sequence. The existing

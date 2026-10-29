@@ -122,6 +122,30 @@ async fn saturate(channel: tonic::transport::Channel) -> tokio::sync::mpsc::Send
     sender
 }
 
+/// Open one stream that the peer holds, as a long-lived connection into the
+/// sandbox holds its stream, and return once the peer has accepted it.
+async fn hold(
+    channel: tonic::transport::Channel,
+) -> (
+    tokio::sync::mpsc::Sender<ExchangeFrame>,
+    tonic::Streaming<ExchangeFrame>,
+) {
+    let (sender, receiver) = tokio::sync::mpsc::channel(1);
+    sender
+        .send(exchange_frame(TEST_BOUNDARY_HANDLE))
+        .await
+        .unwrap();
+    let mut request = tonic::Request::new(ReceiverStream::new(receiver));
+    request
+        .metadata_mut()
+        .insert("x-stall", "1".parse().unwrap());
+    let response = SandboxProtocolClient::new(channel)
+        .exchange(request)
+        .await
+        .unwrap();
+    (sender, response.into_inner())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stalled_relays_cannot_starve_other_streams() {
     let channel = start_boundary(StallingPeer {
@@ -137,30 +161,7 @@ async fn stalled_relays_cannot_starve_other_streams() {
         stalled.push(sender.unwrap());
     }
 
-    let auth: tonic::metadata::AsciiMetadataValue = "Bearer test".parse().unwrap();
-    let exchange = async {
-        let mut stream = open_grpc_client_stream_with_authorization(
-            channel,
-            GrpcStreamKind::Exchange,
-            auth,
-            TEST_BOUNDARY_HANDLE,
-        )
-        .await
-        .unwrap();
-        let request = RequestEnvelope::new(Request::Wait {
-            process_id: "main".into(),
-        })
-        .unwrap();
-        stream
-            .write_all(&encode_frame(&request).unwrap())
-            .await
-            .unwrap();
-        crate::boundary_protocol::read_frame_async::<_, ResponseEnvelope>(&mut stream)
-            .await
-            .unwrap()
-            .response
-    };
-    let pong = tokio::time::timeout(Duration::from_secs(3), exchange)
+    let pong = tokio::time::timeout(Duration::from_secs(3), exchange(channel))
         .await
         .expect("stalled relay streams must not exhaust connection-level credit");
     assert!(matches!(
@@ -170,4 +171,63 @@ async fn stalled_relays_cannot_starve_other_streams() {
         }
     ));
     drop(stalled);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_budgeted_stream_opens_and_exchanges_still_answer() {
+    let channel = start_boundary(StallingPeer {
+        stalled: Arc::default(),
+    })
+    .await;
+    // Every network and loopback stream at once, as pending accepts, connections
+    // out of the sandbox and long-lived connections into it hold them.
+    let held = tokio::time::timeout(Duration::from_secs(30), async {
+        let mut opening = tokio::task::JoinSet::new();
+        for _ in 0..MAX_NETWORK_STREAMS + MAX_LOOPBACK_STREAMS {
+            opening.spawn(hold(channel.clone()));
+        }
+        let mut held = Vec::new();
+        while let Some(stream) = opening.join_next().await {
+            held.push(stream.unwrap());
+        }
+        held
+    })
+    .await
+    .expect("the boundary connection must admit every budgeted stream");
+
+    let pong = tokio::time::timeout(Duration::from_secs(3), exchange(channel))
+        .await
+        .expect("exec and control exchanges keep streams of their own");
+    assert!(matches!(
+        pong,
+        Response::Exited {
+            status: ExitStatusWire::Exited(23)
+        }
+    ));
+    drop(held);
+}
+
+/// One control exchange, which the peer answers.
+async fn exchange(channel: tonic::transport::Channel) -> Response {
+    let auth: tonic::metadata::AsciiMetadataValue = "Bearer test".parse().unwrap();
+    let mut stream = open_grpc_client_stream_with_authorization(
+        channel,
+        GrpcStreamKind::Exchange,
+        auth,
+        TEST_BOUNDARY_HANDLE,
+    )
+    .await
+    .unwrap();
+    let request = RequestEnvelope::new(Request::Wait {
+        process_id: "main".into(),
+    })
+    .unwrap();
+    stream
+        .write_all(&encode_frame(&request).unwrap())
+        .await
+        .unwrap();
+    crate::boundary_protocol::read_frame_async::<_, ResponseEnvelope>(&mut stream)
+        .await
+        .unwrap()
+        .response
 }

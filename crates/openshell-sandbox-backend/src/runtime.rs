@@ -57,13 +57,20 @@ const ROUTED_FIRST_CONNECT_TIMEOUT: Duration = Duration::from_mins(5);
 /// Bounds the liveness check that decides whether a stream failure lost the
 /// whole connection.
 const CONNECTION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-/// Relay and pending-accept streams share the boundary's concurrent stream
-/// limit with exec and control exchanges; leave the remainder for those.
+/// Relay and pending-accept streams of the sandbox's outbound TCP connections.
 const MAX_NETWORK_STREAMS: usize = 96;
+/// Connections into the sandbox's own ports, such as the gateway's relays of
+/// requests to a service the sandbox exposes, each holding a stream for its
+/// whole life.
+const MAX_LOOPBACK_STREAMS: usize = 896;
+// Each kind has its own budget within the boundary's concurrent stream limit,
+// so neither takes the other's streams or the remainder exec and control
+// exchanges keep.
 const _: () = assert!(
-    MAX_NETWORK_STREAMS < crate::boundary_protocol::BOUNDARY_MAX_CONCURRENT_STREAMS as usize
+    MAX_NETWORK_STREAMS + MAX_LOOPBACK_STREAMS
+        < crate::boundary_protocol::BOUNDARY_MAX_CONCURRENT_STREAMS as usize
 );
-const NETWORK_STREAM_WAIT_WARNING: Duration = Duration::from_secs(5);
+const STREAM_WAIT_WARNING: Duration = Duration::from_secs(5);
 
 fn begin_recovery_window(
     deadline: &mut Option<tokio::time::Instant>,
@@ -839,6 +846,8 @@ impl BoundaryLoopbackConnector {
         &self,
         target: LoopbackTarget,
     ) -> Result<BoundaryDuplexStream, BackendError> {
+        // The connection holds its stream until it closes.
+        let permit = self.client.loopback_streams.acquire().await;
         let (stream, response) = self
             .client
             .call_stream(Request::LoopbackConnect {
@@ -847,9 +856,89 @@ impl BoundaryLoopbackConnector {
             })
             .await?;
         match response {
-            Response::LoopbackConnected => Ok(stream),
+            Response::LoopbackConnected => Ok(Box::new(BudgetedStream {
+                inner: stream,
+                _permit: permit,
+            })),
             response => Err(unexpected_response("loopback_connected", &response)),
         }
+    }
+}
+
+/// One kind of connection's share of the boundary connection's streams. A
+/// connection of that kind waits for a stream while none is free.
+struct StreamBudget {
+    streams: Arc<tokio::sync::Semaphore>,
+    limit: usize,
+    exhausted: AtomicBool,
+    warning: &'static str,
+}
+
+impl StreamBudget {
+    fn new(limit: usize, warning: &'static str) -> Self {
+        Self {
+            streams: Arc::new(tokio::sync::Semaphore::new(limit)),
+            limit,
+            exhausted: AtomicBool::new(false),
+            warning,
+        }
+    }
+
+    async fn acquire(&self) -> tokio::sync::OwnedSemaphorePermit {
+        let acquire = self.streams.clone().acquire_owned();
+        tokio::pin!(acquire);
+        // Bursty clients briefly exceed the budget; only report sustained waits.
+        let permit =
+            if let Ok(permit) = tokio::time::timeout(STREAM_WAIT_WARNING, &mut acquire).await {
+                self.exhausted.store(false, Ordering::Relaxed);
+                permit
+            } else {
+                if !self.exhausted.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(limit = self.limit, "{}", self.warning);
+                }
+                acquire.await
+            };
+        permit.expect("stream budget semaphore is never closed")
+    }
+}
+
+/// A boundary stream that holds its budget's permit until it closes.
+struct BudgetedStream {
+    inner: BoundaryDuplexStream,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl tokio::io::AsyncRead for BudgetedStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(context, buffer)
+    }
+}
+
+impl tokio::io::AsyncWrite for BudgetedStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        buffer: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(context, buffer)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(context)
     }
 }
 
@@ -964,7 +1053,7 @@ impl NetworkMediationSource {
         // a source error, which permanently stops the proxy. The boundary drops
         // the interrupted pending open; a retry never replays its decision.
         // Pending accepts and live relays each hold a stream until the relay ends.
-        let permit = self.client.acquire_network_stream().await;
+        let permit = self.client.network_streams.acquire().await;
         let (stream, response) = self.client.call_wait_stream(Request::AcceptNetwork).await?;
         let Response::NetworkConnected {
             identity,
@@ -1195,8 +1284,8 @@ struct BoundaryClient {
     reconnect: tokio::sync::Mutex<()>,
     next_connection_generation: AtomicU64,
     credential_monitor_started: AtomicBool,
-    network_streams: Arc<tokio::sync::Semaphore>,
-    network_streams_exhausted: AtomicBool,
+    network_streams: StreamBudget,
+    loopback_streams: StreamBudget,
 }
 
 #[derive(Clone)]
@@ -1388,31 +1477,15 @@ impl BoundaryClient {
             reconnect: tokio::sync::Mutex::new(()),
             next_connection_generation: AtomicU64::new(1),
             credential_monitor_started: AtomicBool::new(false),
-            network_streams: Arc::new(tokio::sync::Semaphore::new(MAX_NETWORK_STREAMS)),
-            network_streams_exhausted: AtomicBool::new(false),
+            network_streams: StreamBudget::new(
+                MAX_NETWORK_STREAMS,
+                "Sandbox network relay streams exhausted; new sandbox TCP connections are waiting for a relay to close",
+            ),
+            loopback_streams: StreamBudget::new(
+                MAX_LOOPBACK_STREAMS,
+                "Sandbox loopback streams exhausted; new connections into the sandbox are waiting for one to close",
+            ),
         }
-    }
-
-    async fn acquire_network_stream(&self) -> tokio::sync::OwnedSemaphorePermit {
-        let acquire = self.network_streams.clone().acquire_owned();
-        tokio::pin!(acquire);
-        // Bursty clients briefly exceed the budget; only report sustained waits.
-        let permit = if let Ok(permit) =
-            tokio::time::timeout(NETWORK_STREAM_WAIT_WARNING, &mut acquire).await
-        {
-            self.network_streams_exhausted
-                .store(false, Ordering::Relaxed);
-            permit
-        } else {
-            if !self.network_streams_exhausted.swap(true, Ordering::Relaxed) {
-                tracing::warn!(
-                    limit = MAX_NETWORK_STREAMS,
-                    "Sandbox network relay streams exhausted; new sandbox TCP connections are waiting for a relay to close"
-                );
-            }
-            acquire.await
-        };
-        permit.expect("network stream semaphore is never closed")
     }
 
     async fn call_idempotent(&self, request: Request) -> Result<Response, BackendError> {

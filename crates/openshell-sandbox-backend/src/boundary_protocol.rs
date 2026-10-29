@@ -48,7 +48,7 @@ pub const MAX_STREAM_FRAME_BYTES: usize = 64 * 1024;
 // stalled relays starve DNS and control traffic of connection-level credit.
 // h2 keeps at least two thirds of `connection - in-flight` advertised, so the
 // reserve stays usable even with every stream stalled at its window.
-pub const BOUNDARY_MAX_CONCURRENT_STREAMS: u32 = 128;
+pub const BOUNDARY_MAX_CONCURRENT_STREAMS: u32 = 1024;
 pub const BOUNDARY_STREAM_WINDOW_BYTES: u32 = 256 * 1024;
 pub const BOUNDARY_CONNECTION_WINDOW_RESERVE_BYTES: u32 = 16 * 1024 * 1024;
 pub const BOUNDARY_CONNECTION_WINDOW_BYTES: u32 = BOUNDARY_MAX_CONCURRENT_STREAMS
