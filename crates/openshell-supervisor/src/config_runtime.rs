@@ -681,7 +681,11 @@ impl ConfigRuntime {
             *self.installed_bindings() = Some(prepared.bindings.clone());
         }
         if provider_env_changed || policy_runtime_reconciled {
-            self.provider_env_revision = result.provider_env_revision;
+            self.provider_env_revision = prepared_provider
+                .as_ref()
+                .map_or(result.provider_env_revision, |prepared| {
+                    prepared.identity.revision
+                });
         }
 
         if let Some(version) = unchanged_policy_revision_ready_to_ack(
@@ -759,7 +763,9 @@ impl ConfigRuntime {
         self.settings = result.settings;
     }
 
-    /// Fetch and prepare the provider environment a polled snapshot requests.
+    /// Fetch and prepare the provider environment a polled snapshot requests. A
+    /// later revision of the same attachment and policy serves the request: the
+    /// gateway refreshed a credential after the poll.
     async fn fetch_provider_environment<C: PolicyGatewayClient>(
         &self,
         ctx: &PolicyPollLoopContext,
@@ -780,7 +786,7 @@ impl ConfigRuntime {
             .await
         {
             Ok(provider)
-                if EnvironmentIdentity::from_environment(&provider) == *desired_identity
+                if EnvironmentIdentity::from_environment(&provider).serves(desired_identity)
                     && provider_environment_is_installable(provider.readiness_reason) =>
             {
                 provider
@@ -2132,6 +2138,47 @@ mod tests {
         }
     }
 
+    /// A gateway whose provider fetch answers `environment`, whatever the poll named.
+    #[derive(Clone)]
+    struct FetchedProviderGateway {
+        policy: ScriptedPolicyGateway,
+        environment: openshell_core::grpc_client::ProviderEnvironmentResult,
+    }
+
+    impl PolicyGatewayClient for FetchedProviderGateway {
+        async fn poll_settings(
+            &self,
+            sandbox: &str,
+        ) -> Result<openshell_core::grpc_client::SettingsPollResult> {
+            self.policy.poll_settings(sandbox).await
+        }
+
+        async fn report_policy_status(
+            &self,
+            sandbox_id: &str,
+            version: u32,
+            loaded: bool,
+            error: &str,
+        ) -> Result<()> {
+            self.policy
+                .report_policy_status(sandbox_id, version, loaded, error)
+                .await
+        }
+
+        async fn fetch_provider_environment(
+            &self,
+            _gateway: &openshell_core::grpc_client::GatewayEndpoint,
+            _sandbox_id: &str,
+            _requires_stable_placeholders: bool,
+        ) -> Result<openshell_core::grpc_client::ProviderEnvironmentResult> {
+            Ok(self.environment.clone())
+        }
+
+        fn workspace(&self) -> String {
+            self.policy.workspace()
+        }
+    }
+
     // ---- Provider credential refresh and policy generations ----
 
     /// A gateway-policy sandbox reconciling session-delivered snapshots, as
@@ -2229,6 +2276,29 @@ mod tests {
             self.runtime.commit(self.settings.clone());
         }
 
+        /// Reconcile a poll that names `revision` while the gateway's fetch answers
+        /// `environment`.
+        async fn fetch(
+            &mut self,
+            revision: u64,
+            environment: openshell_core::grpc_client::ProviderEnvironmentResult,
+        ) -> ReconcileOutcome {
+            self.settings.provider_env_revision = revision;
+            let client = FetchedProviderGateway {
+                policy: self.client.clone(),
+                environment,
+            };
+            let reconciled = self
+                .runtime
+                .reconcile(&self.ctx, &client, &self.settings, ProviderSource::Fetch)
+                .await
+                .unwrap();
+            if matches!(reconciled.outcome, ReconcileOutcome::Applied) {
+                self.runtime.commit(self.settings.clone());
+            }
+            reconciled.outcome
+        }
+
         /// A relay pinned to the current generation, as an open tunnel or an
         /// in-flight response stream holds; relays close once it is stale.
         fn pin(&self) -> PolicyGenerationGuard {
@@ -2299,6 +2369,44 @@ mod tests {
             .await;
         assert!(!tunnel.is_stale());
         assert_eq!(delivery.resolved().as_deref(), Some("second"));
+    }
+
+    #[tokio::test]
+    async fn a_refresh_between_the_poll_and_the_fetch_installs_in_place() {
+        let mut delivery = Delivery::start(stable_provider_environment(1, Some("first"))).await;
+        let generation = delivery.engine.current_generation();
+        let tunnel = delivery.pin();
+
+        // The poll names revision 2; another refresh made revision 3 before the fetch.
+        let outcome = delivery
+            .fetch(2, stable_provider_environment(3, Some("third")))
+            .await;
+        assert!(matches!(outcome, ReconcileOutcome::Applied));
+        assert_eq!(delivery.engine.current_generation(), generation);
+        assert!(!tunnel.is_stale(), "open relays stay open");
+        assert_eq!(delivery.resolved().as_deref(), Some("third"));
+        // The poll that names revision 3 finds it installed and fetches nothing.
+        let outcome = delivery.fetch(3, stable_provider_environment(4, None)).await;
+        assert!(matches!(outcome, ReconcileOutcome::Unchanged));
+        assert_eq!(delivery.resolved().as_deref(), Some("third"));
+
+        // An earlier revision, or one of another policy or attachment, does not serve
+        // the request: static credentials are revoked until the next poll.
+        let mut other_policy = stable_provider_environment(5, Some("other"));
+        other_policy.policy_hash = "hash-v2".into();
+        let mut other_attachment = stable_provider_environment(5, Some("other"));
+        other_attachment.provider_attachment_epoch = "epoch-2".into();
+        for environment in [
+            stable_provider_environment(3, Some("third")),
+            other_policy,
+            other_attachment,
+        ] {
+            let mut delivery =
+                Delivery::start(stable_provider_environment(1, Some("first"))).await;
+            let outcome = delivery.fetch(4, environment).await;
+            assert!(matches!(outcome, ReconcileOutcome::Rejected(_)));
+            assert_eq!(delivery.resolved(), None);
+        }
     }
 
     #[tokio::test]

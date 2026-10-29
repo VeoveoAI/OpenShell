@@ -50,6 +50,15 @@ impl EnvironmentIdentity {
             policy_hash: result.policy_hash.clone(),
         }
     }
+
+    /// Whether an environment with this identity serves a request for `requested`:
+    /// the same environment, or a later revision of the same attachment and policy,
+    /// which a credential refresh between the poll and the fetch produces.
+    pub(crate) fn serves(&self, requested: &Self) -> bool {
+        self.attachment_epoch == requested.attachment_epoch
+            && self.policy_hash == requested.policy_hash
+            && self.revision >= requested.revision
+    }
 }
 
 #[derive(Clone, Debug)]
