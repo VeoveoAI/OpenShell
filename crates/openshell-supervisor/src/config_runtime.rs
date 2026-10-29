@@ -2138,11 +2138,13 @@ mod tests {
         }
     }
 
-    /// A gateway whose provider fetch answers `environment`, whatever the poll named.
+    /// A gateway whose one provider fetch answers `environment`, whatever the poll
+    /// named.
     #[derive(Clone)]
     struct FetchedProviderGateway {
         policy: ScriptedPolicyGateway,
-        environment: openshell_core::grpc_client::ProviderEnvironmentResult,
+        environment:
+            Arc<std::sync::Mutex<Option<openshell_core::grpc_client::ProviderEnvironmentResult>>>,
     }
 
     impl PolicyGatewayClient for FetchedProviderGateway {
@@ -2171,7 +2173,11 @@ mod tests {
             _sandbox_id: &str,
             _requires_stable_placeholders: bool,
         ) -> Result<openshell_core::grpc_client::ProviderEnvironmentResult> {
-            Ok(self.environment.clone())
+            self.environment
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or_else(|| miette::miette!("the provider environment was fetched twice"))
         }
 
         fn workspace(&self) -> String {
@@ -2286,7 +2292,7 @@ mod tests {
             self.settings.provider_env_revision = revision;
             let client = FetchedProviderGateway {
                 policy: self.client.clone(),
-                environment,
+                environment: Arc::new(std::sync::Mutex::new(Some(environment))),
             };
             let reconciled = self
                 .runtime
