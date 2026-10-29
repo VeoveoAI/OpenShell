@@ -672,7 +672,7 @@ impl ConfigRuntime {
             );
             if reloads_gateway_policy {
                 info!(
-                    provider_env_revision = result.provider_env_revision,
+                    provider_env_revision = prepared.identity.revision,
                     "Provider credential values refreshed in place; the policy generation is retained"
                 );
             }
@@ -789,6 +789,13 @@ impl ConfigRuntime {
                 if EnvironmentIdentity::from_environment(&provider).serves(desired_identity)
                     && provider_environment_is_installable(provider.readiness_reason) =>
             {
+                if provider.provider_env_revision != desired_identity.revision {
+                    info!(
+                        requested_revision = desired_identity.revision,
+                        provider_env_revision = provider.provider_env_revision,
+                        "Provider environment was refreshed again during preparation; the later revision serves the request"
+                    );
+                }
                 provider
             }
             failed => {
