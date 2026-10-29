@@ -2386,7 +2386,9 @@ mod tests {
         assert!(!tunnel.is_stale(), "open relays stay open");
         assert_eq!(delivery.resolved().as_deref(), Some("third"));
         // The poll that names revision 3 finds it installed and fetches nothing.
-        let outcome = delivery.fetch(3, stable_provider_environment(4, None)).await;
+        let outcome = delivery
+            .fetch(3, stable_provider_environment(4, None))
+            .await;
         assert!(matches!(outcome, ReconcileOutcome::Unchanged));
         assert_eq!(delivery.resolved().as_deref(), Some("third"));
 
@@ -2401,8 +2403,7 @@ mod tests {
             other_policy,
             other_attachment,
         ] {
-            let mut delivery =
-                Delivery::start(stable_provider_environment(1, Some("first"))).await;
+            let mut delivery = Delivery::start(stable_provider_environment(1, Some("first"))).await;
             let outcome = delivery.fetch(4, environment).await;
             assert!(matches!(outcome, ReconcileOutcome::Rejected(_)));
             assert_eq!(delivery.resolved(), None);
