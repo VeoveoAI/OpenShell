@@ -1309,6 +1309,8 @@ impl KubernetesComputeDriver {
             supports_sandbox_authentication: true,
             driver_reports_runtime_readiness: false,
             supports_workspace_keep: true,
+            supervisor_image: self.config.supervisor_image.clone(),
+            sandbox_runtime_image: self.config.sandbox_runtime_image.clone(),
             resource_capabilities: Some(ResourceCapabilities {
                 cpu: Some(CpuResourceCapabilities {
                     limit_supported: true,
@@ -15909,6 +15911,20 @@ mod tests {
         let gpu = resources.gpu.unwrap();
         assert!(gpu.default_selection_supported);
         assert!(gpu.count_selection_supported);
+    }
+
+    #[tokio::test]
+    async fn capabilities_report_the_trusted_images_every_sandbox_runs() {
+        let supervisor = "registry.example.com/openshell/supervisor@sha256:aa";
+        let runtime = "registry.example.com/openshell/sandbox@sha256:bb";
+        let driver = KubernetesComputeDriver::new_for_test(KubernetesComputeConfig {
+            supervisor_image: supervisor.to_string(),
+            sandbox_runtime_image: runtime.to_string(),
+            ..KubernetesComputeConfig::default()
+        });
+        let capabilities = driver.capabilities().unwrap();
+        assert_eq!(capabilities.supervisor_image, supervisor);
+        assert_eq!(capabilities.sandbox_runtime_image, runtime);
     }
 
     #[test]

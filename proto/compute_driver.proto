@@ -111,6 +111,12 @@ message GetCapabilitiesResponse {
   // Whether DeleteSandbox can keep the sandbox's workspace volume for the next
   // sandbox of the same name in the same workspace.
   bool supports_workspace_keep = 14;
+  // Supervisor image, from the driver's trusted configuration, that every new
+  // sandbox runs. Empty when the driver does not report one.
+  string supervisor_image = 15;
+  // Sandbox runtime image, from the driver's trusted configuration, that every
+  // new sandbox runs. Empty when the driver does not report one.
+  string sandbox_runtime_image = 16;
 }
 
 message AuthenticateSandboxRequest {

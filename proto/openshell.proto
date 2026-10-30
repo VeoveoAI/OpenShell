@@ -996,6 +996,15 @@ message ComputeDriverCapabilities {
 
   // Static portable resource request forms reported by the driver.
   ResourceCapabilities resource_capabilities = 3;
+
+  // Supervisor image every new sandbox runs, as the driver reports it. A client
+  // compares it to learn whether a running sandbox predates a supervisor change.
+  // Empty when the driver does not report one.
+  string supervisor_image = 4;
+
+  // Sandbox runtime image every new sandbox runs, as the driver reports it.
+  // Empty when the driver does not report one.
+  string sandbox_runtime_image = 5;
 }
 
 // Static portable resource request forms reported by a compute driver.

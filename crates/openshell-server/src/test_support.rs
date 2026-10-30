@@ -164,6 +164,8 @@ impl FakeComputeDriver {
                     supports_sandbox_authentication: false,
                     driver_reports_runtime_readiness: false,
                     supports_workspace_keep: false,
+                    supervisor_image: String::new(),
+                    sandbox_runtime_image: String::new(),
                     resource_capabilities: None,
                     rootfs_tar_staging_dir: String::new(),
                     rootfs_tar_max_bytes: 0,

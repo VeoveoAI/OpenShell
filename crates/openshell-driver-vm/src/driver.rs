@@ -1127,6 +1127,8 @@ impl VmDriver {
             supports_sandbox_authentication: false,
             driver_reports_runtime_readiness: false,
             supports_workspace_keep: false,
+            supervisor_image: String::new(),
+            sandbox_runtime_image: String::new(),
             resource_capabilities: Some(ResourceCapabilities {
                 cpu: Some(CpuResourceCapabilities {
                     limit_supported: false,

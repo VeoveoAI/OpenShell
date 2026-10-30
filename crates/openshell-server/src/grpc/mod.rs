@@ -302,6 +302,8 @@ impl OpenShell for OpenShellService {
                         .resource_capabilities
                         .as_ref()
                         .map(|resources| public_resource_capabilities(*resources)),
+                    supervisor_image: driver.supervisor_image.clone(),
+                    sandbox_runtime_image: driver.sandbox_runtime_image.clone(),
                 }),
             })
             .collect();

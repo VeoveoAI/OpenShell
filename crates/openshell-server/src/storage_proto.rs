@@ -162,8 +162,10 @@ mod tests {
     // SandboxStatus.last_activity_time is a gateway-owned durable timestamp.
     // Older rows decode it absent, which reads as no recorded activity, and
     // the next activity report records it without a rewrite.
+    // ComputeDriverCapabilities.supervisor_image and sandbox_runtime_image are
+    // public only: GetGatewayInfo reports them, and no row stores them.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "3964d427305044c9008e76f60c9ff55c177e5dfd0a0f4bf7299dbe60903fe97c";
+        "07a00f5225fbec97027af5b8e353afa5403be6bb34c7926ae161546d25aea272";
     const DURABLE_SCHEMA_SHA256: &str =
         "f8265f291bf9317a373f2c01ef45c9e6222805451d5d256a2b90e582fa7dc5bf";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
