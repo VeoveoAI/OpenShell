@@ -421,8 +421,10 @@ impl ConfigRuntime {
                 .build());
         }
 
-        // Prepare the matching environment before activation. Failed refreshes
-        // revoke static credentials while preserving independently bound dynamic grants.
+        // Prepare the matching environment before activation. An environment that
+        // cannot be installed revokes static credentials while preserving
+        // independently bound dynamic grants; a failed fetch keeps them until the
+        // next poll fetches again.
         let prepared_provider = match provider {
             _ if !provider_env_changed => None,
             ProviderSource::Fetch => {
@@ -798,15 +800,28 @@ impl ConfigRuntime {
                 }
                 provider
             }
-            failed => {
-                let reason = match failed {
-                    Ok(provider)
-                        if provider.readiness_reason != ProviderReadinessReason::Unspecified =>
-                    {
-                        provider.readiness_reason
-                    }
-                    Ok(_) => ProviderReadinessReason::SnapshotMismatch,
-                    Err(_) => ProviderReadinessReason::CredentialInstallFailed,
+            // The gateway said nothing about the environment. The installed
+            // credentials serve until their recorded expiry, and the next poll
+            // fetches again.
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    requested_revision = desired_identity.revision,
+                    "Provider environment fetch failed; the installed credentials remain until the next poll fetches again"
+                );
+                let error =
+                    "Provider environment could not be fetched; installed credentials remain";
+                return Err(ConfigRejection {
+                    code: "provider_environment_fetch_failed",
+                    detail: error.to_string(),
+                    admission_error: error.to_string(),
+                });
+            }
+            Ok(provider) => {
+                let reason = if provider.readiness_reason == ProviderReadinessReason::Unspecified {
+                    ProviderReadinessReason::SnapshotMismatch
+                } else {
+                    provider.readiness_reason
                 };
                 self.revoke_provider_environment(
                     ctx,
@@ -2300,10 +2315,23 @@ mod tests {
             revision: u64,
             environment: openshell_core::grpc_client::ProviderEnvironmentResult,
         ) -> ReconcileOutcome {
+            self.fetch_answering(revision, Some(environment)).await
+        }
+
+        /// Reconcile a poll that names `revision` while the gateway's fetch fails.
+        async fn fetch_failing(&mut self, revision: u64) -> ReconcileOutcome {
+            self.fetch_answering(revision, None).await
+        }
+
+        async fn fetch_answering(
+            &mut self,
+            revision: u64,
+            environment: Option<openshell_core::grpc_client::ProviderEnvironmentResult>,
+        ) -> ReconcileOutcome {
             self.settings.provider_env_revision = revision;
             let client = FetchedProviderGateway {
                 policy: self.client.clone(),
-                environment: Arc::new(std::sync::Mutex::new(Some(environment))),
+                environment: Arc::new(std::sync::Mutex::new(environment)),
             };
             let reconciled = self
                 .runtime
@@ -2422,6 +2450,28 @@ mod tests {
             assert!(matches!(outcome, ReconcileOutcome::Rejected(_)));
             assert_eq!(delivery.resolved(), None);
         }
+    }
+
+    #[tokio::test]
+    async fn a_failed_fetch_keeps_the_installed_credentials_and_open_relays() {
+        let mut delivery = Delivery::start(stable_provider_environment(1, Some("first"))).await;
+        let generation = delivery.engine.current_generation();
+        let tunnel = delivery.pin();
+
+        // The poll names revision 2, and the fetch fails, as during a gateway outage.
+        let outcome = delivery.fetch_failing(2).await;
+        assert!(matches!(outcome, ReconcileOutcome::Rejected(_)));
+        assert_eq!(delivery.resolved().as_deref(), Some("first"));
+        assert!(!tunnel.is_stale(), "open relays stay open");
+
+        // The next poll fetches again, and the refresh installs in place.
+        let outcome = delivery
+            .fetch(2, stable_provider_environment(2, Some("second")))
+            .await;
+        assert!(matches!(outcome, ReconcileOutcome::Applied));
+        assert_eq!(delivery.engine.current_generation(), generation);
+        assert!(!tunnel.is_stale(), "open relays stay open");
+        assert_eq!(delivery.resolved().as_deref(), Some("second"));
     }
 
     #[tokio::test]
@@ -2713,17 +2763,9 @@ mod tests {
             "fetching desired credentials does not install them"
         );
         assert!(response.send(Err(miette::miette!("unavailable"))).is_ok());
-        timeout(Duration::from_secs(1), async {
-            while tracker.observation(&credentials).reason
-                != i32::from(ProviderReadinessReason::CredentialInstallFailed)
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
         let failed_id = credentials.snapshot().installation_id.clone();
 
+        // The next poll fetches the same identity again.
         polls.send(initial.clone()).unwrap();
         let (_, response) = timeout(Duration::from_secs(1), received.recv())
             .await
@@ -2926,27 +2968,47 @@ mod tests {
         // Rotation gives future processes a new reference; the retained old
         // reference continues to resolve its original value until revocation.
         let old_reference = "openshell:resolve:env:v1_EXTERNAL_TOKEN";
-        for (revision, value, fail) in [
-            (1, Some("initial"), false),
-            (2, Some("rotated"), false),
-            (3, None, true),
-            (3, Some("recovered"), false),
-            (4, None, false),
-            (5, None, false),
+        for (revision, value) in [
+            (1, Some("initial")),
+            (2, Some("rotated")),
+            (3, Some("recovered")),
+            (4, None),
+            (5, None),
         ] {
             let mut poll = initial.clone();
             poll.provider_env_revision = revision;
-            polls.send(poll).unwrap();
-            let (_, response) = timeout(Duration::from_secs(5), received.recv())
+            polls.send(poll.clone()).unwrap();
+            let (_, mut response) = timeout(Duration::from_secs(5), received.recv())
                 .await
                 .expect("provider refresh requested")
                 .expect("poll loop active");
-            let result = if fail {
-                Err(miette::miette!("provider snapshot unavailable"))
-            } else {
-                Ok(static_provider_environment(revision, value))
-            };
-            assert!(response.send(result).is_ok());
+            if revision == 3 {
+                // The fetch fails, as while the gateway is unreachable. The installed
+                // revision keeps resolving, and the next poll fetches again.
+                assert!(
+                    response
+                        .send(Err(miette::miette!("provider snapshot unavailable")))
+                        .is_ok()
+                );
+                polls.send(poll).unwrap();
+                (_, response) = timeout(Duration::from_secs(5), received.recv())
+                    .await
+                    .expect("provider refresh retried")
+                    .expect("poll loop active");
+                assert_eq!(state.revision(), 2);
+                assert_eq!(
+                    state
+                        .resolver_for_endpoint("tools.example.com", 443, "/v1/chat")
+                        .unwrap()
+                        .resolve_placeholder("openshell:resolve:env:v2_EXTERNAL_TOKEN"),
+                    Some("rotated")
+                );
+            }
+            assert!(
+                response
+                    .send(Ok(static_provider_environment(revision, value)))
+                    .is_ok()
+            );
             let reference = format!("openshell:resolve:env:v{revision}_EXTERNAL_TOKEN");
             timeout(Duration::from_secs(5), async {
                 loop {
@@ -2958,7 +3020,7 @@ mod tests {
                     let observed = tracker.observation(&state);
                     if state.revision() == revision
                         && resolved.as_deref() == value
-                        && (fail || observed.credentials_installed)
+                        && observed.credentials_installed
                     {
                         break;
                     }
@@ -3018,30 +3080,50 @@ mod tests {
         expect_policy_report(&mut reports, 1).await;
         let reference = format!("openshell:resolve:env:s{}_EXTERNAL_TOKEN", "a".repeat(64));
 
-        // A failed refresh must remain eligible for retry at the same revision,
-        // carrying the prior support requirement despite revoking its secrets.
-        for (revision, value, fail, required_before, required_after) in [
-            (1, Some("initial"), false, false, true),
-            (2, Some("rotated"), false, true, true),
-            (3, None, true, true, true),
-            (3, Some("recovered"), false, true, true),
-            (4, None, false, true, false),
-            (5, None, false, false, false),
+        // A failed fetch is retried at the same revision with the prior support
+        // requirement, and the installed secrets keep serving meanwhile.
+        for (revision, value, required_before, required_after) in [
+            (1, Some("initial"), false, true),
+            (2, Some("rotated"), true, true),
+            (3, Some("recovered"), true, true),
+            (4, None, true, false),
+            (5, None, false, false),
         ] {
             let mut poll = initial.clone();
             poll.provider_env_revision = revision;
-            polls.send(poll).unwrap();
-            let (required, response) = timeout(Duration::from_secs(5), received.recv())
+            polls.send(poll.clone()).unwrap();
+            let (required, mut response) = timeout(Duration::from_secs(5), received.recv())
                 .await
                 .expect("provider refresh requested")
                 .expect("poll loop active");
             assert_eq!(required, required_before, "revision {revision}");
-            let result = if fail {
-                Err(miette::miette!("gateway support acknowledgment missing"))
-            } else {
-                Ok(stable_provider_environment(revision, value))
-            };
-            assert!(response.send(result).is_ok());
+            if revision == 3 {
+                assert!(
+                    response
+                        .send(Err(miette::miette!("provider snapshot unavailable")))
+                        .is_ok()
+                );
+                polls.send(poll).unwrap();
+                let (required, retried) = timeout(Duration::from_secs(5), received.recv())
+                    .await
+                    .expect("provider refresh retried")
+                    .expect("poll loop active");
+                assert!(required, "the retry carries the support requirement");
+                response = retried;
+                assert_eq!(state.revision(), 2);
+                assert_eq!(
+                    state
+                        .resolver_for_endpoint("tools.example.com", 443, "/v1/chat")
+                        .unwrap()
+                        .resolve_placeholder(&reference),
+                    Some("rotated")
+                );
+            }
+            assert!(
+                response
+                    .send(Ok(stable_provider_environment(revision, value)))
+                    .is_ok()
+            );
             timeout(Duration::from_secs(5), async {
                 loop {
                     let resolved = state
@@ -3052,7 +3134,7 @@ mod tests {
                     let observed = tracker.observation(&state);
                     if state.revision() == revision
                         && resolved.as_deref() == value
-                        && (fail || observed.credentials_installed)
+                        && observed.credentials_installed
                     {
                         break;
                     }

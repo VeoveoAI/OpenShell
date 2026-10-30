@@ -124,6 +124,14 @@ another attachment or policy revokes static credentials until the next poll, and
 the revocation logs its reason. Before this, a refresh between the two revoked them
 for a poll interval and closed every relay once they returned.
 
+A fetch that fails says nothing about the environment, as when the gateway is briefly
+unreachable. The installed credentials keep serving, each until its recorded expiry,
+and the next poll fetches again, so the refresh still installs in place. Only an
+environment the gateway hands over revokes them: one of another attachment or policy,
+one not ready for installation, or one whose bindings fail validation. Before this, a
+failed fetch revoked them, and their return closed every relay, about once in 1,400
+refreshes.
+
 ## Portable supervisor access
 
 The supervisor consumes the shared isolation backend contract. Its gateway
