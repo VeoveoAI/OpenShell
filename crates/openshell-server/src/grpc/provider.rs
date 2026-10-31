@@ -3804,6 +3804,9 @@ fn normalize_profile_id_request(id: &str) -> Result<String, Status> {
     })
 }
 
+/// The error profile YAML parsing reports for `credential_binding.provider`.
+const PROFILE_BINDING_PROVIDER_ERROR: &str = "unknown field: provider";
+
 fn profiles_from_import_items(
     items: &[ProviderProfileImportItem],
 ) -> (
@@ -3825,12 +3828,19 @@ fn profiles_from_import_items(
             continue;
         };
         for (index, endpoint) in profile.endpoints.iter().enumerate() {
-            if endpoint.credential_binding.is_some() {
+            // A profile endpoint binds the profile's own provider and accepts
+            // only `strict`. Report a provider name as YAML and JSON parsing
+            // does, instead of dropping it in the profile conversion.
+            if endpoint
+                .credential_binding
+                .as_ref()
+                .is_some_and(|binding| !binding.provider.is_empty())
+            {
                 diagnostics.push(ProfileValidationDiagnostic {
                     source: source.clone(),
                     profile_id: profile.id.clone(),
-                    field: format!("endpoints[{index}].credential_binding"),
-                    message: "credential_binding references a concrete sandbox provider and is only valid in sandbox policy".to_string(),
+                    field: format!("endpoints[{index}].credential_binding.provider"),
+                    message: PROFILE_BINDING_PROVIDER_ERROR.to_string(),
                     severity: "error".to_string(),
                 });
             }
@@ -7668,6 +7678,97 @@ mod tests {
         .profile
         .unwrap();
         assert_eq!(fetched.id, "custom-api");
+    }
+
+    fn strict_import_request(profile: ProviderProfile) -> ImportProviderProfilesRequest {
+        ImportProviderProfilesRequest {
+            request_id: String::new(),
+            profiles: vec![ProviderProfileImportItem {
+                profile: Some(profile),
+                source: "strict.yaml".to_string(),
+            }],
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
+        }
+    }
+
+    #[tokio::test]
+    async fn import_provider_profile_keeps_a_strict_endpoint_binding() {
+        let state = test_server_state().await;
+        let response = handle_import_provider_profiles(
+            &state,
+            authed_request(strict_import_request(strict_binding_test_profile())),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(
+            response.diagnostics.is_empty(),
+            "{:?}",
+            response.diagnostics
+        );
+        assert!(response.imported);
+
+        let fetched = handle_get_provider_profile(
+            &state,
+            authed_request(GetProviderProfileRequest {
+                id: "strict-binding-test".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .profile
+        .unwrap();
+        assert_eq!(
+            fetched.endpoints[0].credential_binding,
+            Some(openshell_core::proto::NetworkCredentialBinding {
+                provider: String::new(),
+                strict: true,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn import_provider_profile_rejects_a_profile_binding_provider() {
+        let state = test_server_state().await;
+        let mut profile = strict_binding_test_profile();
+        profile.endpoints[0].credential_binding =
+            Some(openshell_core::proto::NetworkCredentialBinding {
+                provider: "work-api".to_string(),
+                strict: true,
+            });
+        let response =
+            handle_import_provider_profiles(&state, authed_request(strict_import_request(profile)))
+                .await
+                .unwrap()
+                .into_inner();
+        assert!(!response.imported);
+        assert!(
+            response.diagnostics.iter().any(|diagnostic| {
+                diagnostic.field == "endpoints[0].credential_binding.provider"
+                    && diagnostic.message == "unknown field: provider"
+                    && diagnostic.severity == "error"
+            }),
+            "{:?}",
+            response.diagnostics
+        );
+
+        // YAML import reports the same field error.
+        let yaml_error = openshell_providers::parse_profile_yaml(
+            "id: strict-api\ndisplay_name: Strict\nendpoints:\n  - host: api.example.com\n    port: 443\n    credential_binding:\n      provider: work-api\n",
+        )
+        .expect_err("YAML rejects a profile binding provider");
+        assert!(
+            yaml_error
+                .to_string()
+                .ends_with(PROFILE_BINDING_PROVIDER_ERROR),
+            "{yaml_error}"
+        );
     }
 
     #[tokio::test]

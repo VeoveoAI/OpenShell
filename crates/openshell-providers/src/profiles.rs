@@ -6360,7 +6360,17 @@ endpoints:
     #[test]
     fn profile_credential_binding_cannot_name_a_provider() {
         let yaml = STRICT_PROFILE.replace("strict: true", "provider: work-api");
-        assert!(parse_profile_yaml(&yaml).is_err());
+        let error = parse_profile_yaml(&yaml).expect_err("provider is rejected");
+        assert!(
+            error.to_string().contains("unknown field: provider"),
+            "{error}"
+        );
+        let json = r#"{"id":"strict-api","display_name":"Strict","endpoints":[{"host":"api.example.com","port":443,"credential_binding":{"provider":"work-api"}}]}"#;
+        let error = parse_profile_json(json).expect_err("provider is rejected");
+        assert!(
+            error.to_string().contains("unknown field `provider`"),
+            "{error}"
+        );
     }
 
     #[test]
