@@ -46,6 +46,7 @@ Provider profiles include these user-facing features:
 - Dynamic token grants that use the sandbox's SPIFFE JWT-SVID as an OAuth2 client assertion and inject short-lived tokens into supported headers for matching profile endpoints.
 - Request-scoped refresh, where the gateway mints an OAuth2 client credentials token for a scope named by one request header and the supervisor substitutes it for that request's placeholder.
 - Endpoint-bound static credential placeholders. The sandbox proxy resolves a static credential only for request hosts, ports, and paths declared by its provider profile or explicitly bound in sandbox policy for an endpointless profile.
+- Strict credential binding. A strictly bound endpoint admits a request only when the request's credential is a placeholder bound there, so a credential value typed into a workload never reaches it.
 
 ## Understand Static Credential Endpoint Binding
 
@@ -71,6 +72,7 @@ A request can use a static credential only when all of these checks pass:
 | The placeholder belongs to the current attached provider state. | Sandbox provider attachment and current provider record. |
 | The calling binary and destination are allowed. | Effective sandbox network policy. |
 | The host, port, and canonical request path match the credential binding. | Provider profile endpoints, or an explicit sandbox policy binding for an endpointless profile. |
+| At a strictly bound endpoint, every credential position in the request holds a placeholder bound there, and the request carries at least one. | `credential_binding.strict` on the profile endpoint or on the explicit sandbox policy binding. Refer to [Strict Credential Binding](#strict-credential-binding). |
 | The HTTP method, path, or protocol operation is allowed when L7 inspection is configured. | Effective sandbox network policy. |
 | The credential has not expired. | Provider credential expiry metadata. |
 
@@ -196,6 +198,96 @@ have received their real values.
 When upgrading from revision-scoped refresh placeholders to stable refresh
 handles, restart each existing workload once so it receives the new placeholder.
 Later access-token rotations do not require workload restarts.
+
+### Strict Credential Binding
+
+An ordinary binding controls where a placeholder resolves. It does not stop a
+workload from sending its own value: if someone types a real API key into an
+application inside the sandbox, the proxy forwards it unchanged. A strict
+binding closes that path. At a strictly bound endpoint, the proxy admits a
+request only when the request's credential is a placeholder of a credential
+bound there, and then substitutes it as usual.
+
+Set `credential_binding.strict` on a provider profile endpoint. The profile's
+own provider is implied, so a profile endpoint does not name one:
+
+```yaml showLineNumbers={false}
+credentials:
+  - name: api_key
+    env_vars: [EXAMPLE_API_KEY]
+    auth_style: header
+    header_name: x-api-key
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    access: full
+    credential_binding:
+      strict: true
+```
+
+For an endpointless profile, set it on the sandbox policy binding:
+
+```yaml showLineNumbers={false}
+network_policies:
+  example_api:
+    endpoints:
+      - host: api.example.com
+        port: 443
+        protocol: rest
+        access: full
+        credential_binding:
+          provider: work-example
+          strict: true
+```
+
+The default is `false`. Endpoints without `strict` behave as described above.
+
+The request's credential is what it carries at a credential position. The
+`Authorization` header is always a credential position. Each static credential
+bound at the endpoint adds the position its `auth_style` declares:
+
+| `auth_style` | Credential position | What the position must hold |
+|---|---|---|
+| `bearer`, `header` | The `header_name` header. | A bound placeholder, optionally after one authentication scheme, such as `Bearer <placeholder>`. |
+| `basic` | The `header_name` header, or `Authorization` when it is empty. | `Basic` with a Base64 `user-id:password` in which each non-empty part is a bound placeholder. |
+| `query` | Every `query_param` parameter. | Exactly a bound placeholder. |
+| `path` | The segment that `path_template` marks with `{credential}`, when the request path's segments before it match the template. | Exactly a bound placeholder between the template text around `{credential}`. |
+
+The `Authorization` header follows the same rules as a `bearer` header, and
+`Basic` values follow the `basic` rules wherever they appear.
+
+A request is admitted when every credential position it carries holds a bound
+placeholder and it carries at least one. A bound placeholder is any form of
+placeholder issued to the workload, including a JWT-shaped alias, for a static
+credential bound at the endpoint. The proxy refuses the request before any
+upstream write when:
+
+- A credential position holds a literal value, a placeholder with extra text, or a placeholder of a credential that is not bound at the endpoint.
+- A header position occurs more than once and one occurrence does not hold a bound placeholder.
+- The request carries no credential position.
+
+The refusal is HTTP 403 with this response:
+
+```json
+{"error":"credential_placeholder_required","message":"This endpoint binds its credential strictly; send the provider credential placeholder"}
+```
+
+A placeholder of a credential bound only at other endpoints still returns
+`credential_endpoint_mismatch`. The sandbox logs record the destination and
+`credential_placeholder_required`, and OCSF output includes the denied activity
+and a detection finding. These events never contain the refused value.
+
+When one binding that covers a request's host, port, and path is strict, the
+endpoint is strict for every static credential bound there. Strict binding
+checks only credential positions; it does not inspect other headers, cookies,
+or the request body. It needs the request's credential as the workload sent
+it, so OpenShell rejects `strict` together with `credential_signing` or
+`allow_uninspected_credentials`, and in a profile that declares a
+`token_grant` credential. A strict profile endpoint must use L7 inspection.
+Strictness travels with the credential's binding: while OpenShell withholds a
+credential from the sandbox, for example after it expires, its endpoints are
+not strictly bound.
 
 ## Roadmap
 
@@ -443,6 +535,9 @@ endpoints:
     websocket_credential_rewrite: false
     request_body_credential_rewrite: false
     allow_uninspected_credentials: false
+    # Admit only requests whose credential is a placeholder bound here.
+    credential_binding:
+      strict: false
     persisted_queries: deny
     graphql_max_body_bytes: 65536
     rules:
@@ -503,7 +598,7 @@ credential declared under `credentials`. OpenShell scans the referenced
 credential's `env_vars` in order and stores the first non-empty local
 environment value under the actual environment variable key.
 
-`endpoints` contains the same endpoint object shape as sandbox network policy. A profile can use access presets, protocol-specific allow rules, deny rules, WebSocket credential rewriting, request body credential rewriting, GraphQL fields, and SSRF IP allowlists. Because profile credentials are not mapped to individual endpoints, OpenShell conservatively treats every endpoint in a profile that declares credentials as credentialed. Such endpoints require L7 inspection and cannot use `tls: skip` unless the profile explicitly sets `allow_uninspected_credentials: true`.
+`endpoints` contains the same endpoint object shape as sandbox network policy. A profile can use access presets, protocol-specific allow rules, deny rules, WebSocket credential rewriting, request body credential rewriting, GraphQL fields, and SSRF IP allowlists. Because profile credentials are not mapped to individual endpoints, OpenShell conservatively treats every endpoint in a profile that declares credentials as credentialed. Such endpoints require L7 inspection and cannot use `tls: skip` unless the profile explicitly sets `allow_uninspected_credentials: true`. A profile endpoint accepts `credential_binding.strict` but not `credential_binding.provider`; refer to [Strict Credential Binding](#strict-credential-binding).
 
 Profile validation rejects unknown `tls`, `enforcement`, and `access` values before the profile can contribute policy to a sandbox.
 

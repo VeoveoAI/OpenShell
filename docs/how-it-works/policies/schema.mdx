@@ -166,6 +166,7 @@ the gateway host.
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `credential_binding.provider` | string | None | Binds the static credentials of an attached provider whose profile defines no endpoints. Valid only in a sandbox policy. |
+| `credential_binding.strict` | bool | `false` | Admits a request only when its credential is a placeholder bound at this endpoint. Provider profile endpoints accept it without `provider`. Refer to [Strict Credential Binding](/how-it-works/providers/profiles#strict-credential-binding). |
 | `request_body_credential_rewrite` | bool | `false` | Replaces credential placeholders in REST request bodies. |
 | `websocket_credential_rewrite` | bool | `false` | Replaces credential placeholders in client WebSocket text messages. |
 | `allow_uninspected_credentials` | bool | `false` | Allows a provider-credentialed endpoint to omit request inspection or use `tls: skip`. |

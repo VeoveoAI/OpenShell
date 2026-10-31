@@ -505,6 +505,11 @@ query string.
 Unknown, malformed, expired, or otherwise unresolved placeholders also fail
 closed instead of being forwarded to the upstream service.
 
+A strictly bound endpoint also refuses a request whose credential is not a
+placeholder bound there, such as a key typed into an application, with
+`credential_placeholder_required`. Refer to
+[Strict Credential Binding](/how-it-works/providers/profiles#strict-credential-binding).
+
 ### Inspect an Endpoint Binding
 
 Export the profile used by a provider to inspect its credential boundary:
