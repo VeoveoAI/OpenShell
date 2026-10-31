@@ -92,6 +92,9 @@ type PolicyNetworkEndpoint struct {
 // NetworkCredentialBinding binds an endpoint to static credentials from an attached provider.
 type NetworkCredentialBinding struct {
 	Provider string
+	// Strict admits a request only when its credential is a placeholder of a
+	// credential bound at the endpoint.
+	Strict bool
 }
 
 // PolicyNetworkBinary identifies a binary subject to network policy enforcement.

@@ -277,6 +277,18 @@ fn request_pipeline_conflicts(left: &NetworkEndpoint, right: &NetworkEndpoint) -
             .map(|binding| binding.provider.as_str())
             .unwrap_or_default(),
     );
+    push_conflict(
+        &mut conflicts,
+        "credential_binding.strict",
+        &left
+            .credential_binding
+            .as_ref()
+            .is_some_and(|binding| binding.strict),
+        &right
+            .credential_binding
+            .as_ref()
+            .is_some_and(|binding| binding.strict),
+    );
 
     if left.protocol.eq_ignore_ascii_case("graphql")
         && right.protocol.eq_ignore_ascii_case("graphql")
@@ -1020,10 +1032,12 @@ mod tests {
         let mut left = endpoint("api.example.com", 443);
         left.credential_binding = Some(openshell_core::proto::NetworkCredentialBinding {
             provider: "provider-a".to_string(),
+            strict: false,
         });
         let mut right = endpoint("api.example.com", 443);
         right.credential_binding = Some(openshell_core::proto::NetworkCredentialBinding {
             provider: "provider-b".to_string(),
+            strict: false,
         });
 
         let ambiguities = find_endpoint_ambiguities(&policy_with(left, right));
@@ -1033,6 +1047,29 @@ mod tests {
                 .conflicts
                 .iter()
                 .any(|field| field.contains("credential_binding.provider"))
+        );
+    }
+
+    #[test]
+    fn strict_and_non_strict_bindings_conflict_on_same_endpoint() {
+        let binding = |strict| {
+            Some(openshell_core::proto::NetworkCredentialBinding {
+                provider: "provider-a".to_string(),
+                strict,
+            })
+        };
+        let mut left = endpoint("api.example.com", 443);
+        left.credential_binding = binding(true);
+        let mut right = endpoint("api.example.com", 443);
+        right.credential_binding = binding(false);
+
+        let ambiguities = find_endpoint_ambiguities(&policy_with(left, right));
+        assert_eq!(ambiguities.len(), 1);
+        assert!(
+            ambiguities[0]
+                .conflicts
+                .iter()
+                .any(|field| field.contains("credential_binding.strict"))
         );
     }
 

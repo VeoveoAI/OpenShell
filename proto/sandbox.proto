@@ -96,10 +96,19 @@ message MiddlewareEndpointSelector {
 }
 
 // Binds a policy endpoint to static credentials from a sandbox provider.
+//
+// In a sandbox policy the binding names the attached provider. In a provider
+// profile endpoint the profile's own provider is implied, so provider stays
+// empty and only strict applies.
 message NetworkCredentialBinding {
   // Name of the provider attached to this sandbox whose static credentials
   // may be resolved for requests admitted by this endpoint.
   string provider = 1;
+  // When true, a request at this endpoint is admitted only when every
+  // credential position it carries holds a placeholder of a credential bound
+  // here, and it carries at least one. A literal value, an unbound
+  // placeholder, or no credential is refused. Defaults to false.
+  bool strict = 2;
 }
 
 // TLS handling for a network endpoint.

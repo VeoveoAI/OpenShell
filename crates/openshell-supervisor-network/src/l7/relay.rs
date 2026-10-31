@@ -128,8 +128,17 @@ fn scoped_context_for_request(
         // HTTP/1.0 permits an origin-form request without Host. Such requests
         // remain compatible, but an absent authority cannot authorize static
         // credential use. Clearing the resolver makes any placeholder or
-        // signing attempt fail closed before an upstream write.
-        scoped.secret_resolver = None;
+        // signing attempt fail closed before an upstream write. A strictly
+        // bound tunnel endpoint keeps its requirement, so a literal credential
+        // is refused there too.
+        scoped.secret_resolver = ctx
+            .provider_credentials
+            .as_ref()
+            .and_then(|credentials| {
+                credentials.resolver_for_endpoint(&ctx.host, ctx.port, &request.target)
+            })
+            .filter(|resolver| resolver.is_strict())
+            .map(|resolver| Arc::new(resolver.without_credentials()));
         scoped.body_classifier = None;
         // A dynamic grant may already be installed on this request. Keep its
         // generation pin across body buffering even without static authority.
@@ -547,21 +556,49 @@ fn build_request_authority_mismatch_finding(ctx: &L7EvalContext) -> openshell_oc
         .build()
 }
 
-fn build_credential_resolution_event(
+/// Why the credential binding stopped a request before any upstream write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialRefusal {
+    EndpointMismatch,
+    PlaceholderRequired,
+    Unavailable,
+}
+
+impl CredentialRefusal {
+    fn of(error: &secrets::UnresolvedPlaceholderError) -> Self {
+        if error.is_endpoint_mismatch() {
+            Self::EndpointMismatch
+        } else if error.is_placeholder_required() {
+            Self::PlaceholderRequired
+        } else {
+            Self::Unavailable
+        }
+    }
+
+    fn status_detail(self) -> &'static str {
+        match self {
+            Self::EndpointMismatch => "credential_endpoint_mismatch",
+            Self::PlaceholderRequired => "credential_placeholder_required",
+            Self::Unavailable => "credential_unavailable",
+        }
+    }
+}
+
+fn build_credential_refusal_event(
     ctx: &L7EvalContext,
     method: &str,
-    endpoint_mismatch: bool,
+    refusal: CredentialRefusal,
 ) -> openshell_ocsf::OcsfEvent {
-    let response_code = if endpoint_mismatch { 403 } else { 500 };
+    let denied = refusal != CredentialRefusal::Unavailable;
     HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::for_http_method(method))
         .http_request(method_only_request(method))
         .http_response(openshell_ocsf::HttpResponse {
-            code: response_code,
+            code: if denied { 403 } else { 500 },
         })
         .action(ActionId::Denied)
         .disposition(DispositionId::Blocked)
-        .severity(if endpoint_mismatch {
+        .severity(if denied {
             SeverityId::High
         } else {
             SeverityId::Medium
@@ -569,22 +606,21 @@ fn build_credential_resolution_event(
         .status(StatusId::Failure)
         .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
         .firewall_rule(&ctx.policy_name, "credential-binding")
-        .message(if endpoint_mismatch {
-            format!(
+        .message(match refusal {
+            CredentialRefusal::EndpointMismatch => format!(
                 "Credential use denied: credential is not authorized for {}:{}",
                 ctx.host, ctx.port
-            )
-        } else {
-            format!(
+            ),
+            CredentialRefusal::PlaceholderRequired => format!(
+                "Credential use denied: {}:{} requires a bound credential placeholder",
+                ctx.host, ctx.port
+            ),
+            CredentialRefusal::Unavailable => format!(
                 "Credential use denied: credential is unavailable for {}:{}",
                 ctx.host, ctx.port
-            )
+            ),
         })
-        .status_detail(if endpoint_mismatch {
-            "credential_endpoint_mismatch"
-        } else {
-            "credential_unavailable"
-        })
+        .status_detail(refusal.status_detail())
         .build()
 }
 
@@ -597,6 +633,14 @@ fn build_credential_endpoint_mismatch_finding(ctx: &L7EvalContext) -> openshell_
     )
 }
 
+fn build_credential_placeholder_required_finding(ctx: &L7EvalContext) -> openshell_ocsf::OcsfEvent {
+    crate::l7::build_credential_placeholder_required_finding(
+        &ctx.policy_name,
+        &ctx.host,
+        "Strict credential binding requires a bound placeholder; request denied",
+    )
+}
+
 pub(crate) async fn reject_credential_resolution<W>(
     client: &mut W,
     ctx: &L7EvalContext,
@@ -606,16 +650,22 @@ pub(crate) async fn reject_credential_resolution<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let endpoint_mismatch = error.is_endpoint_mismatch();
-    let status = if endpoint_mismatch {
-        "403 Forbidden"
-    } else {
+    let refusal = CredentialRefusal::of(error);
+    let status = if refusal == CredentialRefusal::Unavailable {
         "500 Internal Server Error"
-    };
-    let body = if endpoint_mismatch {
-        r#"{"error":"credential_endpoint_mismatch","message":"Credential is not authorized for this request endpoint"}"#
     } else {
-        r#"{"error":"credential_unavailable","message":"Credential placeholder could not be resolved"}"#
+        "403 Forbidden"
+    };
+    let body = match refusal {
+        CredentialRefusal::EndpointMismatch => {
+            r#"{"error":"credential_endpoint_mismatch","message":"Credential is not authorized for this request endpoint"}"#
+        }
+        CredentialRefusal::PlaceholderRequired => {
+            r#"{"error":"credential_placeholder_required","message":"This endpoint binds its credential strictly; send the provider credential placeholder"}"#
+        }
+        CredentialRefusal::Unavailable => {
+            r#"{"error":"credential_unavailable","message":"Credential placeholder could not be resolved"}"#
+        }
     };
     let response = format!(
         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -627,14 +677,16 @@ where
         .into_diagnostic()?;
     client.flush().await.into_diagnostic()?;
 
-    ocsf_emit!(build_credential_resolution_event(
-        ctx,
-        method,
-        endpoint_mismatch
-    ));
+    ocsf_emit!(build_credential_refusal_event(ctx, method, refusal));
 
-    if endpoint_mismatch {
-        ocsf_emit!(build_credential_endpoint_mismatch_finding(ctx));
+    match refusal {
+        CredentialRefusal::EndpointMismatch => {
+            ocsf_emit!(build_credential_endpoint_mismatch_finding(ctx));
+        }
+        CredentialRefusal::PlaceholderRequired => {
+            ocsf_emit!(build_credential_placeholder_required_finding(ctx));
+        }
+        CredentialRefusal::Unavailable => {}
     }
     Ok(())
 }
@@ -848,7 +900,7 @@ where
             } else if let Some(error) = report.downcast_ref::<secrets::UnresolvedPlaceholderError>()
             {
                 if let Some(observer) = observer {
-                    observer.observe_credential_failure(error.is_endpoint_mismatch());
+                    observer.observe_credential_failure(error.is_denied());
                 }
                 reject_credential_resolution(client, ctx, &request.action, error).await?;
                 Ok(None)
@@ -1367,7 +1419,7 @@ where
             Ok(target) => target,
             Err(error) => {
                 if let Some(observer) = observer.as_ref() {
-                    observer.observe_credential_failure(error.is_endpoint_mismatch());
+                    observer.observe_credential_failure(error.is_denied());
                 }
                 reject_credential_resolution(client, ctx, &req.action, &error).await?;
                 return Ok(());
@@ -2536,7 +2588,7 @@ where
             Ok(target) => target,
             Err(error) => {
                 if let Some(observer) = observer.as_ref() {
-                    observer.observe_credential_failure(error.is_endpoint_mismatch());
+                    observer.observe_credential_failure(error.is_denied());
                 }
                 reject_credential_resolution(client, ctx, &req.action, &error).await?;
                 return Ok(());
@@ -3990,10 +4042,12 @@ mod tests {
                 host: "allowed.example.test".to_string(),
                 port: 443,
                 path: "/allowed/**".to_string(),
+                strict: false,
             }],
             credential_identity: identity.to_string(),
             workload_credential_handle: String::new(),
             request_scope: None,
+            placement: None,
         }
     }
 
@@ -4037,12 +4091,12 @@ mod tests {
                 403,
             ),
             (
-                build_credential_resolution_event(&ctx, "POST", true),
+                build_credential_refusal_event(&ctx, "POST", CredentialRefusal::EndpointMismatch),
                 "POST",
                 403,
             ),
             (
-                build_credential_resolution_event(&ctx, "HEAD", false),
+                build_credential_refusal_event(&ctx, "HEAD", CredentialRefusal::Unavailable),
                 "HEAD",
                 500,
             ),
@@ -4269,9 +4323,10 @@ mod tests {
             "credential mismatch must not write upstream"
         );
 
-        let activity = build_credential_resolution_event(ctx, "GET", true)
-            .to_json()
-            .expect("serialize credential mismatch activity");
+        let activity =
+            build_credential_refusal_event(ctx, "GET", CredentialRefusal::EndpointMismatch)
+                .to_json()
+                .expect("serialize credential mismatch activity");
         assert_eq!(activity["status_detail"], "credential_endpoint_mismatch");
         assert_eq!(activity["action"], "Denied");
         assert_eq!(activity["disposition"], "Blocked");
@@ -4331,9 +4386,10 @@ mod tests {
             "credential mismatch must not write upstream"
         );
 
-        let activity = build_credential_resolution_event(&ctx, "GET", true)
-            .to_json()
-            .unwrap();
+        let activity =
+            build_credential_refusal_event(&ctx, "GET", CredentialRefusal::EndpointMismatch)
+                .to_json()
+                .unwrap();
         assert_eq!(activity["status_detail"], "credential_endpoint_mismatch");
         assert_eq!(activity["action"], "Denied");
         assert_eq!(activity["disposition"], "Blocked");
@@ -4347,6 +4403,193 @@ mod tests {
         );
         assert_eq!(finding["action"], "Denied");
         assert_eq!(finding["disposition"], "Blocked");
+    }
+
+    /// Provider state that binds `API_TOKEN` strictly at
+    /// `strict.example.test:443`, and the endpoint's scoped resolver.
+    fn strict_binding_resolver() -> (ProviderCredentialState, Arc<SecretResolver>, String) {
+        let mut binding = endpoint_binding("provider-a:API_TOKEN");
+        binding.endpoints[0] = StaticCredentialEndpointBinding {
+            host: "strict.example.test".to_string(),
+            port: 443,
+            path: "/**".to_string(),
+            strict: true,
+        };
+        let state = ProviderCredentialState::from_bound_environment(
+            1,
+            TestHashMap::from([("API_TOKEN".to_string(), "real-secret".to_string())]),
+            TestHashMap::new(),
+            TestHashMap::new(),
+            TestHashMap::from([("API_TOKEN".to_string(), binding)]),
+            Vec::new(),
+        )
+        .expect("bound provider state");
+        let placeholder = state.snapshot().child_env["API_TOKEN"].clone();
+        let resolver = state
+            .resolver_for_endpoint("strict.example.test", 443, "/v1/chat")
+            .expect("endpoint-scoped resolver");
+        assert!(resolver.is_strict());
+        (state, resolver, placeholder)
+    }
+
+    fn strict_request(authorization: &str) -> crate::l7::provider::L7Request {
+        crate::l7::provider::L7Request {
+            action: "GET".to_string(),
+            target: "/v1/chat".to_string(),
+            query_params: TestHashMap::new(),
+            raw_header: format!(
+                "GET /v1/chat HTTP/1.1\r\nHost: strict.example.test\r\nAuthorization: {authorization}\r\nContent-Length: 0\r\n\r\n"
+            )
+            .into_bytes(),
+            body_length: crate::l7::provider::BodyLength::ContentLength(0),
+        }
+    }
+
+    fn strict_ctx(resolver: &Arc<SecretResolver>) -> L7EvalContext {
+        L7EvalContext {
+            host: "strict.example.test".to_string(),
+            port: 443,
+            request_default_port: Some(443),
+            policy_name: "bound".to_string(),
+            secret_resolver: Some(resolver.clone()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_binding_refuses_a_literal_credential_with_typed_403() {
+        let (_state, resolver, _) = strict_binding_resolver();
+        let ctx = strict_ctx(&resolver);
+        let (mut client_peer, mut client) = tokio::io::duplex(8192);
+        let (mut upstream, mut upstream_peer) = tokio::io::duplex(8192);
+
+        let outcome = relay_http_request_with_credential_rejection(
+            &strict_request("Bearer sk-typed-into-the-app"),
+            &mut client,
+            &mut upstream,
+            crate::l7::rest::RelayRequestOptions {
+                resolver: Some(resolver.as_ref()),
+                ..Default::default()
+            },
+            &ctx,
+            None,
+        )
+        .await
+        .expect("typed credential denial");
+        assert!(outcome.is_none());
+        drop(client);
+        drop(upstream);
+
+        let mut response = String::new();
+        client_peer.read_to_string(&mut response).await.unwrap();
+        assert!(response.contains("403 Forbidden"), "{response}");
+        assert!(
+            response.contains(r#""error":"credential_placeholder_required""#),
+            "{response}"
+        );
+        assert!(!response.contains("sk-typed-into-the-app"));
+        let mut forwarded = Vec::new();
+        upstream_peer.read_to_end(&mut forwarded).await.unwrap();
+        assert!(
+            forwarded.is_empty(),
+            "a refused request must not write upstream"
+        );
+
+        let activity =
+            build_credential_refusal_event(&ctx, "GET", CredentialRefusal::PlaceholderRequired)
+                .to_json()
+                .unwrap();
+        assert_eq!(activity["status_detail"], "credential_placeholder_required");
+        assert_eq!(activity["action"], "Denied");
+        assert_eq!(activity["disposition"], "Blocked");
+        assert_eq!(activity["http_response"]["code"], 403);
+        assert!(!activity.to_string().contains("sk-typed-into-the-app"));
+        let finding = build_credential_placeholder_required_finding(&ctx)
+            .to_json()
+            .unwrap();
+        assert_eq!(
+            finding["finding_info"]["uid"],
+            "openshell.provider_credential.placeholder_required"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_binding_substitutes_the_bound_placeholder() {
+        let (_state, resolver, placeholder) = strict_binding_resolver();
+        let ctx = strict_ctx(&resolver);
+        let (mut _client_peer, mut client) = tokio::io::duplex(8192);
+        let (mut upstream, mut upstream_peer) = tokio::io::duplex(8192);
+        let upstream_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let mut total = 0;
+            while !buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = upstream_peer.read(&mut buf[total..]).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                total += n;
+            }
+            upstream_peer
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&buf[..total]).to_string()
+        });
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            relay_http_request_with_credential_rejection(
+                &strict_request(&format!("Bearer {placeholder}")),
+                &mut client,
+                &mut upstream,
+                crate::l7::rest::RelayRequestOptions {
+                    resolver: Some(resolver.as_ref()),
+                    ..Default::default()
+                },
+                &ctx,
+                None,
+            ),
+        )
+        .await
+        .expect("relay must not deadlock")
+        .expect("placeholder request is relayed");
+        assert!(outcome.is_some());
+
+        let forwarded = upstream_task.await.unwrap();
+        assert!(
+            forwarded.contains("Authorization: Bearer real-secret\r\n"),
+            "{forwarded}"
+        );
+        assert!(!forwarded.contains("openshell:resolve:env:"));
+    }
+
+    #[test]
+    fn strict_binding_survives_a_request_without_authority() {
+        let (state, _, _) = strict_binding_resolver();
+        let ctx = L7EvalContext {
+            host: "strict.example.test".to_string(),
+            port: 443,
+            request_default_port: Some(443),
+            provider_credentials: Some(state),
+            ..Default::default()
+        };
+        let request = crate::l7::provider::L7Request {
+            action: "GET".to_string(),
+            target: "/v1/chat".to_string(),
+            query_params: TestHashMap::new(),
+            raw_header: b"GET /v1/chat HTTP/1.0\r\nAuthorization: Bearer typed\r\n\r\n".to_vec(),
+            body_length: crate::l7::provider::BodyLength::None,
+        };
+        let scoped = scoped_context_for_request(&ctx, &request).expect("scoped context");
+        let resolver = scoped
+            .secret_resolver
+            .expect("a strict endpoint keeps its requirement without authority");
+        assert!(resolver.is_strict());
+        assert!(
+            secrets::rewrite_http_header_block(&request.raw_header, Some(&resolver))
+                .expect_err("literal credential")
+                .is_placeholder_required()
+        );
     }
 
     #[tokio::test]
@@ -6034,10 +6277,12 @@ network_policies:
                         host: "api.example.test".to_string(),
                         port: 8080,
                         path: "/v1/**".to_string(),
+                        strict: false,
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
                     request_scope: None,
+                    placement: None,
                 },
             )]),
             Vec::new(),
@@ -6139,10 +6384,12 @@ network_policies:
                         host: "api.example.test".to_string(),
                         port: u32::from(port),
                         path: "/v1/**".to_string(),
+                        strict: false,
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
                     request_scope: None,
+                    placement: None,
                 },
             )]),
             Vec::new(),
@@ -6795,10 +7042,12 @@ network_policies:
                         host: "api.example.test".to_string(),
                         port: 443,
                         path: "/allowed".to_string(),
+                        strict: false,
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
                     request_scope: None,
+                    placement: None,
                 },
             )]),
             Vec::new(),
@@ -9688,10 +9937,12 @@ network_policies:
                         host: "allowed.example.test".to_string(),
                         port: 443,
                         path: "/allowed/**".to_string(),
+                        strict: false,
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
                     request_scope: None,
+                    placement: None,
                 },
             )]),
             Vec::new(),
@@ -12501,10 +12752,12 @@ network_policies:
                                 host: ctx.host.clone(),
                                 port: u32::from(ctx.port),
                                 path: "/mcp".into(),
+                                strict: false,
                             }],
                             credential_identity: "provider:API_TOKEN".into(),
                             workload_credential_handle: String::new(),
                             request_scope: None,
+                            placement: None,
                         },
                     )]),
                     Vec::new(),

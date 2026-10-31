@@ -1582,6 +1582,9 @@ fn redacted_policy_violation_category(violation: &PolicyViolation) -> &'static s
         PolicyViolation::CredentialSigningWithBodyRewrite { .. } => {
             "conflicting credential rewrite configuration"
         }
+        PolicyViolation::UnenforceableStrictCredentialBinding { .. } => {
+            "unenforceable strict credential binding"
+        }
         PolicyViolation::InvalidL7Endpoint { .. } => "invalid L7 endpoint configuration",
         PolicyViolation::InvalidMiddlewareConfig { .. } => "invalid middleware configuration",
         PolicyViolation::TooManyMiddlewareConfigs { .. } => {

@@ -575,6 +575,7 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
                             credential_binding: e.credential_binding.map(|binding| {
                                 openshell_core::proto::NetworkCredentialBinding {
                                     provider: binding.provider,
+                                    strict: binding.strict,
                                 }
                             }),
                             json_rpc_max_body_bytes: json_rpc_max_body_bytes(&e.json_rpc, &e.mcp),
@@ -763,6 +764,7 @@ fn from_proto(policy: &SandboxPolicy) -> Result<PolicyFile> {
                             credential_binding: e.credential_binding.as_ref().map(|binding| {
                                 NetworkCredentialBindingDef {
                                     provider: binding.provider.clone(),
+                                    strict: binding.strict,
                                 }
                             }),
                             json_rpc,
@@ -1068,6 +1070,14 @@ pub enum PolicyViolation {
     },
     /// `credential_signing` and `request_body_credential_rewrite` are both set.
     CredentialSigningWithBodyRewrite { policy_name: String, host: String },
+    /// `credential_binding.strict` is set where the proxy cannot check the
+    /// request's credential: the endpoint signs requests itself, or allows
+    /// uninspected credentials.
+    UnenforceableStrictCredentialBinding {
+        policy_name: String,
+        host: String,
+        conflict: &'static str,
+    },
     /// An endpoint contains a deterministic L7 semantic error.
     InvalidL7Endpoint {
         policy_name: String,
@@ -1228,6 +1238,17 @@ impl fmt::Display for PolicyViolation {
                     f,
                     "network policy '{policy_name}': endpoint '{host}' has both credential_signing \
                      and request_body_credential_rewrite set; these options are mutually exclusive"
+                )
+            }
+            Self::UnenforceableStrictCredentialBinding {
+                policy_name,
+                host,
+                conflict,
+            } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': endpoint '{host}' sets credential_binding.strict \
+                     with {conflict}; strict binding needs the request's own credential"
                 )
             }
             Self::InvalidL7Endpoint {
@@ -1547,6 +1568,27 @@ fn validate_sandbox_policy_with_mcp_presence(
                     policy_name: name.clone(),
                     host: ep.host.clone(),
                 });
+            }
+            if ep
+                .credential_binding
+                .as_ref()
+                .is_some_and(|binding| binding.strict)
+            {
+                for (conflicting, conflict) in [
+                    (!ep.credential_signing.is_empty(), "credential_signing"),
+                    (
+                        ep.allow_uninspected_credentials,
+                        "allow_uninspected_credentials",
+                    ),
+                ] {
+                    if conflicting {
+                        violations.push(PolicyViolation::UnenforceableStrictCredentialBinding {
+                            policy_name: name.clone(),
+                            host: ep.host.clone(),
+                            conflict,
+                        });
+                    }
+                }
             }
 
             let rules_would_deny_all = !ep.rules.is_empty()
@@ -4364,6 +4406,78 @@ network_policies:
         assert_eq!(proto1, proto2);
         assert!(yaml_out.contains("credential_binding:"));
         assert!(yaml_out.contains("provider: work-gcp"));
+        assert!(!yaml_out.contains("strict"));
+    }
+
+    #[test]
+    fn round_trip_preserves_strict_credential_binding() {
+        let yaml = r"
+version: 1
+network_policies:
+  gcp_storage:
+    endpoints:
+      - host: storage.googleapis.com
+        port: 443
+        protocol: rest
+        access: full
+        credential_binding:
+          provider: work-gcp
+          strict: true
+";
+
+        let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
+        let binding = proto1.network_policies["gcp_storage"].endpoints[0]
+            .credential_binding
+            .as_ref()
+            .expect("binding");
+        assert_eq!(binding.provider, "work-gcp");
+        assert!(binding.strict);
+
+        let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
+        assert!(yaml_out.contains("strict: true"));
+        assert_eq!(
+            proto1,
+            parse_sandbox_policy(&yaml_out).expect("re-parse failed")
+        );
+    }
+
+    #[test]
+    fn validate_rejects_strict_binding_the_proxy_cannot_check() {
+        for (credential_signing, allow_uninspected_credentials, conflict) in [
+            ("sigv4", false, "credential_signing"),
+            ("", true, "allow_uninspected_credentials"),
+        ] {
+            let mut policy = restrictive_default_policy();
+            policy.network_policies.insert(
+                "bound".into(),
+                NetworkPolicyRule {
+                    name: "bound".into(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "api.example.com".into(),
+                        port: 443,
+                        protocol: "rest".into(),
+                        credential_signing: credential_signing.into(),
+                        signing_service: "s3".into(),
+                        allow_uninspected_credentials,
+                        credential_binding: Some(openshell_core::proto::NetworkCredentialBinding {
+                            provider: "work".into(),
+                            strict: true,
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            );
+            let violations = validate_sandbox_policy(&policy).unwrap_err();
+            assert!(
+                violations.iter().any(|violation| matches!(
+                    violation,
+                    PolicyViolation::UnenforceableStrictCredentialBinding { conflict: found, .. }
+                        if *found == conflict
+                )),
+                "{violations:?}"
+            );
+        }
     }
 
     #[test]

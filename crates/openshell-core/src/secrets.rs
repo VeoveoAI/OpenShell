@@ -3,6 +3,8 @@
 
 #[path = "secrets_body.rs"]
 pub mod body;
+#[path = "secrets_strict.rs"]
+pub mod strict;
 
 use crate::time::now_ms;
 use base64::Engine as _;
@@ -114,6 +116,7 @@ pub struct UnresolvedPlaceholderError {
 enum UnresolvedPlaceholderReason {
     Unavailable,
     EndpointMismatch,
+    PlaceholderRequired,
 }
 
 impl UnresolvedPlaceholderError {
@@ -125,6 +128,20 @@ impl UnresolvedPlaceholderError {
     #[must_use]
     pub fn is_endpoint_mismatch(&self) -> bool {
         self.reason == UnresolvedPlaceholderReason::EndpointMismatch
+    }
+
+    /// A strictly bound endpoint refused a request whose credential is not a
+    /// placeholder bound there, or that carries no credential.
+    #[must_use]
+    pub fn is_placeholder_required(&self) -> bool {
+        self.reason == UnresolvedPlaceholderReason::PlaceholderRequired
+    }
+
+    /// The credential binding refused the request, as opposed to a
+    /// credential that could not be resolved.
+    #[must_use]
+    pub fn is_denied(&self) -> bool {
+        self.is_endpoint_mismatch() || self.is_placeholder_required()
     }
 }
 
@@ -138,6 +155,8 @@ impl fmt::Display for UnresolvedPlaceholderError {
                     "credential placeholder could not be resolved",
                 UnresolvedPlaceholderReason::EndpointMismatch =>
                     "credential is not authorized for the request endpoint",
+                UnresolvedPlaceholderReason::PlaceholderRequired =>
+                    "a bound credential placeholder is required for the request endpoint",
             },
             self.location,
         )
@@ -186,6 +205,8 @@ pub struct SecretResolver {
     denied_env_keys: HashSet<String>,
     identity_bound_env_keys: HashSet<String>,
     revision_fallback_allowed_revisions: HashMap<String, Arc<HashSet<u64>>>,
+    /// Present when the request endpoint binds a credential strictly.
+    strict_binding: Option<Arc<strict::StrictCredentialBinding>>,
 }
 
 #[derive(Clone)]
@@ -295,6 +316,7 @@ impl SecretResolver {
                 denied_env_keys: HashSet::new(),
                 identity_bound_env_keys: HashSet::new(),
                 revision_fallback_allowed_revisions: HashMap::new(),
+                strict_binding: None,
             })
         };
         (
@@ -350,6 +372,7 @@ impl SecretResolver {
                     denied_env_keys: HashSet::new(),
                     identity_bound_env_keys: HashSet::new(),
                     revision_fallback_allowed_revisions: HashMap::new(),
+                    strict_binding: None,
                 }),
             )
         }
@@ -375,6 +398,7 @@ impl SecretResolver {
                 denied_env_keys,
                 identity_bound_env_keys,
                 revision_fallback_allowed_revisions,
+                strict_binding: None,
             })
         }
     }
@@ -408,7 +432,63 @@ impl SecretResolver {
             denied_env_keys,
             identity_bound_env_keys: bound_keys.clone(),
             revision_fallback_allowed_revisions,
+            strict_binding: None,
         }
+    }
+
+    /// Return this endpoint-scoped view with a strict credential requirement.
+    #[must_use]
+    pub fn with_strict_binding(mut self, binding: Arc<strict::StrictCredentialBinding>) -> Self {
+        self.strict_binding = Some(binding);
+        self
+    }
+
+    /// Whether the request endpoint binds a credential strictly.
+    #[must_use]
+    pub fn is_strict(&self) -> bool {
+        self.strict_binding.is_some()
+    }
+
+    /// Return a view that resolves no credential but keeps this view's
+    /// endpoint denials and strict requirement.
+    ///
+    /// Requests whose authority cannot authorize credential use still have
+    /// their credential positions checked at a strictly bound endpoint.
+    #[must_use]
+    pub fn without_credentials(&self) -> Self {
+        Self {
+            by_placeholder: HashMap::new(),
+            denied_env_keys: self.denied_env_keys.clone(),
+            identity_bound_env_keys: self.identity_bound_env_keys.clone(),
+            revision_fallback_allowed_revisions: HashMap::new(),
+            strict_binding: self.strict_binding.clone(),
+        }
+    }
+
+    /// Check an HTTP/1 request header block against the strict credential
+    /// requirement of this endpoint, if any.
+    ///
+    /// The check reads placeholder syntax only. It never resolves a secret
+    /// and its error never carries the refused value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a placeholder-required error when a credential position holds
+    /// anything other than a placeholder bound at this endpoint, or when the
+    /// request carries no credential position. A placeholder of a credential
+    /// bound elsewhere returns an endpoint mismatch.
+    pub fn check_strict_binding(&self, raw: &[u8]) -> Result<(), UnresolvedPlaceholderError> {
+        let Some(binding) = self.strict_binding.as_deref() else {
+            return Ok(());
+        };
+        let header_end = raw
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map_or(raw.len(), |position| position + 4);
+        binding.check_request(
+            &self.denied_env_keys,
+            &String::from_utf8_lossy(&raw[..header_end]),
+        )
     }
 
     /// Return a view in which every placeholder of `key` this resolver holds
@@ -1285,6 +1365,8 @@ pub fn rewrite_http_header_block(
             redacted_target: None,
         });
     };
+
+    resolver.check_strict_binding(raw)?;
 
     let Some(header_end) = raw.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4) else {
         return Ok(RewriteResult {

@@ -1688,6 +1688,7 @@ mod provider_environment_tests {
                         host: "api.example.com".to_string(),
                         port: 443,
                         path: "/v1/**".to_string(),
+                        strict: false,
                     }],
                     credential_identity: "provider:TOKEN".to_string(),
                     ..Default::default()

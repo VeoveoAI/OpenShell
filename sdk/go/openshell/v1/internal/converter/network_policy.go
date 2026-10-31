@@ -87,6 +87,7 @@ func policyNetworkEndpointFromProto(ep *sbv1.NetworkEndpoint) types.PolicyNetwor
 	if binding := ep.GetCredentialBinding(); binding != nil {
 		result.CredentialBinding = &types.NetworkCredentialBinding{
 			Provider: binding.GetProvider(),
+			Strict:   binding.GetStrict(),
 		}
 	}
 	if ports := ep.GetPorts(); len(ports) > 0 {
@@ -149,6 +150,7 @@ func policyNetworkEndpointToProto(ep *types.PolicyNetworkEndpoint) *sbv1.Network
 	if ep.CredentialBinding != nil {
 		result.CredentialBinding = &sbv1.NetworkCredentialBinding{
 			Provider: ep.CredentialBinding.Provider,
+			Strict:   ep.CredentialBinding.Strict,
 		}
 	}
 	if len(ep.Ports) > 0 {

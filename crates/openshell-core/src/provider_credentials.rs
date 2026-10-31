@@ -4,6 +4,7 @@
 //! Runtime provider credential snapshots.
 
 use crate::secrets::SecretResolver;
+use crate::secrets::strict::{CredentialPosition, StrictCredentialBinding};
 use crate::{
     endpoint_path::EndpointPathPattern,
     host_pattern::HostPattern,
@@ -73,6 +74,8 @@ struct CompiledStaticCredentialBinding {
     credential_identity: String,
     workload_credential_handle: String,
     request_scope: Option<RequestScopedCredential>,
+    /// Request position the credential's profile placement declares.
+    position: Option<CredentialPosition>,
 }
 
 /// Request-scoped refresh metadata for one endpoint-bound static credential.
@@ -104,6 +107,7 @@ struct CompiledStaticCredentialEndpointBinding {
     host: HostPattern,
     port: u16,
     path: EndpointPathPattern,
+    strict: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -396,16 +400,39 @@ impl ProviderCredentialState {
             // safely, so expose no endpoint-scoped resolver.
             return (None, None, revision);
         };
+        let mut strict = false;
         let allowed: HashSet<String> = inner
             .static_credential_bindings
             .iter()
             .filter(|(_, binding)| {
-                binding.endpoints.iter().any(|endpoint| {
-                    static_credential_endpoint_matches(endpoint, &host_labels, port, &request_path)
-                })
+                let mut matched = false;
+                for endpoint in &binding.endpoints {
+                    if static_credential_endpoint_matches(
+                        endpoint,
+                        &host_labels,
+                        port,
+                        &request_path,
+                    ) {
+                        matched = true;
+                        strict |= endpoint.strict;
+                    }
+                }
+                matched
             })
             .map(|(key, _)| key.clone())
             .collect();
+        // One strict binding makes the endpoint strict for every credential
+        // bound there: each of their positions must carry one of their
+        // placeholders.
+        let strict_binding = strict.then(|| {
+            Arc::new(StrictCredentialBinding::new(
+                allowed.clone(),
+                allowed
+                    .iter()
+                    .filter_map(|key| inner.static_credential_bindings.get(key))
+                    .filter_map(|binding| binding.position.clone()),
+            ))
+        });
         let classifier = inner.body_inventory_available.then(|| {
             Arc::new(crate::secrets::body::BodyCredentialClassifier::new(
                 inner.combined_resolver.as_deref(),
@@ -441,11 +468,15 @@ impl ProviderCredentialState {
                 })
                 .map(|(key, epoch)| (key.clone(), epoch.revisions.clone()))
                 .collect();
-            Arc::new(resolver.scoped_to_env_keys(
+            let scoped = resolver.scoped_to_env_keys(
                 &inner.known_static_credential_keys,
                 &allowed,
                 revision_fallback_allowed_revisions,
-            ))
+            );
+            Arc::new(match strict_binding.clone() {
+                Some(binding) => scoped.with_strict_binding(binding),
+                None => scoped,
+            })
         });
         (resolver, classifier, revision)
     }
@@ -1134,6 +1165,21 @@ fn compile_static_credential_bindings(
                     compile_request_scope(&key, &binding.credential_identity, request_scope)
                 })
                 .transpose()?;
+            let position = binding
+                .placement
+                .map(|placement| {
+                    CredentialPosition::from_placement(
+                        &placement.auth_style,
+                        &placement.header_name,
+                        &placement.query_param,
+                        &placement.path_template,
+                    )
+                    .map_err(|_| {
+                        binding_error("static credential binding contains an invalid placement")
+                    })
+                })
+                .transpose()?
+                .flatten();
             Ok((
                 key,
                 CompiledStaticCredentialBinding {
@@ -1141,6 +1187,7 @@ fn compile_static_credential_bindings(
                     credential_identity: binding.credential_identity,
                     workload_credential_handle: binding.workload_credential_handle,
                     request_scope,
+                    position,
                 },
             ))
         })
@@ -1203,6 +1250,7 @@ fn compile_static_credential_endpoint(
         port: u16::try_from(endpoint.port)
             .map_err(|_| binding_error("static credential binding contains an invalid endpoint"))?,
         path: EndpointPathPattern::new(&endpoint.path),
+        strict: endpoint.strict,
     })
 }
 
@@ -1472,10 +1520,12 @@ mod tests {
                 host: host.to_string(),
                 port,
                 path: path.to_string(),
+                strict: false,
             }],
             credential_identity: "provider-a:API_KEY".to_string(),
             workload_credential_handle: String::new(),
             request_scope: None,
+            placement: None,
         }
     }
 
@@ -1572,6 +1622,115 @@ mod tests {
                 "static credential binding contains an invalid endpoint",
             );
         }
+    }
+
+    fn strict_state() -> ProviderCredentialState {
+        let mut api_key = binding("api.example.com", 443, "/v1/**");
+        api_key.endpoints[0].strict = true;
+        // The same credential is also bound, not strictly, to a second host.
+        api_key.endpoints.push(StaticCredentialEndpointBinding {
+            host: "uploads.example.com".to_string(),
+            port: 443,
+            path: String::new(),
+            strict: false,
+        });
+        api_key.placement = Some(crate::proto::StaticCredentialPlacement {
+            auth_style: "header".to_string(),
+            header_name: "X-Api-Key".to_string(),
+            ..Default::default()
+        });
+        ProviderCredentialState::from_bound_environment(
+            7,
+            HashMap::from([("API_KEY".to_string(), "secret".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([("API_KEY".to_string(), api_key)]),
+            Vec::new(),
+        )
+        .expect("valid bindings")
+    }
+
+    fn header_block(target: &str, headers: &[(&str, &str)]) -> Vec<u8> {
+        let mut raw = format!("POST {target} HTTP/1.1\r\nHost: api.example.com\r\n");
+        for (name, value) in headers {
+            raw.push_str(name);
+            raw.push_str(": ");
+            raw.push_str(value);
+            raw.push_str("\r\n");
+        }
+        raw.push_str("\r\n");
+        raw.into_bytes()
+    }
+
+    #[test]
+    fn strict_endpoint_binding_requires_the_declared_placeholder() {
+        let state = strict_state();
+        let placeholder = state.snapshot().child_env["API_KEY"].clone();
+        let resolver = state
+            .resolver_for_endpoint("api.example.com", 443, "/v1/messages")
+            .expect("bound resolver");
+        assert!(resolver.is_strict());
+
+        let rewritten = crate::secrets::rewrite_http_header_block(
+            &header_block("/v1/messages", &[("x-api-key", &placeholder)]),
+            Some(&resolver),
+        )
+        .expect("declared placeholder is admitted");
+        assert!(
+            String::from_utf8(rewritten.rewritten)
+                .expect("utf-8")
+                .contains("x-api-key: secret\r\n")
+        );
+
+        for headers in [
+            vec![("x-api-key", "typed-secret")],
+            vec![("Accept", "application/json")],
+            vec![
+                ("x-api-key", placeholder.as_str()),
+                ("Authorization", "Bearer typed-secret"),
+            ],
+        ] {
+            let error = crate::secrets::rewrite_http_header_block(
+                &header_block("/v1/messages", &headers),
+                Some(&resolver),
+            )
+            .expect_err("strict endpoint refuses the request");
+            assert!(error.is_placeholder_required(), "{headers:?}");
+        }
+    }
+
+    #[test]
+    fn non_strict_endpoints_of_a_strict_credential_are_unchanged() {
+        let state = strict_state();
+        for (host, path) in [
+            ("uploads.example.com", "/files"),
+            ("api.example.com", "/v2/other"),
+        ] {
+            let resolver = state
+                .resolver_for_endpoint(host, 443, path)
+                .expect("scoped resolver");
+            assert!(!resolver.is_strict(), "{host}{path}");
+            crate::secrets::rewrite_http_header_block(
+                &header_block(path, &[("x-api-key", "typed-secret")]),
+                Some(&resolver),
+            )
+            .expect("a non-strict endpoint forwards literal values as before");
+        }
+    }
+
+    #[test]
+    fn rejects_an_invalid_static_credential_placement() {
+        let mut invalid = binding("api.example.com", 443, "/**");
+        invalid.placement = Some(crate::proto::StaticCredentialPlacement {
+            auth_style: "query".to_string(),
+            ..Default::default()
+        });
+        assert_binding_validation_error(
+            HashMap::from([("API_KEY".to_string(), "secret".to_string())]),
+            HashMap::from([("API_KEY".to_string(), invalid)]),
+            Vec::new(),
+            "static credential binding contains an invalid placement",
+        );
     }
 
     #[test]

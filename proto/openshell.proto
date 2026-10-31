@@ -2734,6 +2734,25 @@ message StaticCredentialEndpointBinding {
   string host = 1;
   uint32 port = 2;
   string path = 3;
+  // The binding is strict: a request at this endpoint is admitted only when
+  // each credential position it carries holds a placeholder of a credential
+  // bound here, and it carries at least one.
+  bool strict = 4;
+}
+
+// Where a static credential travels in an HTTP request, as its provider
+// profile credential declares it. Strict endpoint bindings check this
+// position in addition to the Authorization header.
+message StaticCredentialPlacement {
+  // "basic", "bearer", "header", "query", or "path".
+  string auth_style = 1;
+  // Header for basic, bearer, and header styles. Basic defaults to
+  // Authorization when empty.
+  string header_name = 2;
+  // Query parameter for the query style.
+  string query_param = 3;
+  // Path template containing {credential} exactly once, for the path style.
+  string path_template = 4;
 }
 
 // Endpoint allowlist for one static provider credential environment variable.
@@ -2753,6 +2772,9 @@ message StaticCredentialBinding {
   // gateway-managed refresh is configured. Supervisors that ignore it keep
   // resolving the credential's ordinary token.
   StaticCredentialRequestScope request_scope = 4;
+  // Present when the provider profile credential declares an auth_style.
+  // Strict endpoints check this position.
+  StaticCredentialPlacement placement = 5;
 }
 
 // Request-scoped refresh metadata for one static credential environment key.

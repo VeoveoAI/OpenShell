@@ -1267,6 +1267,7 @@ network_policies:
                 host: "lore.example.test".to_string(),
                 port: 443,
                 path: "/**".to_string(),
+                strict: false,
             }],
             credential_identity: "lore-provider-id:LORE_TOKEN".to_string(),
             workload_credential_handle: String::new(),
@@ -1282,6 +1283,7 @@ network_policies:
                 }),
                 provider_attachment_epoch: EPOCH.to_string(),
             }),
+            placement: None,
         }
     }
 

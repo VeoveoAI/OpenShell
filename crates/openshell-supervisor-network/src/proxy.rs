@@ -196,6 +196,46 @@ fn build_credential_endpoint_mismatch_event(
         .build()
 }
 
+fn build_credential_placeholder_required_event(
+    method: &str,
+    host: &str,
+    port: u16,
+    policy_name: &str,
+) -> openshell_ocsf::OcsfEvent {
+    HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::for_http_method(method))
+        .http_request(HttpRequest {
+            http_method: method.parse().expect("HTTP method parsing is infallible"),
+            url: None,
+        })
+        .http_response(HttpResponse { code: 403 })
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(SeverityId::High)
+        .status(StatusId::Failure)
+        .dst_endpoint(Endpoint::from_domain(host, port))
+        .firewall_rule(policy_name, "credential-binding")
+        .message(format!(
+            "Credential use denied: {host}:{port} requires a bound credential placeholder"
+        ))
+        .status_detail("credential_placeholder_required")
+        .build()
+}
+
+fn emit_credential_placeholder_required(method: &str, host: &str, port: u16, policy_name: &str) {
+    ocsf_emit!(build_credential_placeholder_required_event(
+        method,
+        host,
+        port,
+        policy_name
+    ));
+    ocsf_emit!(crate::l7::build_credential_placeholder_required_finding(
+        policy_name,
+        host,
+        "Strict credential binding requires a bound placeholder; request denied",
+    ));
+}
+
 fn emit_credential_endpoint_mismatch(method: &str, host: &str, port: u16, policy_name: &str) {
     let event = build_credential_endpoint_mismatch_event(method, host, port, policy_name);
     ocsf_emit!(event);
@@ -5050,6 +5090,26 @@ fn rewrite_forward_request(
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .map_or(used, |p| p + 4);
+    if let Some(resolver) = secret_resolver.filter(|resolver| resolver.is_strict()) {
+        // Check the canonical origin-form target the upstream receives, not
+        // the received absolute form, so dot segments cannot move a path
+        // credential out of the checked position.
+        let line_end = raw[..header_end]
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .map_or(header_end, |position| position + 2);
+        let method = raw[..line_end]
+            .split(|byte| *byte == b' ')
+            .next()
+            .unwrap_or_default();
+        let mut checked = Vec::with_capacity(header_end + path.len());
+        checked.extend_from_slice(method);
+        checked.push(b' ');
+        checked.extend_from_slice(path.as_bytes());
+        checked.extend_from_slice(b" HTTP/1.1\r\n");
+        checked.extend_from_slice(&raw[line_end..header_end]);
+        resolver.check_strict_binding(&checked)?;
+    }
     let websocket_upgrade = crate::l7::rest::request_is_websocket_upgrade(&raw[..header_end]);
     let upstream_path = match secret_resolver {
         Some(resolver) => secrets::rewrite_target_for_eval(path, resolver)?.resolved,
@@ -6544,19 +6604,26 @@ async fn handle_forward_proxy(
                     .end(openshell_core::proto::MiddlewareSessionEndReason::Cancellation)
                     .await;
             }
-            if e.is_endpoint_mismatch() {
+            if e.is_denied() {
                 if let Some(observer) = endpoint_observer.as_ref() {
                     observer.observe_credential_failure(true);
                 }
-                emit_credential_endpoint_mismatch(method, &host_lc, port, policy_str);
-                respond(
-                    client,
-                    &build_json_error_response(
-                        403,
-                        "Forbidden",
+                let (error, message) = if e.is_placeholder_required() {
+                    emit_credential_placeholder_required(method, &host_lc, port, policy_str);
+                    (
+                        "credential_placeholder_required",
+                        "this endpoint binds its credential strictly; send the provider credential placeholder",
+                    )
+                } else {
+                    emit_credential_endpoint_mismatch(method, &host_lc, port, policy_str);
+                    (
                         "credential_endpoint_mismatch",
                         "credential is not authorized for this request endpoint",
-                    ),
+                    )
+                };
+                respond(
+                    client,
+                    &build_json_error_response(403, "Forbidden", error, message),
                 )
                 .await?;
                 client.shutdown().await.into_diagnostic()?;
@@ -10788,10 +10855,12 @@ network_policies:
                         host: "api.example.test".to_string(),
                         port: 80,
                         path: "/allowed/**".to_string(),
+                        strict: false,
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
                     request_scope: None,
+                    placement: None,
                 },
             )]),
             Vec::new(),
@@ -13155,10 +13224,12 @@ network_policies:
                         host: "api.example.com".to_string(),
                         port: 80,
                         path: "/allowed/**".to_string(),
+                        strict: false,
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
                     request_scope: None,
+                    placement: None,
                 },
             )]),
             Vec::new(),
@@ -13198,10 +13269,12 @@ network_policies:
                         host: "api.example.com".to_string(),
                         port: 80,
                         path: "/allowed/**".to_string(),
+                        strict: false,
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
                     request_scope: None,
+                    placement: None,
                 },
             )]),
             Vec::new(),
@@ -13230,6 +13303,90 @@ network_policies:
     }
 
     #[test]
+    fn forward_request_enforces_strict_credential_binding() {
+        use openshell_core::proto::{
+            StaticCredentialBinding, StaticCredentialEndpointBinding, StaticCredentialPlacement,
+        };
+
+        let state = ProviderCredentialState::from_bound_environment(
+            1,
+            TestHashMap::from([("API_TOKEN".to_string(), "secret".to_string())]),
+            TestHashMap::new(),
+            TestHashMap::new(),
+            TestHashMap::from([(
+                "API_TOKEN".to_string(),
+                StaticCredentialBinding {
+                    endpoints: vec![StaticCredentialEndpointBinding {
+                        host: "api.example.com".to_string(),
+                        port: 80,
+                        path: "/**".to_string(),
+                        strict: true,
+                    }],
+                    credential_identity: "provider-a:API_TOKEN".to_string(),
+                    workload_credential_handle: String::new(),
+                    request_scope: None,
+                    placement: Some(StaticCredentialPlacement {
+                        auth_style: "query".to_string(),
+                        query_param: "key".to_string(),
+                        ..Default::default()
+                    }),
+                },
+            )]),
+            Vec::new(),
+        )
+        .expect("bound provider state");
+        let placeholder = state.snapshot().child_env["API_TOKEN"].clone();
+        let resolver =
+            endpoint_secret_resolver(Some(&state), state.resolver(), "api.example.com", 80, "/v1")
+                .expect("scoped resolver");
+        let forward = |target: &str| {
+            let raw = format!(
+                "GET http://api.example.com{target} HTTP/1.1\r\nHost: api.example.com\r\n\r\n"
+            );
+            rewrite_forward_request(
+                raw.as_bytes(),
+                raw.len(),
+                target,
+                "api.example.com",
+                Some(&resolver),
+            )
+        };
+
+        let rewritten = forward(&format!("/v1?key={placeholder}")).expect("placeholder admitted");
+        let rewritten = String::from_utf8(rewritten).expect("utf-8");
+        assert!(
+            rewritten.starts_with("GET /v1?key=secret HTTP/1.1\r\n"),
+            "{rewritten}"
+        );
+
+        for target in ["/v1?key=typed-secret", "/v1"] {
+            let error = forward(target).expect_err("strict endpoint refuses");
+            assert!(error.is_placeholder_required(), "{target}");
+        }
+
+        // The check reads the canonical target the upstream receives.
+        let raw = format!(
+            "GET http://api.example.com/x?key={placeholder} HTTP/1.1\r\nHost: api.example.com\r\n\r\n"
+        );
+        let error = rewrite_forward_request(
+            raw.as_bytes(),
+            raw.len(),
+            "/x?key=typed-secret",
+            "api.example.com",
+            Some(&resolver),
+        )
+        .expect_err("canonical target holds a literal");
+        assert!(error.is_placeholder_required());
+
+        let event =
+            build_credential_placeholder_required_event("GET", "api.example.com", 80, "bound")
+                .to_json()
+                .expect("serialize");
+        assert_eq!(event["status_detail"], "credential_placeholder_required");
+        assert_eq!(event["http_response"]["code"], 403);
+    }
+
+    #[test]
     fn live_forward_state_is_authoritative_after_revocation() {
         use openshell_core::proto::{StaticCredentialBinding, StaticCredentialEndpointBinding};
 
@@ -13245,10 +13402,12 @@ network_policies:
                         host: "api.example.com".to_string(),
                         port: 80,
                         path: "/**".to_string(),
+                        strict: false,
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
                     request_scope: None,
+                    placement: None,
                 },
             )]),
             Vec::new(),
@@ -13926,8 +14085,10 @@ network_policies:
                         host: "api.example.com".into(),
                         port: 80,
                         path: "/**".into(),
+                        strict: false,
                     }],
                     request_scope: None,
+                    placement: None,
                 },
             )]),
             vec![],
@@ -14072,10 +14233,12 @@ network_policies:
                         host: "allowed.example.com".to_string(),
                         port: 80,
                         path: "/allowed/**".to_string(),
+                        strict: false,
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
                     request_scope: None,
+                    placement: None,
                 },
             )]),
             Vec::new(),
@@ -14164,10 +14327,12 @@ network_policies:
                             host: "allowed.example.com".to_string(),
                             port: 80,
                             path: "/allowed/**".to_string(),
+                            strict: false,
                         }],
                         credential_identity: format!("provider-a:{key}"),
                         workload_credential_handle: String::new(),
                         request_scope: None,
+                        placement: None,
                     },
                 )
             })

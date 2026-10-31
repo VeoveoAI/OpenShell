@@ -334,6 +334,9 @@ pub struct NetworkEndpoint {
 #[serde(deny_unknown_fields)]
 pub struct NetworkCredentialBinding {
     pub provider: String,
+    /// Admit a request only when its credential is a placeholder bound here.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub strict: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -838,7 +841,7 @@ fn inspect_endpoint(value: &serde_yml::Value, path: &str) -> InspectionResult {
     inspect_named(
         endpoint.get("credential_binding"),
         &join(path, "credential_binding"),
-        &["provider"],
+        &["provider", "strict"],
     )?;
     inspect_named(
         endpoint.get("json_rpc"),

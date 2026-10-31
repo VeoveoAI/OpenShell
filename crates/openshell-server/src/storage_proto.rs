@@ -164,10 +164,15 @@ mod tests {
     // the next activity report records it without a rewrite.
     // ComputeDriverCapabilities.supervisor_image and sandbox_runtime_image are
     // public only: GetGatewayInfo reports them, and no row stores them.
+    // NetworkCredentialBinding.strict is stored with policies and provider
+    // profile endpoints; older rows decode false, the non-strict binding.
+    // StaticCredentialEndpointBinding.strict and StaticCredentialBinding.placement
+    // (StaticCredentialPlacement) are public only: the gateway derives them for
+    // each provider environment delivery, and no row stores them.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "07a00f5225fbec97027af5b8e353afa5403be6bb34c7926ae161546d25aea272";
+        "97dd20fe8527353f9ddcac2496a1f1194a6f574415a67a9aae3baa871dc76c26";
     const DURABLE_SCHEMA_SHA256: &str =
-        "f8265f291bf9317a373f2c01ef45c9e6222805451d5d256a2b90e582fa7dc5bf";
+        "d7ed0efbf31db3c83e2c462b5e5e5166f58e023b512fa01297016d7a6d25a98f";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "6d11476ef9aae6310fbd43716c50f541e7e4cc6fef98c72fa9c64f6e87a9370a";
     // Encoded with the schema that omitted stable_placeholder. Keep these
@@ -703,7 +708,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (332, 29),
+                (333, 29),
                 (96, 22),
                 (84, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,

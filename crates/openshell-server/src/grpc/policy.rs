@@ -2194,6 +2194,7 @@ fn policy_static_credential_endpoint_bindings(
                     host: endpoint.host.clone(),
                     port,
                     path: endpoint.path.clone(),
+                    strict: binding.strict,
                 };
                 if !provider_bindings.contains(&candidate) {
                     provider_bindings.push(candidate);
@@ -2204,7 +2205,12 @@ fn policy_static_credential_endpoint_bindings(
 
     for endpoints in bindings.values_mut() {
         endpoints.sort_by(|left, right| {
-            (&left.host, left.port, &left.path).cmp(&(&right.host, right.port, &right.path))
+            (&left.host, left.port, &left.path, left.strict).cmp(&(
+                &right.host,
+                right.port,
+                &right.path,
+                right.strict,
+            ))
         });
     }
     Ok(bindings)
@@ -2249,15 +2255,52 @@ fn validate_policy_credential_binding_context(
                 "credential_binding provider '{provider_name}' has no provider profile"
             ))
         })?;
-        if !profile.to_proto().endpoints.is_empty() {
+        let profile = profile.to_proto();
+        if !profile.endpoints.is_empty() {
             return Err(Status::failed_precondition(format!(
                 "credential_binding provider '{provider_name}' profile already defines endpoints; \
                  profile endpoints remain the credential boundary"
             )));
         }
+        if bindings[provider_name].iter().any(|binding| binding.strict) {
+            validate_strict_binding_profile(provider_name, &profile)?;
+        }
     }
 
     validate_policy_signing_credential_sources(catalog, records, policy)?;
+    Ok(())
+}
+
+/// A strict binding checks the request's credential at the positions the
+/// profile's credentials declare, so each declaration must name a valid
+/// position, and no credential may be one the proxy injects itself.
+fn validate_strict_binding_profile(
+    provider_name: &str,
+    profile: &openshell_core::proto::ProviderProfile,
+) -> Result<(), Status> {
+    for credential in &profile.credentials {
+        if credential.token_grant.is_some() {
+            return Err(Status::failed_precondition(format!(
+                "credential_binding provider '{provider_name}' is strict, but its profile declares \
+                 token_grant credential '{}', whose header the proxy injects itself",
+                credential.name
+            )));
+        }
+        if openshell_core::secrets::strict::CredentialPosition::from_placement(
+            &credential.auth_style,
+            &credential.header_name,
+            &credential.query_param,
+            &credential.path_template,
+        )
+        .is_err()
+        {
+            return Err(Status::failed_precondition(format!(
+                "credential_binding provider '{provider_name}' is strict, but its profile credential \
+                 '{}' declares an invalid {} placement",
+                credential.name, credential.auth_style
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -3455,12 +3498,21 @@ fn hash_policy_credential_bindings(
         hasher.update(provider_name.as_bytes());
         let mut endpoints = bindings[provider_name].clone();
         endpoints.sort_by(|left, right| {
-            (&left.host, left.port, &left.path).cmp(&(&right.host, right.port, &right.path))
+            (&left.host, left.port, &left.path, left.strict).cmp(&(
+                &right.host,
+                right.port,
+                &right.path,
+                right.strict,
+            ))
         });
         for endpoint in endpoints {
             hasher.update(endpoint.host.as_bytes());
             hasher.update(endpoint.port.to_le_bytes());
             hasher.update(endpoint.path.as_bytes());
+            // Only strict bindings add input, so non-strict hashes are unchanged.
+            if endpoint.strict {
+                hasher.update(b"strict");
+            }
         }
     }
 }
@@ -10154,6 +10206,103 @@ mod tests {
     }
 
     #[test]
+    fn strict_policy_binding_requires_checkable_profile_credentials() {
+        let credential = |auth_style: &str, header_name: &str| {
+            openshell_core::proto::ProviderProfileCredential {
+                name: "api_key".to_string(),
+                env_vars: vec!["API_KEY".to_string()],
+                auth_style: auth_style.to_string(),
+                header_name: header_name.to_string(),
+                ..Default::default()
+            }
+        };
+        let profile = |credentials| openshell_core::proto::ProviderProfile {
+            id: "endpointless".to_string(),
+            credentials,
+            ..Default::default()
+        };
+
+        validate_strict_binding_profile("work", &profile(vec![credential("header", "x-api-key")]))
+            .expect("a declared header is checkable");
+        validate_strict_binding_profile("work", &profile(vec![credential("", "")]))
+            .expect("an undeclared placement leaves Authorization as the position");
+
+        let invalid = validate_strict_binding_profile(
+            "work",
+            &profile(vec![credential("header", "bad header")]),
+        )
+        .expect_err("invalid header name");
+        assert_eq!(invalid.code(), Code::FailedPrecondition);
+
+        let mut grant = credential("bearer", "authorization");
+        grant.token_grant = Some(openshell_core::proto::ProviderCredentialTokenGrant::default());
+        let grant = validate_strict_binding_profile("work", &profile(vec![grant]))
+            .expect_err("token grant");
+        assert_eq!(grant.code(), Code::FailedPrecondition);
+        assert!(grant.message().contains("token_grant"));
+    }
+
+    #[test]
+    fn policy_bindings_carry_strictness_to_static_credential_endpoints() {
+        let binding = |strict| {
+            Some(openshell_core::proto::NetworkCredentialBinding {
+                provider: "work".to_string(),
+                strict,
+            })
+        };
+        let policy = ProtoSandboxPolicy {
+            network_policies: HashMap::from([(
+                "bound".to_string(),
+                NetworkPolicyRule {
+                    name: "bound".to_string(),
+                    endpoints: vec![
+                        NetworkEndpoint {
+                            host: "strict.example.com".to_string(),
+                            ports: vec![443, 8443],
+                            credential_binding: binding(true),
+                            ..Default::default()
+                        },
+                        NetworkEndpoint {
+                            host: "lenient.example.com".to_string(),
+                            port: 443,
+                            credential_binding: binding(false),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+
+        let bindings =
+            policy_static_credential_endpoint_bindings(Some(&policy)).expect("valid bindings");
+        let endpoints = bindings["work"]
+            .iter()
+            .map(|endpoint| (endpoint.host.as_str(), endpoint.port, endpoint.strict))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            endpoints,
+            vec![
+                ("lenient.example.com", 443, false),
+                ("strict.example.com", 443, true),
+                ("strict.example.com", 8443, true),
+            ]
+        );
+
+        let hash = |bindings: &HashMap<String, Vec<StaticCredentialEndpointBinding>>| {
+            let mut hasher = Sha256::new();
+            hash_policy_credential_bindings(bindings, &mut hasher);
+            hasher.finalize()
+        };
+        let mut lenient = bindings.clone();
+        for endpoint in lenient.get_mut("work").expect("work bindings") {
+            endpoint.strict = false;
+        }
+        assert_ne!(hash(&bindings), hash(&lenient));
+    }
+
+    #[test]
     fn policy_bindings_add_scopes_only_for_attached_endpointless_providers() {
         let mut scopes = vec![CredentialedEndpointScope {
             host: "profile.example.com".to_string(),
@@ -10168,11 +10317,13 @@ mod tests {
                         host: "API.Bound.Example".to_string(),
                         port: 8443,
                         path: "/v1".to_string(),
+                        strict: false,
                     },
                     StaticCredentialEndpointBinding {
                         host: "api.bound.example".to_string(),
                         port: 8443,
                         path: "/v2".to_string(),
+                        strict: false,
                     },
                 ],
             ),
@@ -10182,6 +10333,7 @@ mod tests {
                     host: "profile-bound.example".to_string(),
                     port: 443,
                     path: String::new(),
+                    strict: false,
                 }],
             ),
             (
@@ -10190,6 +10342,7 @@ mod tests {
                     host: "unattached.example".to_string(),
                     port: 443,
                     path: String::new(),
+                    strict: false,
                 }],
             ),
         ]);
@@ -12054,6 +12207,7 @@ mod tests {
             .endpoints[0]
             .credential_binding = Some(openshell_core::proto::NetworkCredentialBinding {
             provider: provider.to_string(),
+            strict: false,
         });
         policy
     }
@@ -12068,6 +12222,7 @@ mod tests {
         endpoint.credential_binding =
             provider.map(|provider| openshell_core::proto::NetworkCredentialBinding {
                 provider: provider.to_string(),
+                strict: false,
             });
         policy
     }
@@ -14448,6 +14603,7 @@ mod tests {
             .endpoints[0]
             .credential_binding = Some(NetworkCredentialBinding {
             provider: "work-cloud".to_string(),
+            strict: false,
         });
         let bound_endpoint = &mut policy
             .network_policies
@@ -14559,6 +14715,7 @@ mod tests {
                 host: "api.cloud.example".to_string(),
                 port: 443,
                 path: String::new(),
+                strict: false,
             }]
         );
         assert_eq!(

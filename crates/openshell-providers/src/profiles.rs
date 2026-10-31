@@ -9,7 +9,7 @@ use openshell_core::mcp::{
 };
 use openshell_core::proto::{
     GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule, McpOptions, NetworkBinary,
-    NetworkEndpoint, NetworkPolicyRule, ProviderCredentialRefresh,
+    NetworkCredentialBinding, NetworkEndpoint, NetworkPolicyRule, ProviderCredentialRefresh,
     ProviderCredentialRefreshMaterial, ProviderCredentialRefreshOutput,
     ProviderCredentialRefreshStrategy, ProviderCredentialRequestScope,
     ProviderCredentialTokenGrantSubjectToken, ProviderCredentialTokenGrantType, ProviderProfile,
@@ -380,6 +380,20 @@ pub struct EndpointProfile {
     pub credential_signing: String,
     pub signing_service: String,
     pub signing_region: String,
+    /// How this endpoint binds the profile's static credentials. The
+    /// profile's own provider is implied, so only `strict` is authored.
+    pub credential_binding: Option<EndpointCredentialBindingProfile>,
+}
+
+/// Credential binding options for a provider profile endpoint.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointCredentialBindingProfile {
+    /// Admit a request at this endpoint only when every credential position
+    /// it carries holds a placeholder of a credential bound here, and it
+    /// carries at least one.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub strict: bool,
 }
 
 // EndpointProfile needs the complete endpoint before it can decide whether an
@@ -442,6 +456,8 @@ struct EndpointProfileSerde {
     signing_service: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     signing_region: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential_binding: Option<EndpointCredentialBindingProfile>,
 }
 
 impl<'de> Deserialize<'de> for EndpointProfile {
@@ -1045,7 +1061,17 @@ impl ProviderTypeProfile {
     pub fn network_policy_rule(&self, rule_name: &str) -> NetworkPolicyRule {
         NetworkPolicyRule {
             name: rule_name.to_string(),
-            endpoints: self.endpoints.iter().map(endpoint_to_proto).collect(),
+            endpoints: self
+                .endpoints
+                .iter()
+                .map(|endpoint| NetworkEndpoint {
+                    // Profile binding options become the provider's static
+                    // credential bindings, not network policy. A composed
+                    // policy carries only bindings that name a provider.
+                    credential_binding: None,
+                    ..endpoint_to_proto(endpoint)
+                })
+                .collect(),
             binaries: self.binaries.iter().map(binary_to_proto).collect(),
         }
     }
@@ -1710,9 +1736,15 @@ fn endpoint_to_proto(endpoint: &EndpointProfile) -> NetworkEndpoint {
         credential_signing: endpoint.credential_signing.clone(),
         signing_service: endpoint.signing_service.clone(),
         signing_region: endpoint.signing_region.clone(),
-        // Credential bindings reference a concrete sandbox provider instance
-        // and therefore cannot be authored by a reusable provider profile.
-        credential_binding: None,
+        // A profile endpoint binds the profile's own provider, so it carries
+        // only the binding options. The provider instance is named only by a
+        // sandbox policy binding for an endpointless profile.
+        credential_binding: endpoint.credential_binding.as_ref().map(|binding| {
+            NetworkCredentialBinding {
+                provider: String::new(),
+                strict: binding.strict,
+            }
+        }),
     }
 }
 
@@ -1764,6 +1796,11 @@ fn endpoint_from_proto(endpoint: &NetworkEndpoint) -> EndpointProfile {
         credential_signing: endpoint.credential_signing.clone(),
         signing_service: endpoint.signing_service.clone(),
         signing_region: endpoint.signing_region.clone(),
+        credential_binding: endpoint.credential_binding.as_ref().map(|binding| {
+            EndpointCredentialBindingProfile {
+                strict: binding.strict,
+            }
+        }),
     };
     materialize_mcp_endpoint_defaults(&mut profile);
     profile
@@ -3156,6 +3193,41 @@ pub fn validate_profile_set(
                 }
             }
 
+            if endpoint
+                .credential_binding
+                .as_ref()
+                .is_some_and(|binding| binding.strict)
+            {
+                for (conflicting, conflict) in [
+                    (
+                        !endpoint.credential_signing.is_empty(),
+                        "credential_signing",
+                    ),
+                    (
+                        endpoint.allow_uninspected_credentials,
+                        "allow_uninspected_credentials",
+                    ),
+                    (
+                        profile
+                            .credentials
+                            .iter()
+                            .any(|credential| credential.token_grant.is_some()),
+                        "token_grant credentials",
+                    ),
+                ] {
+                    if conflicting {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            format!("endpoints[{index}].credential_binding.strict"),
+                            format!(
+                                "strict credential binding cannot be combined with {conflict}; strict binding needs the request's own credential"
+                            ),
+                        ));
+                    }
+                }
+            }
+
             if profile.has_credentialed_endpoints()
                 && !endpoint.allow_uninspected_credentials
                 && (endpoint.protocol.trim().is_empty()
@@ -3175,6 +3247,36 @@ pub fn validate_profile_set(
                         endpoint.host, endpoint.port
                     ),
                 ));
+            }
+        }
+
+        // A strict endpoint checks each credential at the position its
+        // placement declares, so every declaration must name a valid one.
+        if profile.endpoints.iter().any(|endpoint| {
+            endpoint
+                .credential_binding
+                .as_ref()
+                .is_some_and(|binding| binding.strict)
+        }) {
+            for credential in &profile.credentials {
+                if let Err(message) =
+                    openshell_core::secrets::strict::CredentialPosition::from_placement(
+                        &credential.auth_style,
+                        &credential.header_name,
+                        &credential.query_param,
+                        &credential.path_template,
+                    )
+                {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        "credentials.auth_style",
+                        format!(
+                            "credential '{}' cannot be checked by a strict endpoint: {message}",
+                            credential.name
+                        ),
+                    ));
+                }
             }
         }
 
@@ -3299,6 +3401,7 @@ fn additional_l7_profile_fields(endpoint: &EndpointProfile) -> Vec<&'static str>
         ),
         ("signing_service", !endpoint.signing_service.is_empty()),
         ("signing_region", !endpoint.signing_region.is_empty()),
+        ("credential_binding", endpoint.credential_binding.is_some()),
     ] {
         if present {
             fields.push(name);
@@ -3831,10 +3934,10 @@ mod tests {
     use openshell_core::proto::{ProviderCredentialTokenGrantType, ProviderProfileCategory};
 
     use super::{
-        CredentialRequestScopeProfile, DiscoveryProfile, EndpointProfile, L7AllowProfile,
-        L7QueryMatcherProfile, ProfileDurationWkt, ProfileError, ProfileValidationDiagnostic,
-        ProviderTypeProfile, is_mcp_diagnostic_field, normalize_profile_id,
-        parse_profile_catalog_yamls, parse_profile_json, parse_profile_yaml,
+        CredentialRequestScopeProfile, DiscoveryProfile, EndpointCredentialBindingProfile,
+        EndpointProfile, L7AllowProfile, L7QueryMatcherProfile, ProfileDurationWkt, ProfileError,
+        ProfileValidationDiagnostic, ProviderTypeProfile, is_mcp_diagnostic_field,
+        normalize_profile_id, parse_profile_catalog_yamls, parse_profile_json, parse_profile_yaml,
         profile_duration_to_proto, profile_to_json, profile_to_yaml, profiles_to_json,
         profiles_to_yaml, token_grant_from_proto, token_grant_to_proto, validate_profile_duration,
         validate_profile_set,
@@ -4286,9 +4389,11 @@ credentials:
                     host: endpoint.host.clone(),
                     port: endpoint.port,
                     path: endpoint.path.clone(),
+                    strict: false,
                 })
                 .collect(),
             request_scope: None,
+            placement: None,
         };
         for id in ["codex", "claude-code", "copilot"] {
             let profile = example_profile(id);
@@ -6195,6 +6300,126 @@ credentials:
             .expect("token endpoint diagnostic should be reported");
 
         assert_eq!(diagnostic.message, "token_endpoint must be an absolute URL");
+    }
+
+    const STRICT_PROFILE: &str = r"
+id: strict-api
+display_name: Strict API
+credentials:
+  - name: api_key
+    env_vars: [STRICT_API_KEY]
+    auth_style: header
+    header_name: x-api-key
+endpoints:
+  - host: api.example.com
+    port: 443
+    protocol: rest
+    access: full
+    credential_binding:
+      strict: true
+  - host: uploads.example.com
+    port: 443
+    protocol: rest
+    access: full
+";
+
+    #[test]
+    fn strict_credential_binding_round_trips_without_entering_network_policy() {
+        let profile = parse_profile_yaml(STRICT_PROFILE).expect("profile should parse");
+        assert!(validate_profile_set(&[("strict.yaml".to_string(), profile.clone())]).is_empty());
+        assert_eq!(
+            profile.endpoints[0].credential_binding,
+            Some(EndpointCredentialBindingProfile { strict: true })
+        );
+        assert_eq!(profile.endpoints[1].credential_binding, None);
+
+        let proto = profile.to_proto();
+        let binding = proto.endpoints[0]
+            .credential_binding
+            .as_ref()
+            .expect("profile proto keeps the binding options");
+        assert!(binding.strict);
+        assert!(binding.provider.is_empty());
+        assert!(proto.endpoints[1].credential_binding.is_none());
+        assert_eq!(ProviderTypeProfile::from_proto(&proto), profile);
+
+        let yaml = serde_yml::to_string(&profile).expect("serialize profile");
+        assert!(
+            yaml.contains("    credential_binding:\n      strict: true\n"),
+            "{yaml}"
+        );
+        assert_eq!(parse_profile_yaml(&yaml).expect("reparse"), profile);
+
+        assert!(
+            profile
+                .network_policy_rule("_provider_strict")
+                .endpoints
+                .iter()
+                .all(|endpoint| endpoint.credential_binding.is_none())
+        );
+    }
+
+    #[test]
+    fn profile_credential_binding_cannot_name_a_provider() {
+        let yaml = STRICT_PROFILE.replace("strict: true", "provider: work-api");
+        assert!(parse_profile_yaml(&yaml).is_err());
+    }
+
+    #[test]
+    fn strict_credential_binding_rejects_endpoints_the_proxy_cannot_check() {
+        for (addition, conflict) in [
+            (
+                "    credential_signing: sigv4\n    signing_service: s3\n",
+                "credential_signing",
+            ),
+            (
+                "    allow_uninspected_credentials: true\n",
+                "allow_uninspected_credentials",
+            ),
+        ] {
+            let yaml = STRICT_PROFILE.replace(
+                "      strict: true\n",
+                &format!("      strict: true\n{addition}"),
+            );
+            let profile = parse_profile_yaml(&yaml).expect("profile should parse");
+            let diagnostics = validate_profile_set(&[("strict.yaml".to_string(), profile)]);
+            assert!(
+                diagnostics.iter().any(|diagnostic| {
+                    diagnostic.field == "endpoints[0].credential_binding.strict"
+                        && diagnostic.message.contains(conflict)
+                }),
+                "{diagnostics:?}"
+            );
+        }
+
+        let yaml = STRICT_PROFILE.replace("header_name: x-api-key", "header_name: bad header");
+        let profile = parse_profile_yaml(&yaml).expect("profile should parse");
+        let diagnostics = validate_profile_set(&[("strict.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic.field == "credentials.auth_style"
+                    && diagnostic
+                        .message
+                        .contains("cannot be checked by a strict endpoint")
+            }),
+            "{diagnostics:?}"
+        );
+
+        // A token grant injects its own header, which a strict endpoint would
+        // read as a literal credential.
+        let yaml = STRICT_PROFILE.replace(
+            "    header_name: x-api-key\n",
+            "    header_name: x-api-key\n  - name: grant\n    auth_style: bearer\n    header_name: authorization\n    token_grant:\n      token_endpoint: https://auth.example.com/token\n",
+        );
+        let profile = parse_profile_yaml(&yaml).expect("profile should parse");
+        let diagnostics = validate_profile_set(&[("strict.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic.field == "endpoints[0].credential_binding.strict"
+                    && diagnostic.message.contains("token_grant credentials")
+            }),
+            "{diagnostics:?}"
+        );
     }
 
     #[test]

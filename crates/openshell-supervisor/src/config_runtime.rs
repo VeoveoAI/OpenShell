@@ -1986,10 +1986,12 @@ mod tests {
                         host: "tools.example.com".into(),
                         port: 443,
                         path: "/v1/**".into(),
+                        strict: false,
                     }],
                     credential_identity: "provider-a:EXTERNAL_TOKEN".into(),
                     workload_credential_handle: String::new(),
                     request_scope: None,
+                    placement: None,
                 },
             );
         }

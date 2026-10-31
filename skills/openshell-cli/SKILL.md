@@ -150,6 +150,12 @@ when a placeholder is present but requests receive
 `credential_endpoint_mismatch`. A profileless static provider fails closed
 because the gateway cannot construct a binding.
 
+An endpoint whose profile or sandbox policy sets `credential_binding.strict`
+answers `credential_placeholder_required` when the request's credential is not
+a placeholder bound there, or the request carries none. Have the workload send
+the provider's placeholder at `Authorization` or the position its profile
+`auth_style` declares; do not remove `strict` to admit a typed value.
+
 When an inspected request receives `request_authority_mismatch`, compare its
 HTTP authority with the CONNECT tunnel endpoint. The host and effective port
 must match. For a tunnel to `api.example.com:8443`, send

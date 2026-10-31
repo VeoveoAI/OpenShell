@@ -36,3 +36,20 @@ resolver view only. Tokens come from `MintScopedProviderCredential` with the
 instance's gateway credentials, are cached per attachment, credential identity,
 and scope until expiry minus `refresh_before` (at most 1,024, expired entries
 evicted first, then the oldest), and are minted once per key at a time.
+
+## Strict credential bindings
+
+A static credential binding endpoint can be strict. The endpoint-scoped resolver
+from `ProviderCredentialState::resolver_and_body_classifier_for_endpoint` then
+carries a `StrictCredentialBinding` built from the credentials bound at that
+request endpoint: their environment keys and the request position each
+credential's profile placement declares, plus `Authorization`.
+`SecretResolver::check_strict_binding` runs before any placeholder rewriting in
+`rewrite_http_header_block` (inspected HTTP/1, passthrough with credentials, and
+HTTP/2) and in the forward proxy's `rewrite_forward_request`. It reads only
+placeholder syntax and environment keys, never a secret, and returns a
+placeholder-required error that the relay and the forward proxy answer with 403
+`credential_placeholder_required`, a denied HTTP activity event, and an
+`openshell.provider_credential.placeholder_required` finding. An origin-form
+request without `Host` keeps a credential-free view of a strict endpoint, so its
+positions are still checked.

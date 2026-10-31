@@ -769,11 +769,20 @@ func (x *MiddlewareEndpointSelector) GetExclude() []string {
 }
 
 // Binds a policy endpoint to static credentials from a sandbox provider.
+//
+// In a sandbox policy the binding names the attached provider. In a provider
+// profile endpoint the profile's own provider is implied, so provider stays
+// empty and only strict applies.
 type NetworkCredentialBinding struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Name of the provider attached to this sandbox whose static credentials
 	// may be resolved for requests admitted by this endpoint.
-	Provider      string `protobuf:"bytes,1,opt,name=provider,proto3" json:"provider,omitempty"`
+	Provider string `protobuf:"bytes,1,opt,name=provider,proto3" json:"provider,omitempty"`
+	// When true, a request at this endpoint is admitted only when every
+	// credential position it carries holds a placeholder of a credential bound
+	// here, and it carries at least one. A literal value, an unbound
+	// placeholder, or no credential is refused. Defaults to false.
+	Strict        bool `protobuf:"varint,2,opt,name=strict,proto3" json:"strict,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -813,6 +822,13 @@ func (x *NetworkCredentialBinding) GetProvider() string {
 		return x.Provider
 	}
 	return ""
+}
+
+func (x *NetworkCredentialBinding) GetStrict() bool {
+	if x != nil {
+		return x.Strict
+	}
+	return false
 }
 
 // A network endpoint (host + port) with optional L7 inspection config.
@@ -2515,9 +2531,10 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x05order\x18\x06 \x01(\x05R\x05order\"P\n" +
 	"\x1aMiddlewareEndpointSelector\x12\x18\n" +
 	"\ainclude\x18\x01 \x03(\tR\ainclude\x12\x18\n" +
-	"\aexclude\x18\x02 \x03(\tR\aexclude\"6\n" +
+	"\aexclude\x18\x02 \x03(\tR\aexclude\"N\n" +
 	"\x18NetworkCredentialBinding\x12\x1a\n" +
-	"\bprovider\x18\x01 \x01(\tR\bprovider\"\x87\f\n" +
+	"\bprovider\x18\x01 \x01(\tR\bprovider\x12\x16\n" +
+	"\x06strict\x18\x02 \x01(\bR\x06strict\"\x87\f\n" +
 	"\x0fNetworkEndpoint\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x12\x12\n" +
 	"\x04port\x18\x02 \x01(\rR\x04port\x12\x1a\n" +

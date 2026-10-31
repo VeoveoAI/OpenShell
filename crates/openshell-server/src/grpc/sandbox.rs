@@ -6791,6 +6791,7 @@ mod tests {
                     port: 443,
                     credential_binding: Some(openshell_core::proto::NetworkCredentialBinding {
                         provider: "work-gcp".to_string(),
+                        strict: false,
                     }),
                     ..Default::default()
                 }],

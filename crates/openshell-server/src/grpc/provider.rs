@@ -27,7 +27,7 @@ use openshell_core::proto::{
     CredentialHandle, Provider, ProviderCredentialRefreshStrategy, ProviderCredentialRequestScope,
     ProviderCredentialTokenGrantAudienceOverride, ProviderCredentialTokenGrantType,
     ProviderProfile, ProviderProfileCredential, Sandbox, StaticCredentialBinding,
-    StaticCredentialEndpointBinding, StaticCredentialRequestScope,
+    StaticCredentialEndpointBinding, StaticCredentialPlacement, StaticCredentialRequestScope,
 };
 use openshell_core::telemetry::{
     LifecycleOperation, ProviderProfile as TelemetryProviderProfile, TelemetryOutcome,
@@ -1237,6 +1237,10 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
                             host: endpoint.host.clone(),
                             port,
                             path: endpoint.path.clone(),
+                            strict: endpoint
+                                .credential_binding
+                                .as_ref()
+                                .is_some_and(|binding| binding.strict),
                         })
                 })
                 .collect::<Vec<_>>()
@@ -1263,6 +1267,15 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
             (None, None) => None,
         };
         let has_no_usable_endpoint = effective_endpoints.is_some_and(Vec::is_empty);
+        // Only a strict endpoint reads placement, so a provider without one
+        // receives exactly the bindings it received before strict binding.
+        let placements = if effective_endpoints
+            .is_some_and(|endpoints| endpoints.iter().any(|endpoint| endpoint.strict))
+        {
+            static_credential_placements_by_key(profile_proto.as_ref())
+        } else {
+            HashMap::new()
+        };
         let refresh_epochs = refresh_authorization_epochs_by_key(record)?;
         let request_scopes = request_scoped_refresh_by_key(profile.as_ref(), record);
 
@@ -1343,6 +1356,7 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
                         profile_stable_placeholder_keys.contains(key),
                     );
                     binding.request_scope = request_scopes.get(key).cloned();
+                    binding.placement = placements.get(key).cloned();
                     static_credential_bindings.insert(key.clone(), binding);
                 }
             } else {
@@ -1421,6 +1435,7 @@ pub(super) async fn resolve_provider_environment_from_records_with_policy_bindin
                         profile_stable_placeholder_keys.contains(&key),
                     );
                     binding.request_scope = request_scopes.get(&key).cloned();
+                    binding.placement = placements.get(&key).cloned();
                     static_credential_bindings.insert(key.clone(), binding);
                 }
             } else {
@@ -1627,6 +1642,35 @@ fn request_scoped_refresh_by_key(
     scopes
 }
 
+/// Request placement each stored credential key declares in its profile.
+/// Strict endpoint bindings check these positions in the supervisor.
+fn static_credential_placements_by_key(
+    profile: Option<&ProviderProfile>,
+) -> HashMap<String, StaticCredentialPlacement> {
+    let Some(profile) = profile else {
+        return HashMap::new();
+    };
+    profile
+        .credentials
+        .iter()
+        .filter(|credential| !credential.auth_style.trim().is_empty())
+        .flat_map(|credential| {
+            let placement = StaticCredentialPlacement {
+                auth_style: credential.auth_style.clone(),
+                header_name: credential.header_name.clone(),
+                query_param: credential.query_param.clone(),
+                path_template: credential.path_template.clone(),
+            };
+            let keys = if credential.env_vars.is_empty() {
+                vec![credential.name.clone()]
+            } else {
+                credential.env_vars.clone()
+            };
+            keys.into_iter().map(move |key| (key, placement.clone()))
+        })
+        .collect()
+}
+
 fn static_credential_binding(
     sandbox_id: Option<&str>,
     record: &ProviderEnvironmentRecord,
@@ -1656,6 +1700,7 @@ fn static_credential_binding(
         credential_identity,
         workload_credential_handle,
         request_scope: None,
+        placement: None,
     }
 }
 
@@ -12242,6 +12287,7 @@ mod tests {
             host: "api.example.com".to_string(),
             port: 443,
             path: "/v1/**".to_string(),
+            strict: false,
         }];
         let external_binding =
             |sandbox, record: &ProviderEnvironmentRecord, key, endpoints: &[_]| {
@@ -12267,6 +12313,7 @@ mod tests {
                 host: host.to_string(),
                 port,
                 path: path.to_string(),
+                strict: false,
             }];
             assert!(
                 initial.workload_credential_handle
@@ -12296,11 +12343,13 @@ mod tests {
                 host: "API.EXAMPLE.COM.".to_string(),
                 port: 443,
                 path: "**".to_string(),
+                strict: false,
             },
             StaticCredentialEndpointBinding {
                 host: "files.example.com".to_string(),
                 port: 8443,
                 path: "/v1/**".to_string(),
+                strict: false,
             },
         ];
         let mut reordered = endpoints.clone();
@@ -12360,6 +12409,7 @@ mod tests {
                     host: "api.example.com".to_string(),
                     port: 443,
                     path: "/v2/**".to_string(),
+                    strict: false,
                 }],
             ),
         ] {
@@ -12921,6 +12971,7 @@ mod tests {
                 host: "storage.googleapis.com".to_string(),
                 port: 443,
                 path: "/**".to_string(),
+                strict: false,
             }],
         )]);
 
@@ -12942,6 +12993,90 @@ mod tests {
                 .get("GCP_ADC_ACCESS_TOKEN")
                 .map(|binding| binding.endpoints.as_slice()),
             Some(policy_bindings["my-google-cloud"].as_slice())
+        );
+        assert_eq!(
+            result.static_credential_bindings["GCP_ADC_ACCESS_TOKEN"].placement, None,
+            "a binding without a strict endpoint carries no placement"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_env_delivers_strict_profile_endpoints_and_placement() {
+        let store = test_store().await;
+        let mut profile = custom_profile("strict-binding-test");
+        let mut credential = static_credential("api_key", "STRICT_API_KEY", true);
+        credential.auth_style = "header".to_string();
+        credential.header_name = "x-api-key".to_string();
+        profile.credentials = vec![credential];
+        profile.endpoints = vec![
+            NetworkEndpoint {
+                host: "api.example.com".to_string(),
+                port: 443,
+                protocol: "rest".to_string(),
+                access: openshell_core::proto::NetworkAccessPreset::Full as i32,
+                credential_binding: Some(openshell_core::proto::NetworkCredentialBinding {
+                    provider: String::new(),
+                    strict: true,
+                }),
+                ..Default::default()
+            },
+            NetworkEndpoint {
+                host: "uploads.example.com".to_string(),
+                port: 443,
+                protocol: "rest".to_string(),
+                access: openshell_core::proto::NetworkAccessPreset::Full as i32,
+                ..Default::default()
+            },
+        ];
+        let sources = ProviderProfileSources::from_test_profiles(vec![profile]);
+        let catalog = sources
+            .snapshot_catalog(&store, "default")
+            .await
+            .expect("test profile catalog");
+        create_provider_record_with_catalog(
+            &store,
+            &catalog,
+            "default",
+            provider_with_credential_value(
+                "strict-provider",
+                "strict-binding-test",
+                "STRICT_API_KEY",
+                "api-key-v1",
+            ),
+        )
+        .await
+        .expect("provider with strict endpoint");
+        let records =
+            load_provider_environment_records(&store, "default", &["strict-provider".to_string()])
+                .await
+                .expect("provider records");
+
+        let result = resolve_provider_environment_from_records_with_policy_bindings(
+            &catalog,
+            &records,
+            &HashMap::new(),
+        )
+        .await
+        .expect("provider environment");
+
+        let binding = &result.static_credential_bindings["STRICT_API_KEY"];
+        let strictness = binding
+            .endpoints
+            .iter()
+            .map(|endpoint| (endpoint.host.as_str(), endpoint.strict))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            strictness,
+            HashMap::from([("api.example.com", true), ("uploads.example.com", false)])
+        );
+        assert_eq!(
+            binding.placement,
+            Some(StaticCredentialPlacement {
+                auth_style: "header".to_string(),
+                header_name: "x-api-key".to_string(),
+                query_param: String::new(),
+                path_template: String::new(),
+            })
         );
     }
 
@@ -12986,6 +13121,7 @@ mod tests {
                 host: "tools.example.com".to_string(),
                 port: 443,
                 path: "/mcp/**".to_string(),
+                strict: false,
             }],
         )]);
         let credentials = crate::credentials::CredentialRuntime::from_config(
@@ -13091,6 +13227,7 @@ mod tests {
                 host: "storage.googleapis.com".to_string(),
                 port: 443,
                 path: "/**".to_string(),
+                strict: false,
             }],
         )]);
         let bound = resolve_provider_environment_from_records_with_policy_bindings_and_credentials(

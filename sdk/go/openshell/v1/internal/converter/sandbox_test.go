@@ -677,6 +677,7 @@ func TestSandboxRoundTrip(t *testing.T) {
 								Protocol: "rest",
 								CredentialBinding: &v1.NetworkCredentialBinding{
 									Provider: "api-credentials",
+									Strict:   true,
 								},
 							},
 						},
@@ -729,6 +730,7 @@ func TestSandboxRoundTrip(t *testing.T) {
 	assert.Equal(t, "api.example.com", webRule.Endpoints[0].Host)
 	require.NotNil(t, webRule.Endpoints[0].CredentialBinding)
 	assert.Equal(t, "api-credentials", webRule.Endpoints[0].CredentialBinding.Provider)
+	assert.True(t, webRule.Endpoints[0].CredentialBinding.Strict)
 }
 
 func TestMcpOptionsConversionCopiesVersions(t *testing.T) {

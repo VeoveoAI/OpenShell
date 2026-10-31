@@ -67,6 +67,37 @@ pub(crate) fn build_credential_endpoint_mismatch_finding(
         .build()
 }
 
+/// Finding for a request that a strict credential binding refused because a
+/// credential position held something other than a bound placeholder, or the
+/// request carried no credential. The refused value is never recorded.
+pub(crate) fn build_credential_placeholder_required_finding(
+    policy_name: &str,
+    host: &str,
+    message: &str,
+) -> openshell_ocsf::OcsfEvent {
+    use openshell_ocsf::{
+        ActionId, ActivityId, DetectionFindingBuilder, DispositionId, FindingInfo, SeverityId,
+    };
+
+    DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Open)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(SeverityId::High)
+        .is_alert(true)
+        .finding_info(FindingInfo::new(
+            "openshell.provider_credential.placeholder_required",
+            "Request to a strictly bound endpoint without its credential placeholder",
+        ))
+        .evidence_pairs(&[
+            ("policy", policy_name),
+            ("host", host),
+            ("disposition", "denied"),
+        ])
+        .message(message)
+        .build()
+}
+
 /// TLS handling mode for proxy connections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TlsMode {
