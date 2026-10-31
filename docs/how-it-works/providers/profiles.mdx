@@ -245,7 +245,7 @@ The default is `false`. Endpoints without `strict` behave as described above.
 
 The request's credential is what it carries at a credential position. The
 `Authorization` header is always a credential position. Each static credential
-bound at the endpoint adds the position its `auth_style` declares:
+of the strictly binding provider adds the position its `auth_style` declares:
 
 | `auth_style` | Credential position | What the position must hold |
 |---|---|---|
@@ -278,16 +278,23 @@ A placeholder of a credential bound only at other endpoints still returns
 `credential_placeholder_required`, and OCSF output includes the denied activity
 and a detection finding. These events never contain the refused value.
 
-When one binding that covers a request's host, port, and path is strict, the
-endpoint is strict for every static credential bound there. Strict binding
-checks only credential positions; it does not inspect other headers, cookies,
-or the request body. It needs the request's credential as the workload sent
-it, so OpenShell rejects `strict` together with `credential_signing` or
-`allow_uninspected_credentials`, and in a profile that declares a
-`token_grant` credential. A strict profile endpoint must use L7 inspection.
-Strictness travels with the credential's binding: while OpenShell withholds a
-credential from the sandbox, for example after it expires, its endpoints are
-not strictly bound.
+When a strict binding covers a request's host, port, and path, every request
+there is checked, and a placeholder of any static credential bound there is
+admissible. Strict binding checks only credential positions; it does not
+inspect other headers, cookies, or the request body. It needs the request's
+credential as the workload sent it, so OpenShell rejects `strict` together with
+`credential_signing` or `allow_uninspected_credentials`, and in a profile that
+declares a `token_grant` credential. A strict profile endpoint must use L7
+inspection.
+
+Strictness belongs to the endpoint, not to the credential value. The sandbox
+receives its strict endpoints with every provider environment, including one
+that withholds credentials, for example after a credential expires or its
+refresh fails. While a credential is withheld, its strict endpoints still
+refuse a literal value or a request without a credential with
+`credential_placeholder_required`, and its placeholder fails closed as for any
+withheld credential. A sandbox keeps its strict endpoints until it installs a
+provider environment that changes them.
 
 ## Roadmap
 
