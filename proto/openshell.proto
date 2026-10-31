@@ -2734,15 +2734,29 @@ message StaticCredentialEndpointBinding {
   string host = 1;
   uint32 port = 2;
   string path = 3;
-  // The binding is strict: a request at this endpoint is admitted only when
-  // each credential position it carries holds a placeholder of a credential
-  // bound here, and it carries at least one.
-  bool strict = 4;
+}
+
+// One endpoint at which an attached provider binds its static credentials
+// strictly. A request matching host, port, and path is admitted only when
+// every credential position it carries holds a placeholder of a credential
+// bound there, and it carries at least one. The gateway delivers this
+// requirement whether or not the provider's credential values are delivered,
+// so a withheld credential leaves its endpoints strict.
+message StrictCredentialEndpoint {
+  string host = 1;
+  uint32 port = 2;
+  string path = 3;
+  // Environment keys of the provider's static credentials bound here,
+  // including keys whose values are withheld.
+  repeated string environment_keys = 4;
+  // Request positions the provider's credentials declare. The Authorization
+  // header is always a position and is not listed.
+  repeated StaticCredentialPlacement placements = 5;
 }
 
 // Where a static credential travels in an HTTP request, as its provider
-// profile credential declares it. Strict endpoint bindings check this
-// position in addition to the Authorization header.
+// profile credential declares it. Strict endpoints check this position in
+// addition to the Authorization header.
 message StaticCredentialPlacement {
   // "basic", "bearer", "header", "query", or "path".
   string auth_style = 1;
@@ -2772,9 +2786,6 @@ message StaticCredentialBinding {
   // gateway-managed refresh is configured. Supervisors that ignore it keep
   // resolving the credential's ordinary token.
   StaticCredentialRequestScope request_scope = 4;
-  // Present when the provider profile credential declares an auth_style.
-  // Strict endpoints check this position.
-  StaticCredentialPlacement placement = 5;
 }
 
 // Request-scoped refresh metadata for one static credential environment key.
@@ -2834,6 +2845,9 @@ message GetSandboxProviderEnvironmentResponse {
   // require acknowledgment for declared or previously activated external
   // stable credentials; ordinary legacy delivery does not require it.
   bool supports_stable_placeholder_environment_keys = 12;
+  // Complete set of strictly bound endpoints of the attached providers,
+  // independent of which credential values are delivered.
+  repeated StrictCredentialEndpoint strict_credential_endpoints = 13;
 }
 
 // Receivers treat UNSPECIFIED and unknown values as secret.
@@ -2874,6 +2888,9 @@ message ProviderEnvironmentSnapshot {
   ProviderReadinessReason readiness_reason = 6;
   // Complete desired set of non-secret managed files, keyed by absolute path.
   map<string, string> files = 7;
+  // Complete set of strictly bound endpoints of the attached providers,
+  // independent of which credential values are delivered.
+  repeated StrictCredentialEndpoint strict_credential_endpoints = 8;
 }
 
 message ExchangeProviderSubjectTokenRequest {

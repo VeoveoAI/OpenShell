@@ -353,12 +353,10 @@ mod tests {
                 host: "storage.googleapis.com".into(),
                 port: 443,
                 path: "/**".into(),
-                strict: false,
             }],
             credential_identity: "test-google:token".into(),
             workload_credential_handle: String::new(),
             request_scope: None,
-            placement: None,
         }
     }
 

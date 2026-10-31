@@ -4389,11 +4389,9 @@ credentials:
                     host: endpoint.host.clone(),
                     port: endpoint.port,
                     path: endpoint.path.clone(),
-                    strict: false,
                 })
                 .collect(),
             request_scope: None,
-            placement: None,
         };
         for id in ["codex", "claude-code", "copilot"] {
             let profile = example_profile(id);

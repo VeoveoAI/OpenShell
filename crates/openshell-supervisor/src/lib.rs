@@ -2468,6 +2468,7 @@ pub(crate) struct ProviderBindings {
     static_credential_bindings:
         std::collections::BTreeMap<String, openshell_core::proto::StaticCredentialBinding>,
     stable_placeholder_environment_keys: std::collections::BTreeSet<String>,
+    strict_credential_endpoints: Vec<openshell_core::proto::StrictCredentialEndpoint>,
 }
 
 impl ProviderBindings {
@@ -2502,6 +2503,7 @@ impl ProviderBindings {
                 .iter()
                 .cloned()
                 .collect(),
+            strict_credential_endpoints: provider.strict_credential_endpoints.clone(),
         }
     }
 }
@@ -3130,6 +3132,9 @@ fn prepare_provider_environment(
         provider.stable_placeholder_environment_keys.clone(),
     )
     .map_err(|_| miette::miette!("Provider credential bindings are invalid"))?;
+    prepared
+        .set_strict_credential_endpoints(provider.strict_credential_endpoints.clone())
+        .map_err(|_| miette::miette!("Provider strict credential endpoints are invalid"))?;
     prepared.set_managed_files(provider.files.clone());
     Ok(prepared)
 }
@@ -3690,6 +3695,8 @@ fn report_credential_gating_unavailable() {
 
 /// Install the first gateway snapshot before passing placeholders to the workload.
 /// Invalid static bindings leave only independently authorized dynamic grants active.
+/// Strict endpoints are installed whether or not credential values are, so a
+/// withheld credential leaves its endpoints strict.
 fn initial_provider_credentials(
     result: openshell_core::grpc_client::ProviderEnvironmentResult,
     readiness: &ProviderReadinessTracker,
@@ -3701,17 +3708,28 @@ fn initial_provider_credentials(
         .copied()
         .filter(|expiry| *expiry > 0)
         .min();
-    if result.readiness_reason != ProviderReadinessReason::Unspecified {
-        readiness.credentials_failed(identity, result.readiness_reason);
-        return ProviderCredentialState::from_environment(
+    let strict_credential_endpoints = result.strict_credential_endpoints.clone();
+    let without_static_credentials = |dynamic_credentials| {
+        let credentials = ProviderCredentialState::from_environment(
             result.provider_env_revision,
             std::collections::HashMap::default(),
             std::collections::HashMap::default(),
-            result.dynamic_credentials,
+            dynamic_credentials,
         );
+        if credentials
+            .set_strict_credential_endpoints(strict_credential_endpoints.clone())
+            .is_err()
+        {
+            emit_invalid_strict_credential_endpoints();
+        }
+        credentials
+    };
+    if result.readiness_reason != ProviderReadinessReason::Unspecified {
+        readiness.credentials_failed(identity, result.readiness_reason);
+        return without_static_credentials(result.dynamic_credentials);
     }
     let dynamic_credentials_fallback = result.dynamic_credentials.clone();
-    match ProviderCredentialState::from_bound_environment_with_stable_placeholders(
+    let installed = ProviderCredentialState::from_bound_environment_with_stable_placeholders(
         result.provider_env_revision,
         result.environment,
         result.credential_expires_at_ms,
@@ -3719,7 +3737,13 @@ fn initial_provider_credentials(
         result.static_credential_bindings,
         result.non_secret_environment_keys,
         result.stable_placeholder_environment_keys,
-    ) {
+    )
+    .and_then(|credentials| {
+        credentials
+            .set_strict_credential_endpoints(strict_credential_endpoints.clone())
+            .map(|()| credentials)
+    });
+    match installed {
         Ok(credentials) => {
             credentials.set_managed_files(result.files);
             readiness.credentials_installed(identity, &credentials, expires_at_ms);
@@ -3738,14 +3762,22 @@ fn initial_provider_credentials(
                     ))
                     .build()
             );
-            ProviderCredentialState::from_environment(
-                result.provider_env_revision,
-                std::collections::HashMap::new(),
-                std::collections::HashMap::new(),
-                dynamic_credentials_fallback,
-            )
+            without_static_credentials(dynamic_credentials_fallback)
         }
     }
+}
+
+/// An invalid strict endpoint set cannot be enforced, and the supervisor
+/// keeps any strict endpoints it already holds.
+fn emit_invalid_strict_credential_endpoints() {
+    ocsf_emit!(
+        ConfigStateChangeBuilder::new(ocsf_ctx())
+            .severity(SeverityId::High)
+            .status(StatusId::Failure)
+            .state(StateId::Disabled, "fail_closed")
+            .message("Rejected provider strict credential endpoints; the installed strict endpoints are kept")
+            .build()
+    );
 }
 
 /// Deliver policy status updates independently from policy reconciliation.
@@ -6269,6 +6301,7 @@ network_policies:
             static_credential_bindings: std::collections::HashMap::new(),
             non_secret_environment_keys: Vec::new(),
             stable_placeholder_environment_keys: Vec::new(),
+            strict_credential_endpoints: Vec::new(),
         }
     }
 
@@ -6286,6 +6319,73 @@ network_policies:
             prepare_startup_configuration(&snapshot, &policy, &startup_provider(10))
                 .expect("matching generation is admitted");
         assert_eq!(credentials.revision(), 10);
+    }
+
+    fn strict_endpoint() -> openshell_core::proto::StrictCredentialEndpoint {
+        openshell_core::proto::StrictCredentialEndpoint {
+            host: "api.example.com".to_string(),
+            port: 443,
+            path: "/v1/**".to_string(),
+            environment_keys: vec!["API_KEY".to_string()],
+            placements: Vec::new(),
+        }
+    }
+
+    fn strictly_bound(credentials: &ProviderCredentialState) -> bool {
+        credentials
+            .resolver_for_endpoint("api.example.com", 443, "/v1/chat")
+            .is_some_and(|resolver| resolver.is_strict())
+    }
+
+    #[test]
+    fn startup_with_withheld_credentials_keeps_strict_endpoints() {
+        for reason in [
+            ProviderReadinessReason::CredentialExpired,
+            ProviderReadinessReason::CredentialsWithheld,
+        ] {
+            let mut provider = startup_provider(10);
+            provider.readiness_reason = reason;
+            provider.strict_credential_endpoints = vec![strict_endpoint()];
+            let credentials =
+                initial_provider_credentials(provider, &ProviderReadinessTracker::new());
+            assert!(credentials.resolver().is_none());
+            assert!(strictly_bound(&credentials), "{reason:?}");
+        }
+
+        let mut invalid_bindings = startup_provider(10);
+        invalid_bindings.environment =
+            std::collections::HashMap::from([("API_KEY".to_string(), "secret".to_string())]);
+        invalid_bindings.strict_credential_endpoints = vec![strict_endpoint()];
+        let credentials =
+            initial_provider_credentials(invalid_bindings, &ProviderReadinessTracker::new());
+        assert!(
+            strictly_bound(&credentials),
+            "rejected static bindings keep the delivered strict endpoints"
+        );
+    }
+
+    #[test]
+    fn prepared_environment_carries_strict_endpoints_and_rejects_invalid_ones() {
+        let mut provider = startup_provider(10);
+        provider.strict_credential_endpoints = vec![strict_endpoint()];
+        let credentials = prepare_provider_environment(&provider).expect("valid environment");
+        assert!(strictly_bound(&credentials));
+
+        let mut invalid = strict_endpoint();
+        invalid.port = 0;
+        provider.strict_credential_endpoints = vec![invalid];
+        assert!(prepare_provider_environment(&provider).is_err());
+    }
+
+    #[test]
+    fn strict_endpoint_changes_are_binding_changes() {
+        let lenient = startup_provider(10);
+        let mut strict = startup_provider(10);
+        strict.strict_credential_endpoints = vec![strict_endpoint()];
+        assert_ne!(
+            ProviderBindings::of(&lenient),
+            ProviderBindings::of(&strict)
+        );
     }
 
     #[test]

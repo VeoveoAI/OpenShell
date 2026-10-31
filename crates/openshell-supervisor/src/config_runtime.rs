@@ -914,6 +914,15 @@ impl ConfigRuntime {
                 provider.non_secret_environment_keys,
                 provider.stable_placeholder_environment_keys,
             );
+        // Strictness belongs to the endpoints: a valid strict set from this
+        // snapshot replaces the installed one, and an invalid one keeps it.
+        if ctx
+            .provider_credentials
+            .set_strict_credential_endpoints(provider.strict_credential_endpoints)
+            .is_err()
+        {
+            crate::emit_invalid_strict_credential_endpoints();
+        }
         endpoint_status::reset(
             ctx.endpoint_observation_tx.as_ref(),
             self.endpoint_policy.as_ref(),
@@ -1974,6 +1983,7 @@ mod tests {
             static_credential_bindings: HashMap::new(),
             non_secret_environment_keys: Vec::new(),
             stable_placeholder_environment_keys: Vec::new(),
+            strict_credential_endpoints: Vec::new(),
         };
         if let Some(value) = value {
             result
@@ -1986,12 +1996,10 @@ mod tests {
                         host: "tools.example.com".into(),
                         port: 443,
                         path: "/v1/**".into(),
-                        strict: false,
                     }],
                     credential_identity: "provider-a:EXTERNAL_TOKEN".into(),
                     workload_credential_handle: String::new(),
                     request_scope: None,
-                    placement: None,
                 },
             );
         }

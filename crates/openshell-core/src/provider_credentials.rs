@@ -10,6 +10,7 @@ use crate::{
     host_pattern::HostPattern,
     proto::{
         StaticCredentialBinding, StaticCredentialEndpointBinding, StaticCredentialRequestScope,
+        StrictCredentialEndpoint,
     },
 };
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -60,6 +61,9 @@ struct ProviderCredentialStateInner {
     // Revocation must retain this requirement so retrying against a downgraded
     // gateway cannot silently publish revision-scoped replacements.
     requires_stable_placeholders: bool,
+    // Strictness belongs to the endpoint, not to delivered credential values:
+    // revocation keeps these, and only a valid replacement set changes them.
+    strict_endpoints: Vec<CompiledStrictCredentialEndpoint>,
 }
 
 #[derive(Debug)]
@@ -74,8 +78,6 @@ struct CompiledStaticCredentialBinding {
     credential_identity: String,
     workload_credential_handle: String,
     request_scope: Option<RequestScopedCredential>,
-    /// Request position the credential's profile placement declares.
-    position: Option<CredentialPosition>,
 }
 
 /// Request-scoped refresh metadata for one endpoint-bound static credential.
@@ -107,7 +109,15 @@ struct CompiledStaticCredentialEndpointBinding {
     host: HostPattern,
     port: u16,
     path: EndpointPathPattern,
-    strict: bool,
+}
+
+/// One strictly bound endpoint with the credential keys bound there and the
+/// request positions they declare.
+#[derive(Debug, Clone)]
+struct CompiledStrictCredentialEndpoint {
+    endpoint: CompiledStaticCredentialEndpointBinding,
+    env_keys: HashSet<String>,
+    positions: Vec<CredentialPosition>,
 }
 
 #[derive(Debug, Clone)]
@@ -166,6 +176,7 @@ impl ProviderCredentialState {
                 known_static_credential_keys: HashSet::new(),
                 static_credential_identity_epochs: HashMap::new(),
                 requires_stable_placeholders: false,
+                strict_endpoints: Vec::new(),
             })),
         }
     }
@@ -250,6 +261,7 @@ impl ProviderCredentialState {
                 known_static_credential_keys,
                 static_credential_identity_epochs,
                 requires_stable_placeholders: !stable_placeholder_environment_keys.is_empty(),
+                strict_endpoints: Vec::new(),
             })),
         })
     }
@@ -285,6 +297,7 @@ impl ProviderCredentialState {
                 known_static_credential_keys: HashSet::new(),
                 static_credential_identity_epochs: HashMap::new(),
                 requires_stable_placeholders: false,
+                strict_endpoints: Vec::new(),
             })),
         }
     }
@@ -340,6 +353,29 @@ impl ProviderCredentialState {
             .expect("provider credential state poisoned")
             .combined_resolver
             .clone()
+    }
+
+    /// Replace the strictly bound endpoints with a validated set.
+    ///
+    /// The gateway delivers these independently of credential values, so a
+    /// snapshot that withholds every credential still keeps its endpoints
+    /// strict. An invalid set leaves the current one in place and returns an
+    /// error, so strictness is only removed by a valid replacement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an endpoint, a placement, or its key list is
+    /// invalid.
+    pub fn set_strict_credential_endpoints(
+        &self,
+        endpoints: Vec<StrictCredentialEndpoint>,
+    ) -> Result<(), StaticCredentialBindingError> {
+        let compiled = compile_strict_credential_endpoints(endpoints)?;
+        self.inner
+            .write()
+            .expect("provider credential state poisoned")
+            .strict_endpoints = compiled;
+        Ok(())
     }
 
     /// Resolve provider placeholders only for credentials bound to this
@@ -400,39 +436,23 @@ impl ProviderCredentialState {
             // safely, so expose no endpoint-scoped resolver.
             return (None, None, revision);
         };
-        let mut strict = false;
         let allowed: HashSet<String> = inner
             .static_credential_bindings
             .iter()
             .filter(|(_, binding)| {
-                let mut matched = false;
-                for endpoint in &binding.endpoints {
-                    if static_credential_endpoint_matches(
-                        endpoint,
-                        &host_labels,
-                        port,
-                        &request_path,
-                    ) {
-                        matched = true;
-                        strict |= endpoint.strict;
-                    }
-                }
-                matched
+                binding.endpoints.iter().any(|endpoint| {
+                    static_credential_endpoint_matches(endpoint, &host_labels, port, &request_path)
+                })
             })
             .map(|(key, _)| key.clone())
             .collect();
-        // One strict binding makes the endpoint strict for every credential
-        // bound there: each of their positions must carry one of their
-        // placeholders.
-        let strict_binding = strict.then(|| {
-            Arc::new(StrictCredentialBinding::new(
-                allowed.clone(),
-                allowed
-                    .iter()
-                    .filter_map(|key| inner.static_credential_bindings.get(key))
-                    .filter_map(|binding| binding.position.clone()),
-            ))
-        });
+        let strict_binding = strict_binding_for_request(
+            &inner.strict_endpoints,
+            &allowed,
+            &host_labels,
+            port,
+            &request_path,
+        );
         let classifier = inner.body_inventory_available.then(|| {
             Arc::new(crate::secrets::body::BodyCredentialClassifier::new(
                 inner.combined_resolver.as_deref(),
@@ -477,6 +497,12 @@ impl ProviderCredentialState {
                 Some(binding) => scoped.with_strict_binding(binding),
                 None => scoped,
             })
+        });
+        // A strict endpoint stays strict when no credential value is
+        // installed: an empty view resolves nothing and checks positions.
+        let resolver = resolver.or_else(|| {
+            strict_binding
+                .map(|binding| Arc::new(SecretResolver::default().with_strict_binding(binding)))
         });
         (resolver, classifier, revision)
     }
@@ -952,6 +978,7 @@ impl ProviderCredentialState {
             non_secret_keys,
             files,
             requires_stable_placeholders,
+            strict_endpoints,
         ) = {
             let candidate = prepared
                 .inner
@@ -965,6 +992,7 @@ impl ProviderCredentialState {
                 candidate.non_secret_environment_keys.clone(),
                 candidate.files.clone(),
                 candidate.requires_stable_placeholders,
+                candidate.strict_endpoints.clone(),
             )
         };
         let mut inner = self
@@ -998,6 +1026,7 @@ impl ProviderCredentialState {
         inner.static_credential_bindings = bindings;
         inner.non_secret_environment_keys = non_secret_keys;
         inner.files = files;
+        inner.strict_endpoints = strict_endpoints;
         // Prepared installation is the refresh commit point. Carry its
         // acknowledged delivery requirement into later fetches, including
         // failures that revoke credentials without removing the requirement.
@@ -1165,21 +1194,6 @@ fn compile_static_credential_bindings(
                     compile_request_scope(&key, &binding.credential_identity, request_scope)
                 })
                 .transpose()?;
-            let position = binding
-                .placement
-                .map(|placement| {
-                    CredentialPosition::from_placement(
-                        &placement.auth_style,
-                        &placement.header_name,
-                        &placement.query_param,
-                        &placement.path_template,
-                    )
-                    .map_err(|_| {
-                        binding_error("static credential binding contains an invalid placement")
-                    })
-                })
-                .transpose()?
-                .flatten();
             Ok((
                 key,
                 CompiledStaticCredentialBinding {
@@ -1187,7 +1201,6 @@ fn compile_static_credential_bindings(
                     credential_identity: binding.credential_identity,
                     workload_credential_handle: binding.workload_credential_handle,
                     request_scope,
-                    position,
                 },
             ))
         })
@@ -1250,8 +1263,88 @@ fn compile_static_credential_endpoint(
         port: u16::try_from(endpoint.port)
             .map_err(|_| binding_error("static credential binding contains an invalid endpoint"))?,
         path: EndpointPathPattern::new(&endpoint.path),
-        strict: endpoint.strict,
     })
+}
+
+fn compile_strict_credential_endpoints(
+    endpoints: Vec<StrictCredentialEndpoint>,
+) -> Result<Vec<CompiledStrictCredentialEndpoint>, StaticCredentialBindingError> {
+    endpoints
+        .into_iter()
+        .map(|endpoint| {
+            if endpoint.port == 0 || endpoint.port > u32::from(u16::MAX) {
+                return Err(binding_error(
+                    "strict credential endpoint contains an invalid endpoint",
+                ));
+            }
+            if endpoint.environment_keys.is_empty() {
+                return Err(binding_error(
+                    "strict credential endpoint names no credential keys",
+                ));
+            }
+            let positions = endpoint
+                .placements
+                .iter()
+                .map(|placement| {
+                    CredentialPosition::from_placement(
+                        &placement.auth_style,
+                        &placement.header_name,
+                        &placement.query_param,
+                        &placement.path_template,
+                    )
+                    .map_err(|_| {
+                        binding_error("strict credential endpoint contains an invalid placement")
+                    })
+                })
+                .filter_map(Result::transpose)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(CompiledStrictCredentialEndpoint {
+                endpoint: compile_static_credential_endpoint(StaticCredentialEndpointBinding {
+                    host: endpoint.host,
+                    port: endpoint.port,
+                    path: endpoint.path,
+                })
+                .map_err(|_| {
+                    binding_error("strict credential endpoint contains an invalid endpoint")
+                })?,
+                env_keys: endpoint.environment_keys.into_iter().collect(),
+                positions,
+            })
+        })
+        .collect()
+}
+
+/// The strict requirement of the request endpoint, if any strict endpoint
+/// matches it. Admissible placeholders are those of the strictly bound
+/// credentials and of any other credential bound at the endpoint; positions
+/// are the ones the strictly bound credentials declare.
+fn strict_binding_for_request(
+    strict_endpoints: &[CompiledStrictCredentialEndpoint],
+    allowed: &HashSet<String>,
+    host_labels: &[&str],
+    port: u16,
+    request_path: &str,
+) -> Option<Arc<StrictCredentialBinding>> {
+    let matched = strict_endpoints
+        .iter()
+        .filter(|strict| {
+            static_credential_endpoint_matches(&strict.endpoint, host_labels, port, request_path)
+        })
+        .collect::<Vec<_>>();
+    if matched.is_empty() {
+        return None;
+    }
+    let env_keys = matched
+        .iter()
+        .flat_map(|strict| strict.env_keys.iter().cloned())
+        .chain(allowed.iter().cloned())
+        .collect();
+    Some(Arc::new(StrictCredentialBinding::new(
+        env_keys,
+        matched
+            .iter()
+            .flat_map(|strict| strict.positions.iter().cloned()),
+    )))
 }
 
 fn static_credential_identities(
@@ -1520,12 +1613,10 @@ mod tests {
                 host: host.to_string(),
                 port,
                 path: path.to_string(),
-                strict: false,
             }],
             credential_identity: "provider-a:API_KEY".to_string(),
             workload_credential_handle: String::new(),
             request_scope: None,
-            placement: None,
         }
     }
 
@@ -1624,22 +1715,31 @@ mod tests {
         }
     }
 
+    /// `API_KEY` binds strictly at `api.example.com:443/v1/**` through its
+    /// `x-api-key` placement.
+    fn strict_endpoint() -> StrictCredentialEndpoint {
+        StrictCredentialEndpoint {
+            host: "api.example.com".to_string(),
+            port: 443,
+            path: "/v1/**".to_string(),
+            environment_keys: vec!["API_KEY".to_string()],
+            placements: vec![crate::proto::StaticCredentialPlacement {
+                auth_style: "header".to_string(),
+                header_name: "X-Api-Key".to_string(),
+                ..Default::default()
+            }],
+        }
+    }
+
     fn strict_state() -> ProviderCredentialState {
         let mut api_key = binding("api.example.com", 443, "/v1/**");
-        api_key.endpoints[0].strict = true;
         // The same credential is also bound, not strictly, to a second host.
         api_key.endpoints.push(StaticCredentialEndpointBinding {
             host: "uploads.example.com".to_string(),
             port: 443,
             path: String::new(),
-            strict: false,
         });
-        api_key.placement = Some(crate::proto::StaticCredentialPlacement {
-            auth_style: "header".to_string(),
-            header_name: "X-Api-Key".to_string(),
-            ..Default::default()
-        });
-        ProviderCredentialState::from_bound_environment(
+        let state = ProviderCredentialState::from_bound_environment(
             7,
             HashMap::from([("API_KEY".to_string(), "secret".to_string())]),
             HashMap::new(),
@@ -1647,7 +1747,26 @@ mod tests {
             HashMap::from([("API_KEY".to_string(), api_key)]),
             Vec::new(),
         )
-        .expect("valid bindings")
+        .expect("valid bindings");
+        state
+            .set_strict_credential_endpoints(vec![strict_endpoint()])
+            .expect("valid strict endpoints");
+        state
+    }
+
+    fn assert_strict_refusals(resolver: &SecretResolver) {
+        for headers in [
+            vec![("x-api-key", "typed-secret")],
+            vec![("Authorization", "Bearer typed-secret")],
+            vec![("Accept", "application/json")],
+        ] {
+            let error = crate::secrets::rewrite_http_header_block(
+                &header_block("/v1/messages", &headers),
+                Some(resolver),
+            )
+            .expect_err("strict endpoint refuses the request");
+            assert!(error.is_placeholder_required(), "{headers:?}");
+        }
     }
 
     fn header_block(target: &str, headers: &[(&str, &str)]) -> Vec<u8> {
@@ -1719,17 +1838,119 @@ mod tests {
     }
 
     #[test]
-    fn rejects_an_invalid_static_credential_placement() {
-        let mut invalid = binding("api.example.com", 443, "/**");
-        invalid.placement = Some(crate::proto::StaticCredentialPlacement {
-            auth_style: "query".to_string(),
-            ..Default::default()
-        });
-        assert_binding_validation_error(
-            HashMap::from([("API_KEY".to_string(), "secret".to_string())]),
-            HashMap::from([("API_KEY".to_string(), invalid)]),
+    fn strict_endpoint_stays_strict_while_its_credential_is_withheld() {
+        // The gateway withheld API_KEY, as it does after expiry, but another
+        // provider's credential is installed elsewhere.
+        let state = ProviderCredentialState::from_bound_environment(
+            8,
+            HashMap::from([("OTHER_KEY".to_string(), "other".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([(
+                "OTHER_KEY".to_string(),
+                binding("other.example.com", 443, "/**"),
+            )]),
             Vec::new(),
-            "static credential binding contains an invalid placement",
+        )
+        .expect("valid bindings");
+        state
+            .set_strict_credential_endpoints(vec![strict_endpoint()])
+            .expect("valid strict endpoints");
+        let resolver = state
+            .resolver_for_endpoint("api.example.com", 443, "/v1/messages")
+            .expect("a strict endpoint always has a checking view");
+        assert!(resolver.is_strict());
+        assert_strict_refusals(&resolver);
+
+        // The withheld credential's placeholder is admissible but cannot
+        // resolve, so it fails closed as an unavailable credential.
+        let withheld = crate::secrets::placeholder_for_env_key_for_revision("API_KEY", 7);
+        let error = crate::secrets::rewrite_http_header_block(
+            &header_block("/v1/messages", &[("x-api-key", &withheld)]),
+            Some(&resolver),
+        )
+        .expect_err("withheld placeholder is never forwarded");
+        assert!(!error.is_denied());
+    }
+
+    #[test]
+    fn strict_endpoint_stays_strict_when_no_credential_is_installed() {
+        let state = ProviderCredentialState::from_environment(
+            9,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        assert!(state.resolver().is_none());
+        state
+            .set_strict_credential_endpoints(vec![strict_endpoint()])
+            .expect("valid strict endpoints");
+        let resolver = state
+            .resolver_for_endpoint("api.example.com", 443, "/v1/messages")
+            .expect("a strict endpoint always has a checking view");
+        assert_strict_refusals(&resolver);
+        assert!(
+            state
+                .resolver_for_endpoint("api.example.com", 443, "/v2/other")
+                .is_none(),
+            "a non-strict endpoint is unchanged"
+        );
+    }
+
+    #[test]
+    fn revocation_and_invalid_sets_keep_strict_endpoints() {
+        let state = strict_state();
+        state.revoke_static_provider_environment(8);
+        let resolver = state
+            .resolver_for_endpoint("api.example.com", 443, "/v1/messages")
+            .expect("revoked state keeps its strict endpoints");
+        assert_strict_refusals(&resolver);
+
+        let mut invalid = strict_endpoint();
+        invalid.placements[0].auth_style = "query".to_string();
+        assert_eq!(
+            state
+                .set_strict_credential_endpoints(vec![invalid])
+                .expect_err("invalid placement")
+                .to_string(),
+            "strict credential endpoint contains an invalid placement"
+        );
+        let mut no_keys = strict_endpoint();
+        no_keys.environment_keys.clear();
+        assert!(
+            state
+                .set_strict_credential_endpoints(vec![no_keys])
+                .is_err()
+        );
+        assert!(
+            state
+                .resolver_for_endpoint("api.example.com", 443, "/v1/messages")
+                .is_some_and(|resolver| resolver.is_strict()),
+            "an invalid set leaves the current strict endpoints in place"
+        );
+
+        state
+            .set_strict_credential_endpoints(Vec::new())
+            .expect("an empty set is valid");
+        assert!(
+            state
+                .resolver_for_endpoint("api.example.com", 443, "/v1/messages")
+                .is_none_or(|resolver| !resolver.is_strict())
+        );
+    }
+
+    #[test]
+    fn prepared_installation_carries_strict_endpoints() {
+        let live = ProviderCredentialState::from_environment(
+            1,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        live.install_prepared(&strict_state());
+        assert!(
+            live.resolver_for_endpoint("api.example.com", 443, "/v1/messages")
+                .is_some_and(|resolver| resolver.is_strict())
         );
     }
 

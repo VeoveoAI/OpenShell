@@ -28,6 +28,7 @@ pub use endpoint_status::{
     retry_endpoint_status_after_supervisor_disconnect,
 };
 
+use super::provider::CredentialBindingEndpoint;
 use crate::ServerState;
 use crate::auth::principal::Principal;
 use crate::auth::workspace_authz::{
@@ -50,8 +51,6 @@ use metrics::counter;
 use openshell_core::net::{is_always_blocked_ip, is_internal_ip};
 use openshell_core::policy_identity::canonical_rule_bytes;
 pub use openshell_core::policy_identity::deterministic_policy_hash;
-#[cfg(test)]
-use openshell_core::proto::StaticCredentialBinding;
 use openshell_core::proto::policy_merge_operation;
 use openshell_core::proto::setting_value;
 use openshell_core::proto::{
@@ -77,8 +76,10 @@ use openshell_core::proto::{
 };
 use openshell_core::proto::{
     L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, Provider, Sandbox,
-    SandboxPolicy as ProtoSandboxPolicy, StaticCredentialEndpointBinding,
+    SandboxPolicy as ProtoSandboxPolicy,
 };
+#[cfg(test)]
+use openshell_core::proto::{StaticCredentialBinding, StaticCredentialEndpointBinding};
 use openshell_core::telemetry::{
     LifecycleOperation, LifecycleResource, PolicyDecisionOperation, TelemetryOutcome,
 };
@@ -2145,8 +2146,8 @@ pub(super) fn validate_candidate_effective_policy(
 
 fn policy_static_credential_endpoint_bindings(
     policy: Option<&ProtoSandboxPolicy>,
-) -> Result<HashMap<String, Vec<StaticCredentialEndpointBinding>>, Status> {
-    let mut bindings = HashMap::<String, Vec<StaticCredentialEndpointBinding>>::new();
+) -> Result<HashMap<String, Vec<CredentialBindingEndpoint>>, Status> {
+    let mut bindings = HashMap::<String, Vec<CredentialBindingEndpoint>>::new();
     let Some(policy) = policy else {
         return Ok(bindings);
     };
@@ -2190,7 +2191,7 @@ fn policy_static_credential_endpoint_bindings(
             }
             let provider_bindings = bindings.entry(provider.to_string()).or_default();
             for port in ports {
-                let candidate = StaticCredentialEndpointBinding {
+                let candidate = CredentialBindingEndpoint {
                     host: endpoint.host.clone(),
                     port,
                     path: endpoint.path.clone(),
@@ -2234,7 +2235,7 @@ fn validate_policy_credential_binding_context(
     catalog: &EffectiveProviderProfileCatalog,
     records: &[super::provider::ProviderEnvironmentRecord],
     policy: &ProtoSandboxPolicy,
-    bindings: &HashMap<String, Vec<StaticCredentialEndpointBinding>>,
+    bindings: &HashMap<String, Vec<CredentialBindingEndpoint>>,
 ) -> Result<(), Status> {
     for provider_name in bindings.keys() {
         let record = records
@@ -2435,7 +2436,7 @@ async fn validate_policy_credential_bindings_for_sandbox(
     workspace: &str,
     provider_names: &[String],
     policy: &ProtoSandboxPolicy,
-) -> Result<HashMap<String, Vec<StaticCredentialEndpointBinding>>, Status> {
+) -> Result<HashMap<String, Vec<CredentialBindingEndpoint>>, Status> {
     let bindings = policy_static_credential_endpoint_bindings(Some(policy))?;
     let has_signing = policy.network_policies.values().any(|rule| {
         rule.endpoints
@@ -3327,7 +3328,7 @@ async fn compute_provider_env_revision_with_catalog_and_policy_bindings(
     catalog: &EffectiveProviderProfileCatalog,
     workspace: &str,
     provider_names: &[String],
-    policy_bindings: &HashMap<String, Vec<StaticCredentialEndpointBinding>>,
+    policy_bindings: &HashMap<String, Vec<CredentialBindingEndpoint>>,
 ) -> Result<u64, Status> {
     let mut hasher = Sha256::new();
     hasher.update(b"openshell-provider-env-revision-v4");
@@ -3403,7 +3404,7 @@ fn compute_provider_env_revision_from_records(
 fn compute_provider_env_revision_from_records_and_policy_bindings(
     catalog: &EffectiveProviderProfileCatalog,
     records: &[super::provider::ProviderEnvironmentRecord],
-    policy_bindings: &HashMap<String, Vec<StaticCredentialEndpointBinding>>,
+    policy_bindings: &HashMap<String, Vec<CredentialBindingEndpoint>>,
     global_policy: Option<&ProtoSandboxPolicy>,
 ) -> Result<u64, Status> {
     let mut hasher = Sha256::new();
@@ -3489,7 +3490,7 @@ fn hash_provider_refresh_states(
 }
 
 fn hash_policy_credential_bindings(
-    bindings: &HashMap<String, Vec<StaticCredentialEndpointBinding>>,
+    bindings: &HashMap<String, Vec<CredentialBindingEndpoint>>,
     hasher: &mut Sha256,
 ) {
     let mut provider_names: Vec<_> = bindings.keys().collect();
@@ -3658,7 +3659,7 @@ fn endpoint_ports(endpoint: &NetworkEndpoint) -> Vec<u32> {
 
 fn extend_credentialed_scopes_from_policy_bindings(
     scopes: &mut Vec<CredentialedEndpointScope>,
-    bindings: &HashMap<String, Vec<StaticCredentialEndpointBinding>>,
+    bindings: &HashMap<String, Vec<CredentialBindingEndpoint>>,
     endpointless_provider_names: &HashSet<String>,
 ) {
     for (provider_name, provider_bindings) in bindings {
@@ -3918,7 +3919,7 @@ struct ProviderEnvironmentTarget<'a> {
     spec: &'a openshell_core::proto::SandboxSpec,
     effective_policy: ProtoSandboxPolicy,
     policy_source: PolicySource,
-    policy_credential_bindings: HashMap<String, Vec<StaticCredentialEndpointBinding>>,
+    policy_credential_bindings: HashMap<String, Vec<CredentialBindingEndpoint>>,
     provider_env_revision: u64,
 }
 
@@ -4159,6 +4160,7 @@ pub async fn build_provider_environment_snapshot_from_inputs(
         provider_attachment_epoch: spec.provider_attachment_epoch.clone(),
         policy_hash: deterministic_policy_hash(&effective_policy),
         readiness_reason: readiness_reason.into(),
+        strict_credential_endpoints: provider_environment.strict_credential_endpoints,
     })
 }
 
@@ -4205,6 +4207,7 @@ fn provider_environment_response(
         provider_attachment_epoch: snapshot.provider_attachment_epoch,
         policy_hash: snapshot.policy_hash,
         readiness_reason: snapshot.readiness_reason,
+        strict_credential_endpoints: snapshot.strict_credential_endpoints,
     }
 }
 
@@ -7632,7 +7635,7 @@ struct PolicyMergeValidationContext<'a> {
 
 fn validate_operator_merged_credential_policy(
     effective_policy: &mut ProtoSandboxPolicy,
-    bindings: &HashMap<String, Vec<StaticCredentialEndpointBinding>>,
+    bindings: &HashMap<String, Vec<CredentialBindingEndpoint>>,
     context: &PolicyCredentialBindingValidationContext<'_>,
 ) -> Result<(), Status> {
     validate_policy_credential_binding_context(
@@ -10290,7 +10293,7 @@ mod tests {
             ]
         );
 
-        let hash = |bindings: &HashMap<String, Vec<StaticCredentialEndpointBinding>>| {
+        let hash = |bindings: &HashMap<String, Vec<CredentialBindingEndpoint>>| {
             let mut hasher = Sha256::new();
             hash_policy_credential_bindings(bindings, &mut hasher);
             hasher.finalize()
@@ -10313,13 +10316,13 @@ mod tests {
             (
                 "bound".to_string(),
                 vec![
-                    StaticCredentialEndpointBinding {
+                    CredentialBindingEndpoint {
                         host: "API.Bound.Example".to_string(),
                         port: 8443,
                         path: "/v1".to_string(),
                         strict: false,
                     },
-                    StaticCredentialEndpointBinding {
+                    CredentialBindingEndpoint {
                         host: "api.bound.example".to_string(),
                         port: 8443,
                         path: "/v2".to_string(),
@@ -10329,7 +10332,7 @@ mod tests {
             ),
             (
                 "endpointful".to_string(),
-                vec![StaticCredentialEndpointBinding {
+                vec![CredentialBindingEndpoint {
                     host: "profile-bound.example".to_string(),
                     port: 443,
                     path: String::new(),
@@ -10338,7 +10341,7 @@ mod tests {
             ),
             (
                 "unattached".to_string(),
-                vec![StaticCredentialEndpointBinding {
+                vec![CredentialBindingEndpoint {
                     host: "unattached.example".to_string(),
                     port: 443,
                     path: String::new(),
@@ -14715,7 +14718,6 @@ mod tests {
                 host: "api.cloud.example".to_string(),
                 port: 443,
                 path: String::new(),
-                strict: false,
             }]
         );
         assert_eq!(

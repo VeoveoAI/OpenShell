@@ -4042,12 +4042,10 @@ mod tests {
                 host: "allowed.example.test".to_string(),
                 port: 443,
                 path: "/allowed/**".to_string(),
-                strict: false,
             }],
             credential_identity: identity.to_string(),
             workload_credential_handle: String::new(),
             request_scope: None,
-            placement: None,
         }
     }
 
@@ -4413,7 +4411,6 @@ mod tests {
             host: "strict.example.test".to_string(),
             port: 443,
             path: "/**".to_string(),
-            strict: true,
         };
         let state = ProviderCredentialState::from_bound_environment(
             1,
@@ -4424,12 +4421,132 @@ mod tests {
             Vec::new(),
         )
         .expect("bound provider state");
+        state
+            .set_strict_credential_endpoints(vec![strict_endpoint()])
+            .expect("valid strict endpoints");
         let placeholder = state.snapshot().child_env["API_TOKEN"].clone();
         let resolver = state
             .resolver_for_endpoint("strict.example.test", 443, "/v1/chat")
             .expect("endpoint-scoped resolver");
         assert!(resolver.is_strict());
         (state, resolver, placeholder)
+    }
+
+    fn strict_endpoint() -> openshell_core::proto::StrictCredentialEndpoint {
+        openshell_core::proto::StrictCredentialEndpoint {
+            host: "strict.example.test".to_string(),
+            port: 443,
+            path: "/**".to_string(),
+            environment_keys: vec!["API_TOKEN".to_string()],
+            placements: Vec::new(),
+        }
+    }
+
+    async fn relay_strict_request(
+        ctx: &L7EvalContext,
+        resolver: &SecretResolver,
+        authorization: &str,
+    ) -> (String, Vec<u8>) {
+        let (mut client_peer, mut client) = tokio::io::duplex(8192);
+        let (mut upstream, mut upstream_peer) = tokio::io::duplex(8192);
+        let outcome = relay_http_request_with_credential_rejection(
+            &strict_request(authorization),
+            &mut client,
+            &mut upstream,
+            crate::l7::rest::RelayRequestOptions {
+                resolver: Some(resolver),
+                ..Default::default()
+            },
+            ctx,
+            None,
+        )
+        .await
+        .expect("typed credential denial");
+        assert!(outcome.is_none());
+        drop(client);
+        drop(upstream);
+        let mut response = String::new();
+        client_peer.read_to_string(&mut response).await.unwrap();
+        let mut forwarded = Vec::new();
+        upstream_peer.read_to_end(&mut forwarded).await.unwrap();
+        (response, forwarded)
+    }
+
+    #[tokio::test]
+    async fn strict_endpoint_refuses_while_its_credential_is_withheld() {
+        // The snapshot withheld API_TOKEN: no credential value is installed,
+        // but the strict endpoint arrived with it.
+        let state = ProviderCredentialState::from_environment(
+            2,
+            TestHashMap::new(),
+            TestHashMap::new(),
+            TestHashMap::new(),
+        );
+        state
+            .set_strict_credential_endpoints(vec![strict_endpoint()])
+            .expect("valid strict endpoints");
+        let resolver = state
+            .resolver_for_endpoint("strict.example.test", 443, "/v1/chat")
+            .expect("a strict endpoint keeps a checking view");
+        let ctx = strict_ctx(&resolver);
+
+        for authorization in ["Bearer sk-typed-into-the-app", "Basic Og=="] {
+            let (response, forwarded) = relay_strict_request(&ctx, &resolver, authorization).await;
+            assert!(response.contains("403 Forbidden"), "{response}");
+            assert!(
+                response.contains(r#""error":"credential_placeholder_required""#),
+                "{response}"
+            );
+            assert!(
+                forwarded.is_empty(),
+                "a refused request must not write upstream"
+            );
+        }
+
+        // No credential at all is refused as well.
+        let (mut client_peer, mut client) = tokio::io::duplex(8192);
+        let (mut upstream, mut upstream_peer) = tokio::io::duplex(8192);
+        let request = crate::l7::provider::L7Request {
+            action: "GET".to_string(),
+            target: "/v1/chat".to_string(),
+            query_params: TestHashMap::new(),
+            raw_header:
+                b"GET /v1/chat HTTP/1.1\r\nHost: strict.example.test\r\nContent-Length: 0\r\n\r\n"
+                    .to_vec(),
+            body_length: crate::l7::provider::BodyLength::ContentLength(0),
+        };
+        let outcome = relay_http_request_with_credential_rejection(
+            &request,
+            &mut client,
+            &mut upstream,
+            crate::l7::rest::RelayRequestOptions {
+                resolver: Some(resolver.as_ref()),
+                ..Default::default()
+            },
+            &ctx,
+            None,
+        )
+        .await
+        .expect("typed credential denial");
+        assert!(outcome.is_none());
+        drop(client);
+        drop(upstream);
+        let mut response = String::new();
+        client_peer.read_to_string(&mut response).await.unwrap();
+        assert!(
+            response.contains("credential_placeholder_required"),
+            "{response}"
+        );
+        let mut forwarded = Vec::new();
+        upstream_peer.read_to_end(&mut forwarded).await.unwrap();
+        assert!(forwarded.is_empty());
+
+        // The withheld credential's placeholder is never forwarded.
+        let withheld = secrets::placeholder_for_env_key_for_revision("API_TOKEN", 1);
+        let (response, forwarded) =
+            relay_strict_request(&ctx, &resolver, &format!("Bearer {withheld}")).await;
+        assert!(response.contains("credential_unavailable"), "{response}");
+        assert!(forwarded.is_empty());
     }
 
     fn strict_request(authorization: &str) -> crate::l7::provider::L7Request {
@@ -6277,12 +6394,10 @@ network_policies:
                         host: "api.example.test".to_string(),
                         port: 8080,
                         path: "/v1/**".to_string(),
-                        strict: false,
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
                     request_scope: None,
-                    placement: None,
                 },
             )]),
             Vec::new(),
@@ -6384,12 +6499,10 @@ network_policies:
                         host: "api.example.test".to_string(),
                         port: u32::from(port),
                         path: "/v1/**".to_string(),
-                        strict: false,
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
                     request_scope: None,
-                    placement: None,
                 },
             )]),
             Vec::new(),
@@ -7042,12 +7155,10 @@ network_policies:
                         host: "api.example.test".to_string(),
                         port: 443,
                         path: "/allowed".to_string(),
-                        strict: false,
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
                     request_scope: None,
-                    placement: None,
                 },
             )]),
             Vec::new(),
@@ -9937,12 +10048,10 @@ network_policies:
                         host: "allowed.example.test".to_string(),
                         port: 443,
                         path: "/allowed/**".to_string(),
-                        strict: false,
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
                     request_scope: None,
-                    placement: None,
                 },
             )]),
             Vec::new(),
@@ -12752,12 +12861,10 @@ network_policies:
                                 host: ctx.host.clone(),
                                 port: u32::from(ctx.port),
                                 path: "/mcp".into(),
-                                strict: false,
                             }],
                             credential_identity: "provider:API_TOKEN".into(),
                             workload_credential_handle: String::new(),
                             request_scope: None,
-                            placement: None,
                         },
                     )]),
                     Vec::new(),

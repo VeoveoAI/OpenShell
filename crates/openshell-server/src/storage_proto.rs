@@ -166,11 +166,11 @@ mod tests {
     // public only: GetGatewayInfo reports them, and no row stores them.
     // NetworkCredentialBinding.strict is stored with policies and provider
     // profile endpoints; older rows decode false, the non-strict binding.
-    // StaticCredentialEndpointBinding.strict and StaticCredentialBinding.placement
-    // (StaticCredentialPlacement) are public only: the gateway derives them for
-    // each provider environment delivery, and no row stores them.
+    // StrictCredentialEndpoint and StaticCredentialPlacement in provider
+    // environment deliveries are public only: the gateway derives them for each
+    // delivery, and no row stores them.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "97dd20fe8527353f9ddcac2496a1f1194a6f574415a67a9aae3baa871dc76c26";
+        "f8f46e4689fce398f3e164e5acefc79a726fbd4cf1a5f1718932fe092ff54ed0";
     const DURABLE_SCHEMA_SHA256: &str =
         "d7ed0efbf31db3c83e2c462b5e5e5166f58e023b512fa01297016d7a6d25a98f";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -708,7 +708,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (333, 29),
+                (334, 29),
                 (96, 22),
                 (84, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,

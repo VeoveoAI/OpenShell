@@ -10855,12 +10855,10 @@ network_policies:
                         host: "api.example.test".to_string(),
                         port: 80,
                         path: "/allowed/**".to_string(),
-                        strict: false,
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
                     request_scope: None,
-                    placement: None,
                 },
             )]),
             Vec::new(),
@@ -13224,12 +13222,10 @@ network_policies:
                         host: "api.example.com".to_string(),
                         port: 80,
                         path: "/allowed/**".to_string(),
-                        strict: false,
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
                     request_scope: None,
-                    placement: None,
                 },
             )]),
             Vec::new(),
@@ -13269,12 +13265,10 @@ network_policies:
                         host: "api.example.com".to_string(),
                         port: 80,
                         path: "/allowed/**".to_string(),
-                        strict: false,
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
                     request_scope: None,
-                    placement: None,
                 },
             )]),
             Vec::new(),
@@ -13306,6 +13300,7 @@ network_policies:
     fn forward_request_enforces_strict_credential_binding() {
         use openshell_core::proto::{
             StaticCredentialBinding, StaticCredentialEndpointBinding, StaticCredentialPlacement,
+            StrictCredentialEndpoint,
         };
 
         let state = ProviderCredentialState::from_bound_environment(
@@ -13320,21 +13315,28 @@ network_policies:
                         host: "api.example.com".to_string(),
                         port: 80,
                         path: "/**".to_string(),
-                        strict: true,
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
                     request_scope: None,
-                    placement: Some(StaticCredentialPlacement {
-                        auth_style: "query".to_string(),
-                        query_param: "key".to_string(),
-                        ..Default::default()
-                    }),
                 },
             )]),
             Vec::new(),
         )
         .expect("bound provider state");
+        state
+            .set_strict_credential_endpoints(vec![StrictCredentialEndpoint {
+                host: "api.example.com".to_string(),
+                port: 80,
+                path: "/**".to_string(),
+                environment_keys: vec!["API_TOKEN".to_string()],
+                placements: vec![StaticCredentialPlacement {
+                    auth_style: "query".to_string(),
+                    query_param: "key".to_string(),
+                    ..Default::default()
+                }],
+            }])
+            .expect("valid strict endpoints");
         let placeholder = state.snapshot().child_env["API_TOKEN"].clone();
         let resolver =
             endpoint_secret_resolver(Some(&state), state.resolver(), "api.example.com", 80, "/v1")
@@ -13402,12 +13404,10 @@ network_policies:
                         host: "api.example.com".to_string(),
                         port: 80,
                         path: "/**".to_string(),
-                        strict: false,
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
                     request_scope: None,
-                    placement: None,
                 },
             )]),
             Vec::new(),
@@ -14085,10 +14085,8 @@ network_policies:
                         host: "api.example.com".into(),
                         port: 80,
                         path: "/**".into(),
-                        strict: false,
                     }],
                     request_scope: None,
-                    placement: None,
                 },
             )]),
             vec![],
@@ -14233,12 +14231,10 @@ network_policies:
                         host: "allowed.example.com".to_string(),
                         port: 80,
                         path: "/allowed/**".to_string(),
-                        strict: false,
                     }],
                     credential_identity: "provider-a:API_TOKEN".to_string(),
                     workload_credential_handle: String::new(),
                     request_scope: None,
-                    placement: None,
                 },
             )]),
             Vec::new(),
@@ -14327,12 +14323,10 @@ network_policies:
                             host: "allowed.example.com".to_string(),
                             port: 80,
                             path: "/allowed/**".to_string(),
-                            strict: false,
                         }],
                         credential_identity: format!("provider-a:{key}"),
                         workload_credential_handle: String::new(),
                         request_scope: None,
-                        placement: None,
                     },
                 )
             })

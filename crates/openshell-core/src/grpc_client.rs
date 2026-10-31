@@ -1668,6 +1668,7 @@ fn provider_environment_result(
         static_credential_bindings: inner.static_credential_bindings,
         non_secret_environment_keys: inner.non_secret_environment_keys,
         stable_placeholder_environment_keys: inner.stable_placeholder_environment_keys,
+        strict_credential_endpoints: inner.strict_credential_endpoints,
     })
 }
 
@@ -1688,7 +1689,6 @@ mod provider_environment_tests {
                         host: "api.example.com".to_string(),
                         port: 443,
                         path: "/v1/**".to_string(),
-                        strict: false,
                     }],
                     credential_identity: "provider:TOKEN".to_string(),
                     ..Default::default()
@@ -2292,6 +2292,8 @@ pub struct ProviderEnvironmentResult {
     /// Credential keys whose stable opaque handles are explicitly authorized
     /// by the gateway's endpoint bindings.
     pub stable_placeholder_environment_keys: Vec<String>,
+    /// Strictly bound endpoints, delivered whether or not credential values are.
+    pub strict_credential_endpoints: Vec<crate::proto::StrictCredentialEndpoint>,
 }
 
 /// Delivered snapshots go through the polling projection, so both paths
@@ -2309,6 +2311,7 @@ impl TryFrom<crate::proto::ProviderEnvironmentSnapshot> for ProviderEnvironmentR
             policy_hash: snapshot.policy_hash,
             readiness_reason: snapshot.readiness_reason,
             files: snapshot.files,
+            strict_credential_endpoints: snapshot.strict_credential_endpoints,
             // Supervisor session payloads are version-locked with the gateway,
             // so every delivered snapshot carries stable-placeholder metadata.
             supports_stable_placeholder_environment_keys: true,
@@ -2395,6 +2398,25 @@ mod provider_snapshot_tests {
             result.readiness_reason,
             ProviderReadinessReason::Unspecified
         );
+    }
+
+    #[test]
+    fn delivered_provider_snapshot_carries_strict_endpoints_without_values() {
+        let strict = crate::proto::StrictCredentialEndpoint {
+            host: "api.example.com".to_string(),
+            port: 443,
+            path: "/v1/**".to_string(),
+            environment_keys: vec!["TOKEN".to_string()],
+            placements: Vec::new(),
+        };
+        let result = ProviderEnvironmentResult::try_from(ProviderEnvironmentSnapshot {
+            readiness_reason: ProviderReadinessReason::CredentialExpired.into(),
+            strict_credential_endpoints: vec![strict.clone()],
+            ..Default::default()
+        })
+        .expect("valid provider snapshot");
+        assert!(result.environment.is_empty());
+        assert_eq!(result.strict_credential_endpoints, vec![strict]);
     }
 
     #[test]

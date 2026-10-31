@@ -39,11 +39,16 @@ evicted first, then the oldest), and are minted once per key at a time.
 
 ## Strict credential bindings
 
-A static credential binding endpoint can be strict. The endpoint-scoped resolver
-from `ProviderCredentialState::resolver_and_body_classifier_for_endpoint` then
-carries a `StrictCredentialBinding` built from the credentials bound at that
-request endpoint: their environment keys and the request position each
-credential's profile placement declares, plus `Authorization`.
+The gateway delivers each provider environment with its strict credential
+endpoints (`StrictCredentialEndpoint`): host, port, path, the environment keys
+of the credentials bound there, and their placements. They arrive whether or
+not the credential values do, and `ProviderCredentialState` keeps them across
+revocation until a valid replacement set is installed. When one matches a
+request, the endpoint-scoped resolver from
+`ProviderCredentialState::resolver_and_body_classifier_for_endpoint` carries a
+`StrictCredentialBinding`: the matched keys and those of any other credential
+bound there, and the matched placements plus `Authorization`. With no
+credential value installed, the resolver is an empty view that only checks.
 `SecretResolver::check_strict_binding` runs before any placeholder rewriting in
 `rewrite_http_header_block` (inspected HTTP/1, passthrough with credentials, and
 HTTP/2) and in the forward proxy's `rewrite_forward_request`. It reads only
