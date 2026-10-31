@@ -171,8 +171,11 @@ rewriting, SigV4 signing, or bound middleware. Each stream checks its authority,
 method and path before forwarding. Header credentials use the same endpoint
 bindings as HTTP/1.1. Bodies and trailers stream without application parsing, so
 a gRPC rule can restrict RPC paths but cannot inspect protobuf fields. Policy
-changes close the connection. Other inspection combinations do not advertise
-HTTP/2; an HTTP/2-only client fails closed. On credential-bearing endpoints,
+changes close the connection. OpenShell uses HTTP/2 only when the client offers
+it and the upstream server selects it, so an HTTP/1.1-only server serves an
+HTTP/2-capable client over HTTP/1.1. Other inspection combinations do not
+advertise HTTP/2; an HTTP/2-only client fails closed, as it does against an
+HTTP/1.1-only server. On credential-bearing endpoints,
 the body credential guard checks each uncompressed gRPC request message before
 forwarding it, with a 16 MiB message limit. Compressed or oversized request
 messages fail closed unless the endpoint explicitly allows uninspected credentials.

@@ -264,6 +264,12 @@ impl ProxyTlsState {
 
     /// Get or generate a leaf cert for the hostname and return a TLS acceptor.
     fn acceptor_for(&self, hostname: &str, http2: bool) -> Result<TlsAcceptor> {
+        Ok(TlsAcceptor::from(self.server_config_for(hostname, http2)?))
+    }
+
+    /// Server configuration presenting the hostname's leaf certificate. It
+    /// offers HTTP/2 first when `http2` is set, and always HTTP/1.1.
+    fn server_config_for(&self, hostname: &str, http2: bool) -> Result<Arc<rustls::ServerConfig>> {
         let leaf = self.cert_cache.get_or_generate(hostname)?;
         let mut server_config = openshell_crypto::tls::server_builder()
             .with_no_client_auth()
@@ -273,7 +279,7 @@ impl ProxyTlsState {
         if http2 {
             server_config.alpn_protocols.insert(0, b"h2".to_vec());
         }
-        Ok(TlsAcceptor::from(Arc::new(server_config)))
+        Ok(Arc::new(server_config))
     }
 
     /// Returns a reference to the upstream client config.
@@ -298,19 +304,99 @@ where
     Ok(tls_stream)
 }
 
-/// Negotiate HTTP/2 only when the caller has admitted an enforceable HTTP/2 route.
-pub(crate) async fn tls_terminate_http_client<S>(
-    client: S,
+/// Which side of an inspected TLS tunnel failed to establish.
+#[derive(Debug)]
+pub(crate) enum HttpTlsError {
+    /// The sandbox client's handshake failed; no endpoint evidence.
+    Client(miette::Report),
+    /// The upstream handshake failed.
+    Upstream(miette::Report),
+}
+
+/// Both TLS legs of one inspected HTTP tunnel, with one application protocol.
+pub(crate) struct NegotiatedHttpTls<C, U> {
+    pub(crate) client: tokio_rustls::server::TlsStream<C>,
+    pub(crate) upstream: tokio_rustls::client::TlsStream<U>,
+    /// Both legs speak HTTP/2; otherwise both speak HTTP/1.1.
+    pub(crate) http2: bool,
+}
+
+/// Terminate the sandbox client's TLS and establish the upstream TLS with one
+/// application protocol on both legs.
+///
+/// The proxy cannot translate between HTTP/2 and HTTP/1.1, so HTTP/2 is used
+/// only when the route allows it, the client offers it, and the upstream
+/// selects it. The client's `ClientHello` is read first; the upstream is
+/// offered HTTP/2 and HTTP/1.1 only when the client offered HTTP/2, and the
+/// client handshake completes with the protocol the upstream selected. An
+/// HTTP/1.1-only upstream therefore serves an HTTP/2-capable client over
+/// HTTP/1.1 instead of rejecting an HTTP/2-only offer. A malformed
+/// `ClientHello` fails before the upstream handshake, so it never counts as an
+/// endpoint failure.
+pub(crate) async fn negotiate_http_tls<C, U>(
+    client: C,
+    upstream: U,
     tls_state: &ProxyTlsState,
     hostname: &str,
-    http2: bool,
-) -> Result<tokio_rustls::server::TlsStream<S>>
+    upstream_config: &Arc<ClientConfig>,
+    allow_http2: bool,
+) -> std::result::Result<NegotiatedHttpTls<C, U>, HttpTlsError>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+    U: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    tls_state
-        .acceptor_for(hostname, http2)?
-        .accept(client)
+    let start = tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), client)
+        .await
+        .into_diagnostic()
+        .map_err(HttpTlsError::Client)?;
+    let client_offers_http2 = start
+        .client_hello()
+        .alpn()
+        .is_some_and(|mut protocols| protocols.any(|protocol| protocol == b"h2"));
+    let attempt_http2 = allow_http2 && client_offers_http2;
+    let upstream_config = if attempt_http2 {
+        let mut config = (**upstream_config).clone();
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        Arc::new(config)
+    } else {
+        Arc::clone(upstream_config)
+    };
+    let upstream = connect_upstream_stream(upstream, hostname, &upstream_config)
+        .await
+        .map_err(HttpTlsError::Upstream)?;
+    let http2 = attempt_http2 && upstream.get_ref().1.alpn_protocol() == Some(b"h2");
+    let server_config = tls_state
+        .server_config_for(hostname, http2)
+        .map_err(HttpTlsError::Client)?;
+    let client = start
+        .into_stream(server_config)
+        .await
+        .into_diagnostic()
+        .map_err(HttpTlsError::Client)?;
+    if http2 != (client.get_ref().1.alpn_protocol() == Some(b"h2")) {
+        return Err(HttpTlsError::Client(miette!(
+            "client and upstream negotiated different HTTP versions"
+        )));
+    }
+    Ok(NegotiatedHttpTls {
+        client,
+        upstream,
+        http2,
+    })
+}
+
+async fn connect_upstream_stream<U>(
+    upstream: U,
+    hostname: &str,
+    client_config: &Arc<ClientConfig>,
+) -> Result<tokio_rustls::client::TlsStream<U>>
+where
+    U: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let connector = TlsConnector::from(Arc::clone(client_config));
+    let server_name = ServerName::try_from(hostname.to_string()).into_diagnostic()?;
+    connector
+        .connect(server_name, upstream)
         .await
         .into_diagnostic()
 }
@@ -849,6 +935,193 @@ mod tests {
     /// Accept exactly one TLS connection on a fresh loopback listener and
     /// return its address. Used by `additional_ca_enables_trust_of_...` to
     /// give each connection attempt its own listener.
+    /// An upstream that, like `api.deepinfra.com`, speaks only HTTP/1.1 and
+    /// answers an `h2`-only ALPN offer with a `no_application_protocol` alert.
+    struct AlpnFixture {
+        state: ProxyTlsState,
+        upstream_config: Arc<ClientConfig>,
+        client_config: Arc<ClientConfig>,
+        upstream_cache: CertCache,
+    }
+
+    impl AlpnFixture {
+        fn new() -> Self {
+            let roots = |ca: &SandboxCa| {
+                let mut roots = rustls::RootCertStore::empty();
+                for cert in rustls_pemfile::certs(&mut ca.cert_pem().as_bytes()) {
+                    roots.add(cert.unwrap()).unwrap();
+                }
+                roots
+            };
+            let upstream_ca = SandboxCa::generate().unwrap();
+            let mut upstream_config = openshell_crypto::tls::client_builder()
+                .with_root_certificates(roots(&upstream_ca))
+                .with_no_client_auth();
+            upstream_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+            let sandbox_ca = SandboxCa::generate().unwrap();
+            let mut client_config = openshell_crypto::tls::client_builder()
+                .with_root_certificates(roots(&sandbox_ca))
+                .with_no_client_auth();
+            // curl built with HTTP/2 support offers both protocols.
+            client_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+            let upstream_config = Arc::new(upstream_config);
+            Self {
+                state: ProxyTlsState::new(CertCache::new(sandbox_ca), upstream_config.clone()),
+                upstream_config,
+                client_config: Arc::new(client_config),
+                upstream_cache: CertCache::new(upstream_ca),
+            }
+        }
+
+        fn upstream_acceptor(&self, hostname: &str, protocols: &[&[u8]]) -> TlsAcceptor {
+            let leaf = self.upstream_cache.get_or_generate(hostname).unwrap();
+            let mut config = openshell_crypto::tls::server_builder()
+                .with_no_client_auth()
+                .with_single_cert(leaf.cert_chain.clone(), leaf.private_key.clone_key())
+                .unwrap();
+            config.alpn_protocols = protocols.iter().map(|protocol| protocol.to_vec()).collect();
+            TlsAcceptor::from(Arc::new(config))
+        }
+
+        /// Run one tunnel and return the negotiated protocol of each leg.
+        async fn negotiate(
+            &self,
+            hostname: &str,
+            upstream_protocols: &[&[u8]],
+            client_protocols: &[&[u8]],
+            allow_http2: bool,
+        ) -> std::result::Result<(Option<Vec<u8>>, Option<Vec<u8>>, bool), String> {
+            let (client_io, proxy_client_io) = tokio::io::duplex(65536);
+            let (proxy_upstream_io, upstream_io) = tokio::io::duplex(65536);
+            let acceptor = self.upstream_acceptor(hostname, upstream_protocols);
+            let upstream_task = tokio::spawn(async move {
+                acceptor
+                    .accept(upstream_io)
+                    .await
+                    .map(|stream| stream.get_ref().1.alpn_protocol().map(<[u8]>::to_vec))
+            });
+            let mut client_config = (*self.client_config).clone();
+            client_config.alpn_protocols = client_protocols
+                .iter()
+                .map(|protocol| protocol.to_vec())
+                .collect();
+            let connector = TlsConnector::from(Arc::new(client_config));
+            let server_name = ServerName::try_from(hostname.to_string()).unwrap();
+            let client_task =
+                tokio::spawn(async move { connector.connect(server_name, client_io).await });
+            let negotiated = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                negotiate_http_tls(
+                    proxy_client_io,
+                    proxy_upstream_io,
+                    &self.state,
+                    hostname,
+                    &self.upstream_config,
+                    allow_http2,
+                ),
+            )
+            .await
+            .expect("negotiation must not hang");
+            let negotiated = match negotiated {
+                Ok(negotiated) => negotiated,
+                Err(HttpTlsError::Client(error)) => return Err(format!("client: {error}")),
+                Err(HttpTlsError::Upstream(error)) => return Err(format!("upstream: {error}")),
+            };
+            let upstream_alpn = upstream_task.await.unwrap().map_err(|e| e.to_string())?;
+            let client = client_task.await.unwrap().map_err(|e| e.to_string())?;
+            let client_alpn = client.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
+            assert_eq!(
+                negotiated
+                    .upstream
+                    .get_ref()
+                    .1
+                    .alpn_protocol()
+                    .map(<[u8]>::to_vec),
+                upstream_alpn
+            );
+            Ok((client_alpn, upstream_alpn, negotiated.http2))
+        }
+    }
+
+    #[tokio::test]
+    async fn http2_client_reaches_an_http1_only_upstream() {
+        let fixture = AlpnFixture::new();
+        let (client, upstream, http2) = fixture
+            .negotiate(
+                "api.deepinfra.example",
+                &[b"http/1.1"],
+                &[b"h2", b"http/1.1"],
+                true,
+            )
+            .await
+            .expect("an HTTP/1.1-only upstream must stay reachable for an h2-capable client");
+        assert_eq!(client.as_deref(), Some(&b"http/1.1"[..]));
+        assert_eq!(upstream.as_deref(), Some(&b"http/1.1"[..]));
+        assert!(!http2);
+    }
+
+    #[tokio::test]
+    async fn http2_is_used_end_to_end_when_both_sides_offer_it() {
+        let fixture = AlpnFixture::new();
+        let (client, upstream, http2) = fixture
+            .negotiate(
+                "api.openai.example",
+                &[b"h2", b"http/1.1"],
+                &[b"h2", b"http/1.1"],
+                true,
+            )
+            .await
+            .expect("h2 tunnel");
+        assert_eq!(client.as_deref(), Some(&b"h2"[..]));
+        assert_eq!(upstream.as_deref(), Some(&b"h2"[..]));
+        assert!(http2);
+    }
+
+    #[tokio::test]
+    async fn http1_clients_and_routes_without_http2_use_http1_upstream() {
+        let fixture = AlpnFixture::new();
+        // An HTTP/1.1-only client must not be handed an h2 upstream.
+        let (client, upstream, http2) = fixture
+            .negotiate(
+                "api.openai.example",
+                &[b"h2", b"http/1.1"],
+                &[b"http/1.1"],
+                true,
+            )
+            .await
+            .expect("HTTP/1.1 client");
+        assert_eq!(client.as_deref(), Some(&b"http/1.1"[..]));
+        assert_eq!(upstream.as_deref(), Some(&b"http/1.1"[..]));
+        assert!(!http2);
+        // A route that cannot inspect HTTP/2 keeps HTTP/1.1 on both legs.
+        let (client, upstream, http2) = fixture
+            .negotiate(
+                "api.openai.example",
+                &[b"h2", b"http/1.1"],
+                &[b"h2", b"http/1.1"],
+                false,
+            )
+            .await
+            .expect("route without HTTP/2");
+        assert_eq!(client.as_deref(), Some(&b"http/1.1"[..]));
+        assert_eq!(upstream.as_deref(), Some(&b"http/1.1"[..]));
+        assert!(!http2);
+    }
+
+    #[tokio::test]
+    async fn upstream_failures_are_reported_as_upstream() {
+        let fixture = AlpnFixture::new();
+        // An h2-only client cannot be bridged to an HTTP/1.1-only upstream.
+        let error = fixture
+            .negotiate("api.deepinfra.example", &[b"http/1.1"], &[b"h2"], true)
+            .await
+            .expect_err("no common protocol");
+        assert!(
+            error.starts_with("upstream:") || error.starts_with("client:"),
+            "{error}"
+        );
+    }
+
     async fn serve_one(acceptor: TlsAcceptor) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

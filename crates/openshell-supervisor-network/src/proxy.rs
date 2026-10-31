@@ -3139,50 +3139,43 @@ async fn handle_mediated_connection(
             else {
                 return Ok(());
             };
-            // Complete the client handshake before observing the upstream
-            // connection. A malformed client handshake provides no evidence
-            // of an endpoint network failure.
-            let mut tls_client = match crate::l7::tls::tls_terminate_http_client(
+            // Both legs must speak one HTTP version: HTTP/2 only when the route
+            // allows it, the client offers it, and the upstream selects it. A
+            // malformed client handshake fails before the upstream handshake
+            // and provides no evidence of an endpoint network failure.
+            let negotiated = match crate::l7::tls::negotiate_http_tls(
                 client,
+                upstream,
                 tls,
                 &host_lc,
+                tls.upstream_config_for(&host_lc, port, connector.addrs()),
                 relay_context.allows_http2(),
             )
             .await
             {
-                Ok(client) => client,
-                Err(error) => {
+                Ok(negotiated) => negotiated,
+                Err(crate::l7::tls::HttpTlsError::Client(error)) => {
                     debug!(host = %host_lc, port, "client TLS handshake failed");
                     return Err(error);
                 }
-            };
-            let http2 = tls_client.get_ref().1.alpn_protocol() == Some(b"h2");
-            let mut upstream_config =
-                (**tls.upstream_config_for(&host_lc, port, connector.addrs())).clone();
-            if http2 {
-                upstream_config.alpn_protocols = vec![b"h2".to_vec()];
-            }
-            let upstream_config = Arc::new(upstream_config);
-            let mut tls_upstream =
-                match crate::l7::tls::tls_connect_upstream(upstream, &host_lc, &upstream_config)
-                    .await
-                {
-                    Ok(upstream) => upstream,
-                    Err(error) => {
-                        if let Some(observer) = connect_endpoint_observer.as_ref() {
-                            observer.observe(EndpointResult::TlsFailed);
-                        }
-                        let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                            .activity(ActivityId::Fail)
-                            .severity(SeverityId::Low)
-                            .status(StatusId::Failure)
-                            .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                            .message("Upstream TLS establishment failed")
-                            .build();
-                        ocsf_emit!(event);
-                        return Err(error);
+                Err(crate::l7::tls::HttpTlsError::Upstream(error)) => {
+                    if let Some(observer) = connect_endpoint_observer.as_ref() {
+                        observer.observe(EndpointResult::TlsFailed);
                     }
-                };
+                    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                        .activity(ActivityId::Fail)
+                        .severity(SeverityId::Low)
+                        .status(StatusId::Failure)
+                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                        .message("Upstream TLS establishment failed")
+                        .build();
+                    ocsf_emit!(event);
+                    return Err(error);
+                }
+            };
+            let http2 = negotiated.http2;
+            let mut tls_client = negotiated.client;
+            let mut tls_upstream = negotiated.upstream;
             let tls_result = async {
                 if http2 {
                     relay::relay_http2_stream(&mut tls_client, &mut tls_upstream, relay_context)
