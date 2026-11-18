@@ -2433,7 +2433,7 @@ mod tests {
         }
 
         /// The value the workload's current placeholder resolves to for the bound
-        /// endpoint, as the next inspected request resolves it.
+        /// endpoint, as the next inspected request resolves it in `Authorization`.
         fn resolved(&self) -> Option<String> {
             let (_, child_env) = self
                 .ctx
@@ -2443,6 +2443,9 @@ mod tests {
             self.ctx
                 .provider_credentials
                 .resolver_for_endpoint("tools.example.com", 443, "/v1/chat")?
+                .with_request_location(openshell_core::secrets::RequestCredentialLocation::Header(
+                    "Authorization".into(),
+                ))
                 .resolve_placeholder(child_env.get("EXTERNAL_TOKEN")?)
                 .map(str::to_owned)
         }
@@ -3080,6 +3083,11 @@ mod tests {
                     state
                         .resolver_for_endpoint("tools.example.com", 443, "/v1/chat")
                         .unwrap()
+                        .with_request_location(
+                            openshell_core::secrets::RequestCredentialLocation::Header(
+                                "Authorization".into(),
+                            ),
+                        )
                         .resolve_placeholder("openshell:resolve:env:v2_EXTERNAL_TOKEN"),
                     Some("rotated")
                 );
@@ -3207,6 +3215,11 @@ mod tests {
                     state
                         .resolver_for_endpoint("tools.example.com", 443, "/v1/chat")
                         .unwrap()
+                        .with_request_location(
+                            openshell_core::secrets::RequestCredentialLocation::Header(
+                                "Authorization".into(),
+                            ),
+                        )
                         .resolve_placeholder(&reference),
                     Some("rotated")
                 );
