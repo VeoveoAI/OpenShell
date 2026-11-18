@@ -8387,7 +8387,10 @@ mod linux {
                 landlock: openshell_core::policy::LandlockPolicy::default(),
                 process: openshell_core::policy::ProcessPolicy::default(),
             });
-            assert!(matches!(boundary.attach(policy), Response::Attached { .. }));
+            assert!(matches!(
+                boundary.attach(policy, false),
+                Response::Attached { .. }
+            ));
             assert!(matches!(boundary.confirm(), Response::Confirmed { .. }));
             let Response::Started { process_id, .. } = boundary.start_agent(
                 "sandbox-termination".to_string(),
@@ -8397,6 +8400,7 @@ mod linux {
                     workdir: None,
                     timeout_secs: 120,
                     interactive: false,
+                    otlp_relay_active: false,
                 },
                 None,
                 None,
