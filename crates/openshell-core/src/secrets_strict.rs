@@ -330,7 +330,9 @@ fn origin_form_target(target: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::secrets::{SecretResolver, placeholder_for_env_key_for_revision};
+    use crate::secrets::{
+        CredentialPlacement, SecretResolver, placeholder_for_env_key_for_revision,
+    };
     use base64::Engine as _;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -344,8 +346,27 @@ mod tests {
     }
 
     /// A resolver scoped to an endpoint that binds `TOKEN` strictly and
-    /// denies `OTHER`, as `ProviderCredentialState` builds it.
+    /// denies `OTHER`, as `ProviderCredentialState` builds it. `TOKEN`'s
+    /// substitution placement follows its first declared header or query
+    /// position, as the gateway's placement metadata for the same profile
+    /// credential does; without one it is the default `Authorization`.
     fn strict_resolver(declared: Vec<CredentialPosition>) -> (SecretResolver, String) {
+        let placement = match declared.first() {
+            Some(CredentialPosition::Header(name)) => {
+                Some(CredentialPlacement::Header(name.clone()))
+            }
+            Some(CredentialPosition::Query(name)) => {
+                Some(CredentialPlacement::QueryParam(name.clone()))
+            }
+            Some(CredentialPosition::Path(_)) | None => None,
+        };
+        strict_resolver_with_placement(declared, placement)
+    }
+
+    fn strict_resolver_with_placement(
+        declared: Vec<CredentialPosition>,
+        placement: Option<CredentialPlacement>,
+    ) -> (SecretResolver, String) {
         let (env, resolver) = SecretResolver::from_provider_env_for_revision(
             HashMap::from([
                 (TOKEN.to_string(), SECRET.to_string()),
@@ -354,11 +375,18 @@ mod tests {
             HashMap::new(),
             3,
         );
-        let resolver = resolver.expect("resolver").scoped_to_env_keys(
-            &keys(&[TOKEN, OTHER]),
-            &keys(&[TOKEN]),
-            HashMap::from([(TOKEN.to_string(), Arc::new(HashSet::from([3])))]),
-        );
+        let resolver = resolver
+            .expect("resolver")
+            .with_placements(
+                placement
+                    .map(|placement| HashMap::from([(TOKEN.to_string(), placement)]))
+                    .unwrap_or_default(),
+            )
+            .scoped_to_env_keys(
+                &keys(&[TOKEN, OTHER]),
+                &keys(&[TOKEN]),
+                HashMap::from([(TOKEN.to_string(), Arc::new(HashSet::from([3])))]),
+            );
         let binding = StrictCredentialBinding::new(keys(&[TOKEN]), declared);
         (
             resolver.with_strict_binding(Arc::new(binding)),
@@ -585,17 +613,23 @@ mod tests {
 
     #[test]
     fn path_credential_position() {
-        let (resolver, placeholder) = strict_resolver(vec![
-            CredentialPosition::from_placement("path", "", "", "/bot{credential}/sendMessage")
-                .expect("valid")
-                .expect("position"),
-        ]);
+        let (resolver, placeholder) = strict_resolver_with_placement(
+            vec![
+                CredentialPosition::from_placement("path", "", "", "/bot{credential}/sendMessage")
+                    .expect("valid")
+                    .expect("position"),
+            ],
+            Some(CredentialPlacement::PathTemplate(
+                "/bot{credential}/sendMessage".to_string(),
+            )),
+        );
+        // Placement admits substitution only at the template's exact path.
         let rewritten = rewrite(
             &resolver,
-            &request(&format!("/bot{placeholder}/getUpdates"), &[]),
+            &request(&format!("/bot{placeholder}/sendMessage"), &[]),
         )
         .expect("path placeholder is admitted");
-        assert!(rewritten.starts_with(&format!("GET /bot{SECRET}/getUpdates HTTP/1.1")));
+        assert!(rewritten.starts_with(&format!("GET /bot{SECRET}/sendMessage HTTP/1.1")));
 
         assert_placeholder_required(rewrite(
             &resolver,

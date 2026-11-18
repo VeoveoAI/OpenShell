@@ -8,8 +8,8 @@ use std::path::Path;
 
 use k8s_openapi::ByteString;
 use k8s_openapi::api::core::v1::{
-    CSIVolumeSource, Capabilities, Container, EmptyDirVolumeSource, EnvVar, KeyToPath,
-    LocalObjectReference, Pod, PodSchedulingGate, PodSecurityContext, PodSpec, Probe,
+    CSIVolumeSource, Capabilities, ConfigMapVolumeSource, Container, EmptyDirVolumeSource, EnvVar,
+    KeyToPath, LocalObjectReference, Pod, PodSchedulingGate, PodSecurityContext, PodSpec, Probe,
     ProjectedVolumeSource, Secret, SecretVolumeSource, SecurityContext, Service,
     ServiceAccountTokenProjection, ServicePort, ServiceSpec, TCPSocketAction, Volume, VolumeMount,
     VolumeProjection,
@@ -40,11 +40,11 @@ pub const SUPERVISOR_AUTH_BUNDLE_KEY: &str = "auth.json";
 pub const PROXY_CA_CERTIFICATE_KEY: &str = "proxy-ca.crt";
 pub const PROXY_CA_PRIVATE_KEY: &str = "proxy-ca.key";
 /// Optional bootstrap-Secret key holding the operator's corporate proxy CA
-/// bundle (`proxy_ca_bundle`). Distinct from [`PROXY_CA_CERTIFICATE_KEY`],
-/// which is the sandbox's own generated TLS-interception CA.
+/// bundle (`proxy_ca_bundle`).
+///
+/// Distinct from [`PROXY_CA_CERTIFICATE_KEY`], which is the sandbox's own
+/// generated TLS-interception CA.
 pub const UPSTREAM_PROXY_CA_BUNDLE_KEY: &str = "upstream-proxy-ca.pem";
-/// Operator-owned roots for inspected destination HTTPS, independent of proxies.
-pub const ADDITIONAL_CA_BUNDLE_KEY: &str = "additional-ca.pem";
 /// JSON sandbox instance registration of a generation on the shared supervisor.
 pub const SHARED_INSTANCE_KEY: &str = "instance.json";
 pub const CLIENT_TLS_CA_KEY: &str = "client-ca.crt";
@@ -62,12 +62,17 @@ pub const PROXY_CA_PRIVATE_KEY_PATH: &str = "/.openshell/supervisor/proxy-ca.key
 /// `/.openshell/supervisor` with no `items` filter, so the key appears here
 /// without a dedicated volume or mount.
 pub const UPSTREAM_PROXY_CA_BUNDLE_PATH: &str = "/.openshell/supervisor/upstream-proxy-ca.pem";
-pub const ADDITIONAL_CA_BUNDLE_PATH: &str = "/.openshell/supervisor/additional-ca.pem";
 pub const CLIENT_TLS_CA_PATH: &str = "/.openshell/supervisor/client-ca.crt";
 pub const CONTROL_HEALTH_SOCKET_PATH: &str = "/run/openshell/health.sock";
 /// Kubelet `tcpSocket` readiness port. An exec probe would start a supervisor
 /// process in every sandbox on every period.
 pub const CONTROL_HEALTH_PORT: u16 = 5501;
+
+/// `ConfigMap` volume name reserved for gateway-normalized destination trust.
+pub const ADDITIONAL_CA_VOLUME_NAME: &str = "openshell-additional-ca";
+/// The only destination-trust path exposed to the dedicated supervisor Pod.
+pub const ADDITIONAL_CA_MOUNT_PATH: &str = openshell_core::driver_utils::ADDITIONAL_CA_MOUNT_PATH;
+const ADDITIONAL_CA_KEY: &str = "ca.crt";
 pub const NAMESPACE_WORKLOAD_POLICY_NAME: &str = "openshell-sandbox-workloads";
 pub const NAMESPACE_SUPERVISOR_EGRESS_POLICY_NAME: &str = "openshell-sandbox-supervisors";
 pub const SUPERVISOR_TERMINATION_GRACE_PERIOD_SECONDS: i64 = 30;
@@ -86,13 +91,6 @@ pub enum SupervisorClientTls<'a> {
     Secret(&'a str),
     /// Keys staged into the supervisor bootstrap Secret.
     Bootstrap,
-}
-
-/// Operator CA files present in the immutable supervisor bootstrap Secret.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct SupervisorCaBundles {
-    pub upstream_proxy: bool,
-    pub additional: bool,
 }
 
 pub struct ProxyCaMaterial {
@@ -215,8 +213,10 @@ pub fn workload_fence(
 }
 
 /// Per-sandbox Sandbox Protocol endpoint. Its stable `ClusterIP` is allocated
-/// before either Pod runs. Each connection mode has a separate Service name
-/// and fixed selector, so legacy gateways keep their workload endpoint.
+/// before either Pod runs.
+///
+/// Each connection mode has a separate Service name and fixed selector, so
+/// legacy gateways keep their workload endpoint.
 #[must_use]
 pub fn boundary_service(
     namespace: &str,
@@ -322,6 +322,16 @@ pub fn shared_control_policy(
     policy
 }
 
+/// Set the dedicated supervisor Pod's `runtimeClassName`. An empty class
+/// leaves it unset.
+#[must_use]
+pub fn with_runtime_class(mut pod: Pod, class: &str) -> Pod {
+    if let Some(spec) = pod.spec.as_mut().filter(|_| !class.is_empty()) {
+        spec.runtime_class_name = Some(class.to_string());
+    }
+    pod
+}
+
 #[allow(clippy::too_many_arguments, clippy::similar_names)]
 pub fn supervisor_pod(
     namespace: &str,
@@ -345,10 +355,15 @@ pub fn supervisor_pod(
     proxy_auth_secret: Option<(&str, &str)>,
     proxy_auth_allow_insecure: bool,
     proxy_connect_by_hostname: bool,
-    ca_bundles: SupervisorCaBundles,
+    upstream_proxy_ca_bundle_staged: bool,
     provider_spiffe_socket_path: Option<&str>,
+    // Name and expected full digest of a gateway-normalized destination trust
+    // generation. The ConfigMap is mounted only in this dedicated control Pod;
+    // it is deliberately absent from the workload Pod and its bootstrap Secret.
+    network_additional_ca: Option<(&str, &str)>,
     owner: OwnerReference,
     tracing_environment: &[(&str, String)],
+    attach_request_timeout_seconds: Option<u64>,
 ) -> Result<Pod, String> {
     let labels = control_labels(sandbox_id, gateway_id);
     let mut environment = vec![
@@ -390,6 +405,12 @@ pub fn supervisor_pod(
             .iter()
             .map(|(name, value)| env_var(name, value)),
     );
+    if let Some(timeout_seconds) = attach_request_timeout_seconds {
+        environment.push(env_var(
+            "OPENSHELL_ATTACH_REQUEST_TIMEOUT_SECONDS",
+            &timeout_seconds.to_string(),
+        ));
+    }
     if let Some(server_name) = gateway_tls_server_name(grpc_endpoint) {
         environment.push(env_var(
             openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME,
@@ -481,17 +502,27 @@ pub fn supervisor_pod(
     }
     // The bundle rides in the bootstrap Secret already mounted at
     // /.openshell/supervisor, so this needs no volume of its own.
-    if ca_bundles.upstream_proxy {
+    if upstream_proxy_ca_bundle_staged {
         command.extend([
             "--upstream-proxy-ca-bundle".to_string(),
             UPSTREAM_PROXY_CA_BUNDLE_PATH.to_string(),
         ]);
     }
-    if ca_bundles.additional {
+    if let Some((config_map_name, _digest)) = network_additional_ca {
         command.extend([
             "--additional-ca-bundle".to_string(),
-            ADDITIONAL_CA_BUNDLE_PATH.to_string(),
+            ADDITIONAL_CA_MOUNT_PATH.to_string(),
         ]);
+        let mut mount = volume_mount(ADDITIONAL_CA_VOLUME_NAME, ADDITIONAL_CA_MOUNT_PATH, true);
+        // A subPath exposes `ca.crt` at the exact protected file path rather
+        // than mounting a ConfigMap directory over the supervisor's filesystem.
+        mount.sub_path = Some(ADDITIONAL_CA_KEY.to_string());
+        volume_mounts.push(mount);
+        volumes.push(config_map_volume(
+            ADDITIONAL_CA_VOLUME_NAME,
+            config_map_name,
+            ADDITIONAL_CA_KEY,
+        ));
     }
     if let Some((secret_name, secret_key)) = proxy_auth_secret {
         let auth_path = Path::new(openshell_core::container_paths::UPSTREAM_PROXY_AUTH_MOUNT_PATH);
@@ -659,7 +690,6 @@ pub fn supervisor_bootstrap_secret(
     proxy_ca_certificate: Vec<u8>,
     proxy_ca_private_key: Vec<u8>,
     upstream_proxy_ca_bundle: Option<Vec<u8>>,
-    additional_ca_bundle: Option<Vec<u8>>,
     client_tls: Option<ClientTlsMaterial>,
     owner: OwnerReference,
 ) -> Secret {
@@ -686,9 +716,6 @@ pub fn supervisor_bootstrap_secret(
     if let Some(bundle) = upstream_proxy_ca_bundle {
         data.insert(UPSTREAM_PROXY_CA_BUNDLE_KEY.to_string(), ByteString(bundle));
     }
-    if let Some(bundle) = additional_ca_bundle {
-        data.insert(ADDITIONAL_CA_BUNDLE_KEY.to_string(), ByteString(bundle));
-    }
     if let Some(tls) = client_tls {
         data.insert(
             CLIENT_TLS_CA_KEY.to_string(),
@@ -712,7 +739,9 @@ pub fn supervisor_bootstrap_secret(
 
 /// Durable launch material of one shared-supervisor sandbox instance, under
 /// the generation's supervisor Secret name so the existing generation cleanup
-/// deletes it. The gateway reads it back to rebuild the host's assignments.
+/// deletes it.
+///
+/// The gateway reads it back to rebuild the host's assignments.
 #[must_use]
 pub fn shared_instance_secret(
     namespace: &str,
@@ -838,6 +867,23 @@ fn volume_mount(name: &str, mount_path: &str, read_only: bool) -> VolumeMount {
         name: name.to_string(),
         mount_path: mount_path.to_string(),
         read_only: read_only.then_some(true),
+        ..Default::default()
+    }
+}
+
+fn config_map_volume(name: &str, config_map_name: &str, key: &str) -> Volume {
+    Volume {
+        name: name.to_string(),
+        config_map: Some(ConfigMapVolumeSource {
+            name: config_map_name.to_string(),
+            default_mode: Some(0o444),
+            items: Some(vec![KeyToPath {
+                key: key.to_string(),
+                path: key.to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
         ..Default::default()
     }
 }
@@ -977,7 +1023,6 @@ mod tests {
             Vec::new(),
             Vec::new(),
             None,
-            None,
             Some(ClientTlsMaterial {
                 ca_certificate: b"ca".to_vec(),
             }),
@@ -1012,10 +1057,12 @@ mod tests {
             None,
             false,
             false,
-            SupervisorCaBundles::default(),
+            false,
+            None,
             None,
             owner(),
             &[],
+            None,
         )
         .expect("render supervisor Pod")
     }
@@ -1046,6 +1093,25 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_runtime_class_is_set_only_when_configured() {
+        let pod = Pod {
+            spec: Some(PodSpec::default()),
+            ..Default::default()
+        };
+        let class = |pod: Pod, name: &str| {
+            with_runtime_class(pod, name)
+                .spec
+                .unwrap()
+                .runtime_class_name
+        };
+        assert_eq!(class(pod.clone(), ""), None);
+        assert_eq!(
+            class(pod, "kata-supervisor").as_deref(),
+            Some("kata-supervisor")
+        );
+    }
+
+    #[test]
     fn supervisor_pod_carries_tracing_environment() {
         const TRACEPARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
         let client_tls = SupervisorClientTls::Disabled;
@@ -1071,7 +1137,8 @@ mod tests {
             None,
             false,
             false,
-            SupervisorCaBundles::default(),
+            false,
+            None,
             None,
             owner(),
             &[
@@ -1081,6 +1148,7 @@ mod tests {
                 ),
                 ("TRACEPARENT", TRACEPARENT.to_string()),
             ],
+            None,
         )
         .expect("render supervisor Pod");
         let environment = pod.spec.expect("Pod spec").containers[0]
@@ -1095,6 +1163,56 @@ mod tests {
             "http://collector:4317"
         );
         assert_eq!(environment["TRACEPARENT"], TRACEPARENT);
+    }
+
+    #[test]
+    fn supervisor_pod_sets_attach_request_timeout_only_when_configured() {
+        let env = |timeout: Option<u64>| {
+            supervisor_pod(
+                "sandbox",
+                &SandboxRuntimeNames::new("pair"),
+                "pair",
+                "demo",
+                "gateway",
+                "supervisor:latest",
+                None,
+                "sandbox-sa",
+                1000,
+                1000,
+                &[],
+                "https://gateway:8080",
+                SupervisorClientTls::Disabled,
+                "{}",
+                "info",
+                600,
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+                None,
+                None,
+                owner(),
+                &[],
+                timeout,
+            )
+            .unwrap()
+            .spec
+            .expect("Pod spec")
+            .containers[0]
+                .env
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|variable| (variable.name, variable.value.unwrap_or_default()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        assert!(!env(None).contains_key("OPENSHELL_ATTACH_REQUEST_TIMEOUT_SECONDS"));
+        assert_eq!(
+            env(Some(900))["OPENSHELL_ATTACH_REQUEST_TIMEOUT_SECONDS"],
+            "900"
+        );
     }
 
     #[test]
@@ -1197,10 +1315,12 @@ mod tests {
             None,
             false,
             false,
-            SupervisorCaBundles::default(),
+            false,
+            None,
             None,
             owner(),
             &[],
+            None,
         )
         .expect("render supervisor Pod");
         let pod_spec = pod.spec.as_ref().expect("Pod spec");
@@ -1339,6 +1459,109 @@ mod tests {
     }
 
     #[test]
+    fn destination_trust_is_mounted_only_into_the_dedicated_supervisor_pod() {
+        for enabled in [false, true] {
+            let names = SandboxRuntimeNames::new("pair");
+            let digest = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+            let pod = supervisor_pod(
+                "sandbox",
+                &names,
+                "pair",
+                "demo",
+                "gateway",
+                "supervisor:latest",
+                None,
+                "sandbox-sa",
+                1000,
+                1000,
+                &[],
+                "https://gateway:8080",
+                SupervisorClientTls::Disabled,
+                "{}",
+                "info",
+                600,
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+                None,
+                Some(("openshell-additional-ca-gateway-generation", digest)),
+                owner(),
+                &[],
+                None,
+            )
+            .expect("render supervisor Pod with destination trust");
+            let pod = crate::app_listener::configure_supervisor_pod(
+                pod,
+                &crate::config::KubernetesAppListenerConfig {
+                    tls_secret_name: "app-tls-secret".into(),
+                    common: openshell_core::app_listener::AppListenerConfig {
+                        enabled,
+                        ..Default::default()
+                    },
+                },
+            );
+            let spec = pod.spec.expect("Pod spec");
+            assert_eq!(
+                spec.volumes
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .any(|v| v.name == "app-tls"),
+                enabled
+            );
+            let container = &spec.containers[0];
+            assert!(container.command.as_deref().is_some_and(|command| {
+                command
+                    .windows(2)
+                    .any(|args| args == ["--additional-ca-bundle", ADDITIONAL_CA_MOUNT_PATH])
+            }));
+            assert_eq!(
+                container
+                    .volume_mounts
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|mount| mount.name == ADDITIONAL_CA_VOLUME_NAME)
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                &[&VolumeMount {
+                    name: ADDITIONAL_CA_VOLUME_NAME.to_string(),
+                    mount_path: ADDITIONAL_CA_MOUNT_PATH.to_string(),
+                    read_only: Some(true),
+                    sub_path: Some(ADDITIONAL_CA_KEY.to_string()),
+                    ..Default::default()
+                }]
+            );
+            let volume = spec
+                .volumes
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .find(|volume| volume.name == ADDITIONAL_CA_VOLUME_NAME)
+                .expect("destination trust ConfigMap volume");
+            assert_eq!(
+                volume
+                    .config_map
+                    .as_ref()
+                    .map(|source| source.name.as_str()),
+                Some("openshell-additional-ca-gateway-generation")
+            );
+            assert_eq!(
+                volume
+                    .config_map
+                    .as_ref()
+                    .and_then(|source| source.items.as_deref())
+                    .and_then(|items| items.first())
+                    .map(|item| (item.key.as_str(), item.path.as_str())),
+                Some((ADDITIONAL_CA_KEY, ADDITIONAL_CA_KEY))
+            );
+        }
+    }
+
+    #[test]
     fn bootstrap_secrets_are_immutable_and_split_by_trust_domain() {
         let names = SandboxRuntimeNames::new("pair");
         let sandbox = sandbox_bootstrap_secret(
@@ -1379,7 +1602,6 @@ mod tests {
             Vec::new(),
             None,
             None,
-            None,
             owner(),
         );
         assert_eq!(
@@ -1415,7 +1637,6 @@ mod tests {
             Vec::new(),
             Some(b"-----BEGIN CERTIFICATE-----\n".to_vec()),
             None,
-            None,
             owner(),
         );
         assert_eq!(staged.immutable, Some(true));
@@ -1431,8 +1652,9 @@ mod tests {
         assert!(staged_data.contains_key(PROXY_CA_CERTIFICATE_KEY));
     }
 
-    /// Render operator trust inputs independently, including direct egress.
-    fn supervisor_pod_with_staged_ca_bundles(proxy: bool, additional: bool) -> Pod {
+    /// Render a supervisor Pod configured for an `https://` corporate proxy,
+    /// varying only whether the operator CA bundle was staged.
+    fn supervisor_pod_with_staged_proxy_ca(staged: bool) -> Pod {
         let names = SandboxRuntimeNames::new("pair");
         supervisor_pod(
             "sandbox",
@@ -1451,96 +1673,24 @@ mod tests {
             "{}",
             "info",
             600,
-            proxy.then_some("https://proxy.corp.example:3130"),
+            Some("https://proxy.corp.example:3130"),
             None,
             None,
             false,
             false,
-            SupervisorCaBundles {
-                upstream_proxy: proxy,
-                additional,
-            },
+            staged,
+            None,
             None,
             owner(),
             &[],
+            None,
         )
         .expect("render supervisor Pod")
     }
 
     #[test]
-    fn additional_ca_bundle_is_staged_only_for_the_supervisor_without_a_proxy() {
-        let names = SandboxRuntimeNames::for_generation("pair", "generation");
-        let pem = b"destination CA bytes".to_vec();
-        let secret = supervisor_bootstrap_secret(
-            "sandbox",
-            &names,
-            "pair",
-            Vec::new(),
-            Vec::new(),
-            b"interception certificate".to_vec(),
-            b"interception private key".to_vec(),
-            None,
-            Some(pem.clone()),
-            None,
-            owner(),
-        );
-        assert_eq!(secret.immutable, Some(true));
-        let data = secret.data.unwrap();
-        assert_eq!(data[ADDITIONAL_CA_BUNDLE_KEY].0, pem);
-        assert!(!data.contains_key(UPSTREAM_PROXY_CA_BUNDLE_KEY));
-        assert_eq!(
-            data[PROXY_CA_CERTIFICATE_KEY].0,
-            b"interception certificate"
-        );
-        let pod = supervisor_pod_with_staged_ca_bundles(false, true);
-        let spec = pod.spec.unwrap();
-        let command = spec.containers[0].command.as_ref().unwrap();
-        assert!(
-            command
-                .windows(2)
-                .any(|pair| pair == ["--additional-ca-bundle", ADDITIONAL_CA_BUNDLE_PATH])
-        );
-        assert!(
-            !command
-                .iter()
-                .any(|arg| arg == "--upstream-proxy" || arg == "--upstream-proxy-ca-bundle")
-        );
-        let mounts = spec.containers[0].volume_mounts.as_ref().unwrap();
-        assert!(
-            mounts
-                .iter()
-                .any(|mount| mount.mount_path == "/.openshell/supervisor"
-                    && mount.read_only == Some(true))
-        );
-        let bare = supervisor_pod_with_staged_ca_bundles(false, false);
-        assert!(
-            !bare.spec.as_ref().unwrap().containers[0]
-                .command
-                .as_ref()
-                .unwrap()
-                .iter()
-                .any(|arg| arg == "--additional-ca-bundle")
-        );
-        let workload = sandbox_bootstrap_secret(
-            "sandbox",
-            &names,
-            "pair",
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            owner(),
-        );
-        assert!(
-            !workload
-                .data
-                .unwrap()
-                .contains_key(ADDITIONAL_CA_BUNDLE_KEY)
-        );
-    }
-
-    #[test]
     fn supervisor_pod_passes_upstream_proxy_ca_bundle_argument() {
-        let pod = supervisor_pod_with_staged_ca_bundles(true, false);
+        let pod = supervisor_pod_with_staged_proxy_ca(true);
         let spec = pod.spec.as_ref().expect("Pod spec");
         let container = &spec.containers[0];
         let command = container.command.as_ref().expect("supervisor command");
@@ -1556,7 +1706,7 @@ mod tests {
     fn supervisor_pod_omits_the_ca_bundle_argument_when_unstaged() {
         // The supervisor keys its behavior off the argument, so an unstaged
         // bundle must not leave a dangling path on the argv.
-        let pod = supervisor_pod_with_staged_ca_bundles(false, false);
+        let pod = supervisor_pod_with_staged_proxy_ca(false);
         let spec = pod.spec.as_ref().expect("Pod spec");
         let command = spec.containers[0]
             .command
@@ -1576,8 +1726,8 @@ mod tests {
         // mounts every key at /.openshell/supervisor. A new volume here would
         // mean the Secret is being projected with an `items` filter that would
         // silently drop the new key.
-        let staged = supervisor_pod_with_staged_ca_bundles(true, false);
-        let bare = supervisor_pod_with_staged_ca_bundles(false, false);
+        let staged = supervisor_pod_with_staged_proxy_ca(true);
+        let bare = supervisor_pod_with_staged_proxy_ca(false);
         let volume_names = |pod: &Pod| {
             pod.spec
                 .as_ref()

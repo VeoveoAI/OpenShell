@@ -85,15 +85,26 @@ pub(crate) struct MappingLookup {
 }
 
 impl MappingLookup {
-    pub(crate) fn pinned_addresses(&self) -> Vec<IpAddr> {
+    /// Select only contracts authorized for this process and destination port.
+    pub(crate) fn pinned_addresses_for(
+        &self,
+        endpoint_ids: &[PolicyEndpointId],
+    ) -> Result<Vec<IpAddr>, MappingLookupError> {
         let mut seen = HashSet::new();
-        self.record
+        let addresses = self
+            .record
             .contracts
             .iter()
-            .filter(|contract| contract.port == self.port)
+            .filter(|contract| {
+                contract.port == self.port && endpoint_ids.contains(&contract.endpoint_id)
+            })
             .flat_map(|contract| contract.pinned_addresses.iter().copied())
             .filter(|address| seen.insert(*address))
-            .collect()
+            .collect::<Vec<_>>();
+        if addresses.is_empty() {
+            return Err(MappingLookupError::EndpointMismatch);
+        }
+        Ok(addresses)
     }
 
     pub(crate) fn endpoint_ids(&self) -> impl Iterator<Item = &PolicyEndpointId> {
@@ -105,20 +116,31 @@ impl MappingLookup {
     }
 
     /// Preserve native logical socket pins instead of reducing them to IP-only plans.
+    #[cfg(test)]
     pub(crate) fn pinned_plan(&self) -> Result<DestinationValidationPlan, MappingLookupError> {
         self.pinned_plan_for(None)
     }
 
+    /// The pinned plan of the contracts authorized for these endpoints,
+    /// preserving a native service's logical socket pin.
+    pub(crate) fn pinned_plan_for_endpoints(
+        &self,
+        endpoint_ids: &[PolicyEndpointId],
+    ) -> Result<DestinationValidationPlan, MappingLookupError> {
+        self.pinned_plan_for(Some(endpoint_ids))
+    }
+
     fn pinned_plan_for(
         &self,
-        endpoint: Option<&PolicyEndpointId>,
+        endpoint_ids: Option<&[PolicyEndpointId]>,
     ) -> Result<DestinationValidationPlan, MappingLookupError> {
         let contracts = self
             .record
             .contracts
             .iter()
             .filter(|contract| {
-                contract.port == self.port && endpoint.is_none_or(|id| id == &contract.endpoint_id)
+                contract.port == self.port
+                    && endpoint_ids.is_none_or(|ids| ids.contains(&contract.endpoint_id))
             })
             .collect::<Vec<_>>();
         if contracts.is_empty() {
@@ -164,7 +186,7 @@ impl MappingLookup {
         &self,
         endpoint_id: &PolicyEndpointId,
     ) -> Result<UpstreamConnector, MappingLookupError> {
-        let plan = self.pinned_plan_for(Some(endpoint_id))?;
+        let plan = self.pinned_plan_for(Some(std::slice::from_ref(endpoint_id)))?;
         validate_destination(DestinationRequest {
             host: self.record.normalized_name.as_str(),
             port: self.port,
@@ -486,7 +508,7 @@ impl ResolvedEndpointStore {
             if allocated.saturating_mul(5) >= capacity.saturating_mul(4)
                 && !emitted.swap(true, Ordering::Relaxed)
             {
-                openshell_ocsf::ocsf_emit!(build_pool_high_water_event(
+                crate::telemetry::egress_emit!(build_pool_high_water_event(
                     allocated, capacity, family,
                 ));
             }
@@ -788,7 +810,10 @@ mod tests {
             .lookup_intent(observed.synthetic_address, 443, 1, now)
             .unwrap();
         assert_eq!(intent.record.normalized_name.as_str(), "unknown.example");
-        assert!(intent.pinned_addresses().is_empty());
+        assert!(matches!(
+            intent.pinned_addresses_for(&[]),
+            Err(MappingLookupError::EndpointMismatch)
+        ));
         assert!(matches!(
             store.lookup_intent(observed.synthetic_address, 443, 2, now),
             Err(MappingLookupError::StalePolicy)
@@ -1118,6 +1143,54 @@ mod tests {
         assert!(matches!(
             lookup.connector_for(&endpoint).await,
             Err(MappingLookupError::InvalidMapping)
+        ));
+    }
+
+    #[tokio::test]
+    async fn endpoint_selection_unions_authorized_contracts_only_and_binds_connector() {
+        let store = store(1);
+        let now = Instant::now();
+        let mut request = request("must-not-resolve.invalid", 1, Duration::from_secs(5));
+        let first = request.contracts[0].clone();
+        let mut second = first.clone();
+        second.endpoint_id.endpoint_index = 1;
+        second.pinned_addresses = vec!["203.0.113.9".parse().unwrap(), first.pinned_addresses[0]];
+        let mut unrelated = first.clone();
+        unrelated.endpoint_id.policy_name = "other-binary".to_string();
+        unrelated.pinned_addresses = vec!["10.2.3.4".parse().unwrap()];
+        let mut other_port = second.clone();
+        other_port.port = 443;
+        other_port.pinned_addresses = vec!["203.0.113.10".parse().unwrap()];
+        request
+            .contracts
+            .extend([second.clone(), unrelated.clone(), other_port]);
+        let record = store.publish(request, 1, now).unwrap();
+        let lookup = store
+            .lookup(record.synthetic_address, 5432, 1, now)
+            .unwrap();
+        assert_eq!(
+            lookup
+                .pinned_addresses_for(&[first.endpoint_id.clone(), second.endpoint_id])
+                .unwrap(),
+            [
+                "203.0.113.8".parse::<IpAddr>().unwrap(),
+                "203.0.113.9".parse().unwrap()
+            ]
+        );
+        let connector = lookup.connector_for(&first.endpoint_id).await.unwrap();
+        assert_eq!(connector.addrs(), &["203.0.113.8:5432".parse().unwrap()]);
+        assert!(matches!(
+            lookup
+                .connector_for(&PolicyEndpointId {
+                    policy_name: "absent".to_string(),
+                    endpoint_index: 0
+                })
+                .await,
+            Err(MappingLookupError::EndpointMismatch)
+        ));
+        assert!(matches!(
+            lookup.pinned_addresses_for(&[]),
+            Err(MappingLookupError::EndpointMismatch)
         ));
     }
 

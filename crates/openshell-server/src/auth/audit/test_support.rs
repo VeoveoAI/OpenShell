@@ -4,10 +4,8 @@
 //! Fixtures for tests that assert on gateway audit events.
 
 use super::{ConnectionSource, RequestOrigin};
+use crate::auth::principal::Principal;
 use openshell_ocsf::test_support::OcsfCapture;
-use openshell_ocsf::validation::schema::{
-    load_class_schema, validate_known_fields, validate_required_fields,
-};
 use serde_json::Value;
 use std::future::Future;
 
@@ -43,6 +41,65 @@ pub async fn audited<F: Future>(path: &str, handler: F) -> (F::Output, Vec<Value
     (output, capture.json_events())
 }
 
+/// Run a gateway service `call` as a routed request to `path` by
+/// `principal`, returning its result and the mutation records it produced.
+pub async fn audited_mutation<T, F>(
+    path: &str,
+    principal: &Principal,
+    call: F,
+) -> (Result<tonic::Response<T>, tonic::Status>, Vec<Value>)
+where
+    F: Future<Output = Result<tonic::Response<T>, tonic::Status>>,
+{
+    let capture = OcsfCapture::default();
+    let mut result = None;
+    {
+        let _guard = capture.install();
+        let routed = async {
+            let output = call.await;
+            let response = match &output {
+                Ok(_) => http::Response::new(tonic::body::Body::empty()),
+                Err(status) => status.clone().into_http(),
+            };
+            result = Some(output);
+            Ok::<_, std::convert::Infallible>(response)
+        };
+        let _ = super::with_audited_request(path.to_string(), origin(), principal, routed).await;
+    }
+    let events = capture
+        .json_events()
+        .into_iter()
+        .filter(|event| event["class_uid"] == 6003)
+        .collect();
+    (result.expect("call completed"), events)
+}
+
+/// Start a gateway service `call` as a routed request to `path` by
+/// `principal`, drop it before it finishes, and return the mutation records
+/// it produced.
+pub async fn cancelled_mutation<T, F>(path: &str, principal: &Principal, call: F) -> Vec<Value>
+where
+    F: Future<Output = Result<tonic::Response<T>, tonic::Status>>,
+{
+    let capture = OcsfCapture::default();
+    {
+        let _guard = capture.install();
+        let routed = async {
+            let _ = call.await;
+            Ok::<_, std::convert::Infallible>(http::Response::new(tonic::body::Body::empty()))
+        };
+        let routed = super::with_audited_request(path.to_string(), origin(), principal, routed);
+        tokio::time::timeout(std::time::Duration::from_millis(10), routed)
+            .await
+            .expect_err("call finished");
+    }
+    capture
+        .json_events()
+        .into_iter()
+        .filter(|event| event["class_uid"] == 6003)
+        .collect()
+}
+
 /// Assert that `event` records the request from [`origin`].
 pub fn assert_origin(event: &Value) {
     assert_eq!(event["src_endpoint"]["ip"], PEER_IP, "{event}");
@@ -57,16 +114,14 @@ pub fn assert_redacted(event: &Value, secret: &str) {
     );
 }
 
-fn assert_conforms(event: &Value, class: &str) {
-    let schema = load_class_schema(class);
-    validate_required_fields(event, &schema);
-    validate_known_fields(event, &schema);
+fn assert_conforms(event: &Value) {
+    openshell_ocsf_validate::validate_event(event).unwrap_or_else(|e| panic!("{e}\n{event}"));
 }
 
 /// Assert that `event` is an Authentication failure for `reason` on a
 /// request to `path`.
 pub fn assert_authentication_failure(event: &Value, path: &str, reason: &str) {
-    assert_conforms(event, "authentication");
+    assert_conforms(event);
     assert_eq!(event["class_uid"], 3002, "{event}");
     assert_eq!(event["activity_id"], 1, "{event}");
     assert_eq!(event["status_id"], 2, "{event}");
@@ -79,7 +134,7 @@ pub fn assert_authentication_failure(event: &Value, path: &str, reason: &str) {
 
 /// Assert that `event` is an Authentication logon for a request to `path`.
 pub fn assert_logon(event: &Value, path: &str) {
-    assert_conforms(event, "authentication");
+    assert_conforms(event);
     assert_eq!(event["class_uid"], 3002, "{event}");
     assert_eq!(event["activity_id"], 1, "{event}");
     assert_eq!(event["status_id"], 1, "{event}");
@@ -93,7 +148,7 @@ pub fn assert_logon(event: &Value, path: &str) {
 /// Assert that `event` is an API Activity denial for `reason` on a request
 /// to `path`.
 pub fn assert_denial(event: &Value, path: &str, reason: &str) {
-    assert_conforms(event, "api_activity");
+    assert_conforms(event);
     assert_eq!(event["class_uid"], 6003, "{event}");
     assert_eq!(event["action_id"], 2, "{event}");
     assert_eq!(event["disposition_id"], 2, "{event}");
@@ -105,7 +160,7 @@ pub fn assert_denial(event: &Value, path: &str, reason: &str) {
 /// Assert that `finding` is the sandbox boundary finding paired with
 /// `denial`.
 pub fn assert_boundary_finding(denial: &Value, finding: &Value) {
-    assert_conforms(finding, "detection_finding");
+    assert_conforms(finding);
     assert_eq!(finding["class_uid"], 2004, "{finding}");
     assert_eq!(
         finding["finding_info"]["uid"], "sandbox-authorization-boundary",

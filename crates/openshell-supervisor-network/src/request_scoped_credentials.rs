@@ -28,7 +28,7 @@ use openshell_core::provider_credentials::RequestScopedCredential;
 use openshell_core::request_scope::ScopedCredentialFailure;
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest, SeverityId,
-    StatusId, ctx::ctx as ocsf_ctx, ocsf_emit,
+    StatusId, ctx::ctx as ocsf_ctx,
 };
 use tokio::sync::OnceCell;
 use tracing::warn;
@@ -444,7 +444,7 @@ fn emit_minted(
     scope: &str,
     request_id: &str,
 ) {
-    ocsf_emit!(
+    crate::telemetry::egress_emit!(
         HttpActivityBuilder::new(ocsf_ctx())
             .activity(ActivityId::Other)
             .action(ActionId::Allowed)
@@ -483,7 +483,7 @@ fn emit_refused(
         code = failure.code(),
         "Request-scoped credential refused; forwarding the ordinary credential"
     );
-    ocsf_emit!(
+    crate::telemetry::egress_emit!(
         HttpActivityBuilder::new(ocsf_ctx())
             .activity(ActivityId::Other)
             .action(ActionId::Allowed)
@@ -522,7 +522,7 @@ fn emit_unavailable(
         request_id = %request_id,
         "Request-scoped credential unavailable; request not forwarded"
     );
-    ocsf_emit!(
+    crate::telemetry::egress_emit!(
         HttpActivityBuilder::new(ocsf_ctx())
             .activity(ActivityId::Fail)
             .action(ActionId::Denied)
@@ -1196,9 +1196,12 @@ network_policies:
         .unwrap();
         let env = state.snapshot().child_env.clone();
         let resolver = state.resolver_for_endpoint("lore.example.test", 443, "/x");
+        // Bound credentials resolve only at a request location; the default
+        // placement is `Authorization`.
         let scoped = resolver
             .unwrap()
-            .with_env_key_value(KEY, "synthetic-scoped", far_future());
+            .with_env_key_value(KEY, "synthetic-scoped", far_future())
+            .with_request_location(at_authorization());
         assert_eq!(
             scoped.resolve_placeholder(&env[KEY]),
             Some("synthetic-scoped")
@@ -1244,7 +1247,8 @@ network_policies:
         assert!(placeholder.contains(&handle));
         let resolver = state
             .resolver_for_endpoint("lore.example.test", 443, "/x")
-            .unwrap();
+            .unwrap()
+            .with_request_location(at_authorization());
         assert_eq!(resolver.resolve_placeholder(&placeholder), Some(ORDINARY));
         let scoped = resolver.with_env_key_value(KEY, "synthetic-scoped", far_future());
         assert_eq!(
@@ -1259,6 +1263,10 @@ network_policies:
             credentials[0].credential_identity,
             format!("refresh:{handle}")
         );
+    }
+
+    fn at_authorization() -> openshell_core::secrets::RequestCredentialLocation {
+        openshell_core::secrets::RequestCredentialLocation::Header("authorization".to_string())
     }
 
     fn lore_state_binding() -> StaticCredentialBinding {

@@ -163,6 +163,7 @@ macro_rules! mock_gateway {
     ) => {
         #[tonic::async_trait]
         impl OpenShell for MockGateway {
+
             $(async fn $method(&self, _: Request<$request>) -> Result<Response<$response>, Status> {
                 Err(Status::unimplemented("unused test RPC"))
             })*
@@ -236,6 +237,8 @@ mock_gateway! {
         delete_sandbox(proto::DeleteSandboxRequest) -> proto::DeleteSandboxResponse;
         stop_sandbox(proto::StopSandboxRequest) -> proto::SandboxResponse;
         start_sandbox(proto::StartSandboxRequest) -> proto::SandboxResponse;
+        suspend_sandbox(proto::SuspendSandboxRequest) -> proto::SandboxResponse;
+        resume_sandbox(proto::ResumeSandboxRequest) -> proto::SandboxResponse;
         create_ssh_session(proto::CreateSshSessionRequest) -> proto::CreateSshSessionResponse;
         expose_service(proto::ExposeServiceRequest) -> proto::ServiceEndpointResponse;
         get_service(proto::GetServiceRequest) -> proto::ServiceEndpointResponse;

@@ -312,7 +312,9 @@ async fn exchange(
         downstream.send_response(response, true).into_diagnostic()?;
         return Ok(());
     }
-    let (prepared, scoped) = tokio::select! {
+    // Injected grant headers are already in the prepared header block; HTTP/2
+    // has no request middleware body to reapply them to.
+    let (prepared, scoped, _injected) = tokio::select! {
         prepared = prepare_inspected_request(
             request_headers,
             &context,
@@ -321,6 +323,7 @@ async fn exchange(
             &info,
             &request_id,
             observation_context.as_ref(),
+            None,
         ) => match prepared {
             Ok(prepared) => prepared,
             Err(error)

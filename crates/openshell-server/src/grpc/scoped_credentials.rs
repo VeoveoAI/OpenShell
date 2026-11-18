@@ -170,7 +170,7 @@ async fn mint(
             "scope is not the credential's scope template rendered with a valid value",
         ));
     }
-    let refresh_state = crate::provider_refresh::get_refresh_state(
+    let refresh_state = crate::refresh_store::get_refresh_state(
         state.store.as_ref(),
         &workspace,
         provider.object_id(),
@@ -397,6 +397,7 @@ credentials:
                 sandbox_id: principal.to_string(),
                 source: SandboxIdentitySource::BootstrapJwt {
                     issuer: "test".to_string(),
+                    auth_epoch: None,
                 },
                 trust_domain: None,
             }));
